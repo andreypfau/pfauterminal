@@ -1,5 +1,6 @@
 mod app;
 mod colors;
+mod dropdown;
 mod font;
 mod gpu;
 mod icons;

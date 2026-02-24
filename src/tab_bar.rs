@@ -38,10 +38,12 @@ pub enum TabBarHit {
 }
 
 /// A filled rounded rectangle for SDF rendering.
+/// When `shadow_softness` > 0, renders as a soft shadow instead of a sharp rect.
 pub struct RoundedQuad {
     pub rect: Rect,
     pub color: [f32; 4],
     pub radius: f32,
+    pub shadow_softness: f32,
 }
 
 /// Structured draw commands for the tab bar.
@@ -59,6 +61,7 @@ pub struct TabBarTextArea {
     pub left: f32,
     pub top: f32,
     pub bounds: Rect,
+    pub is_active: bool,
 }
 
 pub struct TabBar {
@@ -321,12 +324,14 @@ impl TabBar {
                     rect: *rect,
                     color: active_stroke,
                     radius,
+                    shadow_softness: 0.0,
                 });
                 // 2. Fill inset by stroke width
                 rounded_quads.push(RoundedQuad {
                     rect: inset_rect(rect, border),
                     color: active_fill,
                     radius: (radius - border).max(0.0),
+                    shadow_softness: 0.0,
                 });
             } else if is_hovered {
                 // Hovered inactive tab: stroke outline + gray fill
@@ -334,11 +339,13 @@ impl TabBar {
                     rect: *rect,
                     color: hover_stroke,
                     radius,
+                    shadow_softness: 0.0,
                 });
                 rounded_quads.push(RoundedQuad {
                     rect: inset_rect(rect, border),
                     color: hover_bg,
                     radius: (radius - border).max(0.0),
+                    shadow_softness: 0.0,
                 });
             }
 
@@ -372,6 +379,7 @@ impl TabBar {
                     width: text_width,
                     height: rect.height,
                 },
+                is_active,
             });
 
             // Close button icon (only on active or hovered tabs)
@@ -404,6 +412,7 @@ impl TabBar {
                 rect: self.plus_rect,
                 color: hover_bg,
                 radius: plus_radius,
+                shadow_softness: 0.0,
             });
         }
 
@@ -436,6 +445,10 @@ impl TabBar {
             custom_glyphs,
             text_areas,
         }
+    }
+
+    pub fn plus_rect(&self) -> Rect {
+        self.plus_rect
     }
 
     pub fn tab_buffers(&self) -> &[Buffer] {

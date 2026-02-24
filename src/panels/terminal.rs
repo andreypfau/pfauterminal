@@ -44,9 +44,10 @@ impl TerminalPanel {
         cell_width: u16,
         cell_height: u16,
         event_proxy: EventProxy,
+        shell: Option<String>,
     ) -> Self {
         let size = TermSize::new(cols, rows);
-        let terminal = Terminal::new(size, cell_width, cell_height, event_proxy);
+        let terminal = Terminal::new(size, cell_width, cell_height, event_proxy, shell);
         Self {
             id,
             terminal,

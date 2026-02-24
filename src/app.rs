@@ -6,6 +6,7 @@ use winit::event_loop::{ActiveEventLoop, EventLoopProxy};
 use winit::window::{Window, WindowAttributes, WindowId};
 
 use crate::colors::ColorScheme;
+use crate::dropdown::{DropdownHit, DropdownMenu, MenuAction, MenuItem};
 use crate::gpu::GpuContext;
 use crate::icons::IconManager;
 use crate::layout::Rect;
@@ -27,6 +28,7 @@ pub struct App {
     workspaces: Vec<Workspace>,
     active_workspace: usize,
     tab_bar: TabBar,
+    dropdown: DropdownMenu,
     cursor_position: (f32, f32),
     screenshot_pending: Option<String>,
 }
@@ -43,12 +45,13 @@ impl App {
             workspaces: Vec::new(),
             active_workspace: 0,
             tab_bar: TabBar::new(),
+            dropdown: DropdownMenu::new(),
             cursor_position: (0.0, 0.0),
             screenshot_pending: std::env::var("SCREENSHOT").ok().filter(|s| !s.is_empty()),
         }
     }
 
-    fn create_terminal_panel(&self, gpu: &GpuContext) -> TerminalPanel {
+    fn create_terminal_panel(&self, gpu: &GpuContext, shell: Option<String>) -> TerminalPanel {
         let panel_id = PanelId::next();
         let event_proxy = EventProxy::new(self.event_proxy_raw.clone(), panel_id);
 
@@ -69,7 +72,7 @@ impl App {
         let cell_w = (gpu.cell.width * scale) as u16;
         let cell_h = (gpu.cell.height * scale) as u16;
 
-        TerminalPanel::new(panel_id, cols, rows, cell_w, cell_h, event_proxy)
+        TerminalPanel::new(panel_id, cols, rows, cell_w, cell_h, event_proxy, shell)
     }
 
     /// Full panel rect including tab bar space — the panel island covers this.
@@ -157,10 +160,17 @@ impl App {
             .filter_map(|id| ws.panels.get(id).map(|p| p.line_buffers()))
             .collect();
 
+        let dropdown_ref = if self.dropdown.is_open() {
+            Some(&self.dropdown)
+        } else {
+            None
+        };
+
         let screenshot = self.screenshot_pending.take();
         let took_screenshot = screenshot.is_some();
         match gpu.render_frame(
             &self.tab_bar,
+            dropdown_ref,
             &panel_draws,
             &panel_line_refs,
             scale,
@@ -240,9 +250,9 @@ impl App {
         }
     }
 
-    fn new_workspace(&mut self) {
+    fn new_workspace(&mut self, shell: Option<String>) {
         let gpu = self.gpu.as_ref().unwrap();
-        let panel = self.create_terminal_panel(gpu);
+        let panel = self.create_terminal_panel(gpu, shell);
         let ws = Workspace::new(Box::new(panel));
         self.workspaces.push(ws);
         self.active_workspace = self.workspaces.len() - 1;
@@ -259,7 +269,7 @@ impl App {
 
         if self.workspaces.is_empty() {
             // Last tab closed — open a fresh one instead of exiting
-            self.new_workspace();
+            self.new_workspace(None);
             return;
         }
 
@@ -277,6 +287,49 @@ impl App {
             .iter()
             .position(|ws| ws.panels.contains_key(&panel_id))
     }
+
+    fn open_new_tab_dropdown(&mut self) {
+        let shells = detect_shells();
+
+        // If only one shell available, open it directly — no menu needed
+        if shells.len() <= 1 {
+            let shell = shells.into_iter().next().map(|(_, path)| path);
+            self.new_workspace(shell);
+            return;
+        }
+
+        let gpu = self.gpu.as_mut().unwrap();
+        let scale = gpu.scale_factor;
+        let surface_w = gpu.surface_width() as f32;
+        let surface_h = gpu.surface_height() as f32;
+
+        let items: Vec<MenuItem> = shells
+            .into_iter()
+            .map(|(label, path)| MenuItem {
+                label,
+                action: MenuAction::NewShell(path),
+            })
+            .collect();
+
+        let anchor = self.tab_bar.plus_rect();
+        self.dropdown.open(
+            items,
+            anchor,
+            scale,
+            surface_w,
+            surface_h,
+            &mut gpu.font_system,
+        );
+    }
+
+    fn execute_menu_action(&mut self, action: &MenuAction) {
+        match action {
+            MenuAction::NewShell(shell_path) => {
+                self.new_workspace(Some(shell_path.clone()));
+            }
+            MenuAction::Custom(_) => {}
+        }
+    }
 }
 
 impl ApplicationHandler<TerminalEvent> for App {
@@ -292,8 +345,8 @@ impl ApplicationHandler<TerminalEvent> for App {
         let window = Arc::new(event_loop.create_window(attrs).expect("create window"));
         let gpu = GpuContext::new(window.clone(), self.colors.clone());
 
-        // Create first workspace with a terminal panel
-        let panel = self.create_terminal_panel(&gpu);
+        // Create first workspace with a terminal panel (system default shell)
+        let panel = self.create_terminal_panel(&gpu, None);
         let ws = Workspace::new(Box::new(panel));
         self.workspaces.push(ws);
 
@@ -359,6 +412,7 @@ impl ApplicationHandler<TerminalEvent> for App {
             }
 
             WindowEvent::Resized(new_size) => {
+                self.dropdown.close();
                 if let Some(gpu) = &mut self.gpu {
                     gpu.resize(new_size.width, new_size.height);
                 }
@@ -370,6 +424,7 @@ impl ApplicationHandler<TerminalEvent> for App {
             }
 
             WindowEvent::ScaleFactorChanged { scale_factor, .. } => {
+                self.dropdown.close();
                 if let Some(gpu) = &mut self.gpu {
                     gpu.set_scale_factor(scale_factor as f32);
                 }
@@ -387,9 +442,20 @@ impl ApplicationHandler<TerminalEvent> for App {
             WindowEvent::CursorMoved { position, .. } => {
                 // position is already in physical pixels
                 self.cursor_position = (position.x as f32, position.y as f32);
+                let (cx, cy) = self.cursor_position;
+
+                // Dropdown hover takes priority when open
+                if self.dropdown.is_open() {
+                    let hover = self.dropdown.compute_hover(cx, cy);
+                    if self.dropdown.set_hover(hover) {
+                        if let Some(w) = &self.window {
+                            w.request_redraw();
+                        }
+                    }
+                    return;
+                }
 
                 // Update tab bar hover state
-                let (cx, cy) = self.cursor_position;
                 let scale = self.gpu.as_ref().map(|g| g.scale_factor).unwrap_or(1.0);
                 let pad = PANEL_AREA_PADDING * scale;
                 let tab_h = TabBar::height(scale);
@@ -419,6 +485,30 @@ impl ApplicationHandler<TerminalEvent> for App {
                 ..
             } => {
                 let (cx, cy) = self.cursor_position;
+
+                // Dropdown intercepts all clicks when open
+                if self.dropdown.is_open() {
+                    match self.dropdown.hit_test(cx, cy) {
+                        DropdownHit::Item(idx) => {
+                            let action = self.dropdown.action_for(idx).cloned();
+                            self.dropdown.close();
+                            if let Some(action) = action {
+                                self.execute_menu_action(&action);
+                            }
+                        }
+                        DropdownHit::Outside => {
+                            self.dropdown.close();
+                        }
+                        DropdownHit::None => {
+                            // Clicked on menu padding — do nothing
+                        }
+                    }
+                    if let Some(w) = &self.window {
+                        w.request_redraw();
+                    }
+                    return;
+                }
+
                 let scale = self.gpu.as_ref().map(|g| g.scale_factor).unwrap_or(1.0);
                 let pad = PANEL_AREA_PADDING * scale;
                 let tab_h = TabBar::height(scale);
@@ -447,7 +537,7 @@ impl ApplicationHandler<TerminalEvent> for App {
                             }
                         }
                         TabBarHit::NewTab => {
-                            self.new_workspace();
+                            self.open_new_tab_dropdown();
                             if let Some(w) = &self.window {
                                 w.request_redraw();
                             }
@@ -466,6 +556,22 @@ impl ApplicationHandler<TerminalEvent> for App {
             }
 
             WindowEvent::KeyboardInput { event, .. } => {
+                // Close dropdown on Escape
+                if self.dropdown.is_open() {
+                    if event.state == ElementState::Pressed {
+                        if let winit::keyboard::PhysicalKey::Code(
+                            winit::keyboard::KeyCode::Escape,
+                        ) = event.physical_key
+                        {
+                            self.dropdown.close();
+                            if let Some(w) = &self.window {
+                                w.request_redraw();
+                            }
+                            return;
+                        }
+                    }
+                }
+
                 if let Some(ws) = self.workspaces.get_mut(self.active_workspace) {
                     if let Some(panel) = ws.panels.get_mut(&ws.focused_panel) {
                         panel.handle_key(&event);
@@ -491,6 +597,133 @@ impl ApplicationHandler<TerminalEvent> for App {
             }
 
             _ => {}
+        }
+    }
+}
+
+/// Detect available shells on the system. Returns (display_label, full_path) pairs.
+#[cfg(not(windows))]
+fn detect_shells() -> Vec<(String, String)> {
+    let mut shells = Vec::new();
+    let mut seen = std::collections::HashSet::new();
+    detect_shells_unix(&mut shells, &mut seen);
+    if shells.is_empty() {
+        shells.push(("sh".to_string(), "/bin/sh".to_string()));
+    }
+    shells
+}
+
+/// Detect available shells on the system. Returns (display_label, full_path) pairs.
+#[cfg(windows)]
+fn detect_shells() -> Vec<(String, String)> {
+    let mut shells = Vec::new();
+    let mut seen = std::collections::HashSet::new();
+    detect_shells_windows(&mut shells, &mut seen);
+    if shells.is_empty() {
+        shells.push(("cmd".to_string(), "cmd.exe".to_string()));
+    }
+    shells
+}
+
+#[cfg(not(windows))]
+fn detect_shells_unix(
+    shells: &mut Vec<(String, String)>,
+    seen: &mut std::collections::HashSet<String>,
+) {
+    // Only show commonly-used shells from /etc/shells
+    const COMMON_SHELLS: &[&str] = &["zsh", "bash", "fish", "nu", "pwsh"];
+
+    if let Ok(contents) = std::fs::read_to_string("/etc/shells") {
+        for line in contents.lines() {
+            let line = line.trim();
+            if line.is_empty() || line.starts_with('#') {
+                continue;
+            }
+            let path = std::path::Path::new(line);
+            let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
+            if !COMMON_SHELLS.contains(&name) {
+                continue;
+            }
+            if path.exists() && seen.insert(name.to_string()) {
+                shells.push((name.to_string(), line.to_string()));
+            }
+        }
+    }
+
+    // Fallback: check well-known paths
+    if shells.is_empty() {
+        for path in &["/bin/zsh", "/bin/bash", "/bin/sh"] {
+            if std::path::Path::new(path).exists() {
+                let name = std::path::Path::new(path)
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                    .unwrap_or(path);
+                if seen.insert(name.to_string()) {
+                    shells.push((name.to_string(), path.to_string()));
+                }
+            }
+        }
+    }
+}
+
+#[cfg(windows)]
+fn detect_shells_windows(
+    shells: &mut Vec<(String, String)>,
+    seen: &mut std::collections::HashSet<String>,
+) {
+    // PowerShell 7+ (pwsh)
+    if let Ok(output) = std::process::Command::new("where").arg("pwsh").output() {
+        if output.status.success() {
+            if let Some(path) = String::from_utf8_lossy(&output.stdout).lines().next() {
+                let path = path.trim();
+                if seen.insert("pwsh".to_string()) {
+                    shells.push(("PowerShell".to_string(), path.to_string()));
+                }
+            }
+        }
+    }
+
+    // Windows PowerShell (powershell.exe) — always available on modern Windows
+    if let Some(sysroot) = std::env::var_os("SystemRoot") {
+        let ps_path = std::path::Path::new(&sysroot)
+            .join("System32")
+            .join("WindowsPowerShell")
+            .join("v1.0")
+            .join("powershell.exe");
+        if ps_path.exists() {
+            if let Some(p) = ps_path.to_str() {
+                if seen.insert("powershell".to_string()) {
+                    shells.push(("Windows PowerShell".to_string(), p.to_string()));
+                }
+            }
+        }
+    }
+
+    // cmd.exe
+    if let Some(sysroot) = std::env::var_os("SystemRoot") {
+        let cmd_path = std::path::Path::new(&sysroot)
+            .join("System32")
+            .join("cmd.exe");
+        if cmd_path.exists() {
+            if let Some(p) = cmd_path.to_str() {
+                if seen.insert("cmd".to_string()) {
+                    shells.push(("Command Prompt".to_string(), p.to_string()));
+                }
+            }
+        }
+    }
+
+    // Git Bash
+    let git_bash_paths = [
+        "C:\\Program Files\\Git\\bin\\bash.exe",
+        "C:\\Program Files (x86)\\Git\\bin\\bash.exe",
+    ];
+    for path in &git_bash_paths {
+        if std::path::Path::new(path).exists() {
+            if seen.insert("git-bash".to_string()) {
+                shells.push(("Git Bash".to_string(), path.to_string()));
+                break;
+            }
         }
     }
 }

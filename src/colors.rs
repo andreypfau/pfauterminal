@@ -21,6 +21,7 @@ fn hex_to_rgba(hex: &str) -> (u8, u8, u8, u8) {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ColorScheme {
+    // Terminal colors
     pub background: String,
     #[serde(default = "default_chrome")]
     pub chrome: String,
@@ -42,13 +43,45 @@ pub struct ColorScheme {
     pub bright_magenta: String,
     pub bright_cyan: String,
     pub bright_white: String,
+
+    // Tab bar colors
+    #[serde(default = "default_tab_active_fill")]
+    pub tab_active_fill: String,
+    #[serde(default = "default_tab_active_stroke")]
+    pub tab_active_stroke: String,
+    #[serde(default = "default_tab_active_text")]
+    pub tab_active_text: String,
+    #[serde(default = "default_tab_hover_bg")]
+    pub tab_hover_bg: String,
+    #[serde(default = "default_tab_hover_stroke")]
+    pub tab_hover_stroke: String,
+    #[serde(default = "default_tab_separator")]
+    pub tab_separator: String,
+
+    // Panel colors
+    #[serde(default = "default_panel_stroke")]
+    pub panel_stroke: String,
+
+    // Dropdown colors
+    #[serde(default = "default_dropdown_bg")]
+    pub dropdown_bg: String,
+    #[serde(default = "default_dropdown_border")]
+    pub dropdown_border: String,
+    #[serde(default = "default_dropdown_shadow")]
+    pub dropdown_shadow: String,
+    #[serde(default = "default_dropdown_item_hover")]
+    pub dropdown_item_hover: String,
+    #[serde(default = "default_dropdown_text")]
+    pub dropdown_text: String,
+    #[serde(default = "default_dropdown_text_active")]
+    pub dropdown_text_active: String,
 }
 
 impl Default for ColorScheme {
     fn default() -> Self {
         Self {
             background: "1E1F22FF".into(),
-            chrome: "2B2D30FF".into(),
+            chrome: default_chrome(),
             foreground: "BCBEC4FF".into(),
             cursor: "BCBEC4FF".into(),
             black: "000000FF".into(),
@@ -67,6 +100,19 @@ impl Default for ColorScheme {
             bright_magenta: "D670D6FF".into(),
             bright_cyan: "29B8DBFF".into(),
             bright_white: "FFFFFFFF".into(),
+            tab_active_fill: default_tab_active_fill(),
+            tab_active_stroke: default_tab_active_stroke(),
+            tab_active_text: default_tab_active_text(),
+            tab_hover_bg: default_tab_hover_bg(),
+            tab_hover_stroke: default_tab_hover_stroke(),
+            tab_separator: default_tab_separator(),
+            panel_stroke: default_panel_stroke(),
+            dropdown_bg: default_dropdown_bg(),
+            dropdown_border: default_dropdown_border(),
+            dropdown_shadow: default_dropdown_shadow(),
+            dropdown_item_hover: default_dropdown_item_hover(),
+            dropdown_text: default_dropdown_text(),
+            dropdown_text_active: default_dropdown_text_active(),
         }
     }
 }
@@ -186,34 +232,65 @@ impl ColorScheme {
         ]
     }
 
-    /// Active tab fill color.
+    // --- Tab bar ---
+
     pub fn tab_active_fill(&self) -> [f32; 4] {
-        hex_to_linear_f32("2E436EFF")
+        hex_to_linear_f32(&self.tab_active_fill)
     }
 
-    /// Active tab stroke color (1px inside).
     pub fn tab_active_stroke(&self) -> [f32; 4] {
-        hex_to_linear_f32("4A6FA5FF")
+        hex_to_linear_f32(&self.tab_active_stroke)
     }
 
-    /// Hovered inactive tab fill.
+    pub fn tab_active_text(&self) -> GlyphonColor {
+        let (r, g, b, a) = hex_to_rgba(&self.tab_active_text);
+        GlyphonColor::rgba(r, g, b, a)
+    }
+
     pub fn tab_hover_bg(&self) -> [f32; 4] {
-        hex_to_linear_f32("393B40FF")
+        hex_to_linear_f32(&self.tab_hover_bg)
     }
 
-    /// Hovered inactive tab stroke (1px inside).
     pub fn tab_hover_stroke(&self) -> [f32; 4] {
-        hex_to_linear_f32("4E5157FF")
+        hex_to_linear_f32(&self.tab_hover_stroke)
     }
 
-    /// Separator line between tab bar and content.
     pub fn tab_separator(&self) -> [f32; 4] {
-        hex_to_linear_f32("393B40FF")
+        hex_to_linear_f32(&self.tab_separator)
     }
 
-    /// Panel border stroke color (0.5px inside).
+    // --- Panel ---
+
     pub fn panel_stroke(&self) -> [f32; 4] {
-        hex_to_linear_f32("3A3A3AFF")
+        hex_to_linear_f32(&self.panel_stroke)
+    }
+
+    // --- Dropdown ---
+
+    pub fn dropdown_bg(&self) -> [f32; 4] {
+        hex_to_linear_f32(&self.dropdown_bg)
+    }
+
+    pub fn dropdown_border(&self) -> [f32; 4] {
+        hex_to_linear_f32(&self.dropdown_border)
+    }
+
+    pub fn dropdown_shadow(&self) -> [f32; 4] {
+        hex_to_linear_f32(&self.dropdown_shadow)
+    }
+
+    pub fn dropdown_item_hover(&self) -> [f32; 4] {
+        hex_to_linear_f32(&self.dropdown_item_hover)
+    }
+
+    pub fn dropdown_text(&self) -> GlyphonColor {
+        let (r, g, b, a) = hex_to_rgba(&self.dropdown_text);
+        GlyphonColor::rgba(r, g, b, a)
+    }
+
+    pub fn dropdown_text_active(&self) -> GlyphonColor {
+        let (r, g, b, a) = hex_to_rgba(&self.dropdown_text_active);
+        GlyphonColor::rgba(r, g, b, a)
     }
 
     /// Check if a color is the default background.
@@ -245,15 +322,73 @@ fn srgb_to_linear(c: f64) -> f64 {
     }
 }
 
+// --- Serde defaults ---
+
 fn default_chrome() -> String {
     "2B2D30FF".into()
 }
+fn default_tab_active_fill() -> String {
+    "233558FF".into()
+}
+fn default_tab_active_stroke() -> String {
+    "2E4D89FF".into()
+}
+fn default_tab_active_text() -> String {
+    "D1D3D9FF".into()
+}
+fn default_tab_hover_bg() -> String {
+    "393B40FF".into()
+}
+fn default_tab_hover_stroke() -> String {
+    "4E5157FF".into()
+}
+fn default_tab_separator() -> String {
+    "393B40FF".into()
+}
+fn default_panel_stroke() -> String {
+    "3A3A3AFF".into()
+}
+fn default_dropdown_bg() -> String {
+    "2B2D30FF".into()
+}
+fn default_dropdown_border() -> String {
+    "43454AFF".into()
+}
+fn default_dropdown_shadow() -> String {
+    "00000073".into()
+}
+fn default_dropdown_item_hover() -> String {
+    "2E436EFF".into()
+}
+fn default_dropdown_text() -> String {
+    "CDD0D6FF".into()
+}
+fn default_dropdown_text_active() -> String {
+    "FFFFFFFF".into()
+}
+
+fn config_dir() -> PathBuf {
+    // Windows: %APPDATA%\pfauterminal  (e.g. C:\Users\<name>\AppData\Roaming\pfauterminal)
+    // macOS/Linux: ~/.pfauterminal
+    #[cfg(windows)]
+    {
+        if let Ok(appdata) = std::env::var("APPDATA") {
+            return PathBuf::from(appdata).join("pfauterminal");
+        }
+        if let Ok(profile) = std::env::var("USERPROFILE") {
+            return PathBuf::from(profile).join(".pfauterminal");
+        }
+        PathBuf::from(".pfauterminal")
+    }
+    #[cfg(not(windows))]
+    {
+        let home = std::env::var("HOME").unwrap_or_else(|_| ".".into());
+        PathBuf::from(home).join(".pfauterminal")
+    }
+}
 
 fn config_path() -> PathBuf {
-    let home = std::env::var("HOME").unwrap_or_else(|_| ".".into());
-    PathBuf::from(home)
-        .join(".pfauterminal")
-        .join("colors.json")
+    config_dir().join("colors.json")
 }
 
 /// Standard 256-color palette (indices 0..=255).

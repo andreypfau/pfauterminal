@@ -7,6 +7,7 @@ use glyphon::{
 use wgpu::*;
 
 use crate::colors::ColorScheme;
+use crate::dropdown::DropdownMenu;
 use crate::font::{self, CellMetrics};
 use crate::icons::IconManager;
 use crate::panel::{BgQuad, PanelDrawCommands};
@@ -37,11 +38,14 @@ pub struct GpuContext {
     pub queue: Queue,
     pub surface: Surface<'static>,
     pub surface_config: SurfaceConfiguration,
+    /// The format used for render target views (always sRGB for correct colors).
+    render_format: TextureFormat,
 
     pub font_system: FontSystem,
     swash_cache: SwashCache,
     atlas: TextAtlas,
     text_renderer: TextRenderer,
+    overlay_text_renderer: TextRenderer,
     viewport: Viewport,
     _cache: Cache,
 
@@ -90,32 +94,54 @@ impl GpuContext {
         .expect("request device");
 
         let caps = surface.get_capabilities(&adapter);
-        let format = caps
+        let surface_format = caps
             .formats
             .iter()
             .find(|f| f.is_srgb())
             .copied()
             .unwrap_or(caps.formats[0]);
 
+        // Ensure we always render to an sRGB view for correct linear→sRGB conversion.
+        // On some Windows configurations the surface format is Bgra8Unorm (not sRGB),
+        // which causes shader outputs to skip the linear→sRGB conversion, making
+        // everything too dark.
+        let render_format = if surface_format.is_srgb() {
+            surface_format
+        } else {
+            match surface_format {
+                TextureFormat::Bgra8Unorm => TextureFormat::Bgra8UnormSrgb,
+                TextureFormat::Rgba8Unorm => TextureFormat::Rgba8UnormSrgb,
+                other => other,
+            }
+        };
+
+        let view_formats = if render_format != surface_format {
+            vec![render_format]
+        } else {
+            vec![]
+        };
+
         let surface_config = SurfaceConfiguration {
             usage: TextureUsages::RENDER_ATTACHMENT | TextureUsages::COPY_SRC,
-            format,
+            format: surface_format,
             width: size.width.max(1),
             height: size.height.max(1),
             present_mode: PresentMode::Fifo,
             desired_maximum_frame_latency: 2,
             alpha_mode: caps.alpha_modes[0],
-            view_formats: vec![],
+            view_formats,
         };
         surface.configure(&device, &surface_config);
 
-        // glyphon setup
+        // glyphon setup — use render_format (sRGB) for atlas and pipelines
         let mut font_system = font::create_font_system();
         let swash_cache = SwashCache::new();
         let cache = Cache::new(&device);
         let viewport = Viewport::new(&device, &cache);
-        let mut atlas = TextAtlas::new(&device, &queue, &cache, format);
+        let mut atlas = TextAtlas::new(&device, &queue, &cache, render_format);
         let text_renderer =
+            TextRenderer::new(&mut atlas, &device, MultisampleState::default(), None);
+        let overlay_text_renderer =
             TextRenderer::new(&mut atlas, &device, MultisampleState::default(), None);
 
         let cell = font::measure_cell(&mut font_system);
@@ -149,7 +175,7 @@ impl GpuContext {
                 module: &quad_shader,
                 entry_point: Some("fs_main"),
                 targets: &[Some(ColorTargetState {
-                    format,
+                    format: render_format,
                     blend: Some(BlendState::ALPHA_BLENDING),
                     write_mask: ColorWrites::ALL,
                 })],
@@ -239,7 +265,7 @@ impl GpuContext {
                 module: &rounded_rect_shader,
                 entry_point: Some("fs_main"),
                 targets: &[Some(ColorTargetState {
-                    format,
+                    format: render_format,
                     blend: Some(BlendState::ALPHA_BLENDING),
                     write_mask: ColorWrites::ALL,
                 })],
@@ -260,10 +286,12 @@ impl GpuContext {
             queue,
             surface,
             surface_config,
+            render_format,
             font_system,
             swash_cache,
             atlas,
             text_renderer,
+            overlay_text_renderer,
             viewport,
             _cache: cache,
             cell,
@@ -309,6 +337,7 @@ impl GpuContext {
     pub fn render_frame(
         &mut self,
         tab_bar: &TabBar,
+        dropdown: Option<&DropdownMenu>,
         panel_draws: &[PanelDrawCommands],
         panel_line_buffers: &[&[Buffer]],
         scale_factor: f32,
@@ -316,7 +345,10 @@ impl GpuContext {
         screenshot_path: Option<&str>,
     ) -> Result<(), SurfaceError> {
         let frame = self.surface.get_current_texture()?;
-        let view = frame.texture.create_view(&TextureViewDescriptor::default());
+        let view = frame.texture.create_view(&TextureViewDescriptor {
+            format: Some(self.render_format),
+            ..Default::default()
+        });
 
         let w = self.surface_config.width as f32;
         let h = self.surface_config.height as f32;
@@ -335,7 +367,9 @@ impl GpuContext {
             .unwrap_or(w);
         let tab_draw = tab_bar.draw_commands(&self.colors, scale_factor, panel_x, panel_y, panel_w);
 
-        // Upload all rounded rect uniforms: panels first (behind), then tab bar on top
+        // Upload rounded rect uniforms in two groups:
+        // Scene (panels + tab bar) — drawn before text
+        // Overlay (dropdown) — drawn after text, on top of everything
         let mut rr_index = 0;
 
         // Panel island backgrounds (stroke + fill per panel) — drawn first (behind)
@@ -408,6 +442,36 @@ impl GpuContext {
             );
             rr_index += 1;
         }
+
+        // Split point: scene rects end here, overlay rects start after
+        let scene_rr_count = rr_index;
+
+        // Dropdown menu rounded rects (shadow + border + fill + hover) — overlay layer
+        let dropdown_draw = dropdown.map(|d| d.draw_commands(&self.colors, scale_factor));
+        if let Some(ref dd) = dropdown_draw {
+            for rq in &dd.rounded_quads {
+                if rr_index >= MAX_ROUNDED_RECTS {
+                    break;
+                }
+                let uniforms = RoundedRectUniforms {
+                    rect_bounds: [
+                        rq.rect.x,
+                        rq.rect.y,
+                        rq.rect.x + rq.rect.width,
+                        rq.rect.y + rq.rect.height,
+                    ],
+                    params: [rq.radius, rq.shadow_softness, 0.0, 0.0],
+                    color: rq.color,
+                };
+                self.queue.write_buffer(
+                    &self.rounded_rect_uniform_buffer,
+                    (rr_index * aligned_size) as u64,
+                    bytemuck::cast_slice(&[uniforms]),
+                );
+                rr_index += 1;
+            }
+        }
+
         let total_rounded_rects = rr_index;
 
         // Build all quad vertices (tab bar flat quads + all panel cell backgrounds)
@@ -443,7 +507,7 @@ impl GpuContext {
             },
         );
 
-        // Build TextAreas from tab bar + all panels
+        // Build scene TextAreas (tab bar + panels) — rendered before overlay
         let mut text_areas: Vec<TextArea> = Vec::new();
 
         // Carrier buffer for tab bar icons (empty buffer, scale=1.0 so positions are physical px)
@@ -480,7 +544,11 @@ impl GpuContext {
                         right: (ta.bounds.x + ta.bounds.width) as i32,
                         bottom: (ta.bounds.y + ta.bounds.height) as i32,
                     },
-                    default_color: self.colors.fg_glyphon(),
+                    default_color: if ta.is_active {
+                        self.colors.tab_active_text()
+                    } else {
+                        self.colors.fg_glyphon()
+                    },
                     custom_glyphs: &[],
                 });
             }
@@ -524,7 +592,50 @@ impl GpuContext {
                 &mut self.swash_cache,
                 |req| icon_manager.rasterize(req),
             )
-            .expect("prepare text");
+            .expect("prepare scene text");
+
+        // Overlay text (dropdown) — rendered after overlay rects paint over scene text
+        let has_overlay = scene_rr_count < total_rounded_rects;
+        let dropdown_buffers = dropdown.map(|d| d.item_buffers());
+        {
+            let mut overlay_areas: Vec<TextArea> = Vec::new();
+            if let (Some(dd), Some(dd_bufs)) = (&dropdown_draw, dropdown_buffers) {
+                for ta in &dd.text_areas {
+                    if ta.buffer_index < dd_bufs.len() {
+                        let default_color = if ta.is_hovered {
+                            self.colors.dropdown_text_active()
+                        } else {
+                            self.colors.dropdown_text()
+                        };
+                        overlay_areas.push(TextArea {
+                            buffer: &dd_bufs[ta.buffer_index],
+                            left: ta.left,
+                            top: ta.top,
+                            scale: scale_factor,
+                            bounds: TextBounds {
+                                left: ta.bounds.x as i32,
+                                top: ta.bounds.y as i32,
+                                right: (ta.bounds.x + ta.bounds.width) as i32,
+                                bottom: (ta.bounds.y + ta.bounds.height) as i32,
+                            },
+                            default_color,
+                            custom_glyphs: &[],
+                        });
+                    }
+                }
+            }
+            self.overlay_text_renderer
+                .prepare(
+                    &self.device,
+                    &self.queue,
+                    &mut self.font_system,
+                    &mut self.atlas,
+                    &self.viewport,
+                    overlay_areas,
+                    &mut self.swash_cache,
+                )
+                .expect("prepare overlay text");
+        }
 
         // Encode render pass
         let mut encoder = self
@@ -556,27 +667,46 @@ impl GpuContext {
                 ..Default::default()
             });
 
-            // 1. Draw all rounded rects (tab bar elements + island backgrounds)
-            if total_rounded_rects > 0 {
+            // === Scene layer ===
+
+            // 1. Scene rounded rects (panel islands + tab bar elements)
+            if scene_rr_count > 0 {
                 pass.set_pipeline(&self.rounded_rect_pipeline);
-                for i in 0..total_rounded_rects {
+                for i in 0..scene_rr_count {
                     let offset = (i * aligned_size) as u32;
                     pass.set_bind_group(0, &self.rounded_rect_bind_group, &[offset]);
                     pass.draw(0..6, 0..1);
                 }
             }
 
-            // 2. Draw quads (tab bar + cell backgrounds + cursors)
+            // 2. Flat quads (tab bar separator + cell backgrounds + cursors)
             if quad_vertex_count > 0 {
                 pass.set_pipeline(&self.quad_pipeline);
                 pass.set_vertex_buffer(0, self.quad_vertex_buffer.slice(..));
                 pass.draw(0..quad_vertex_count, 0..1);
             }
 
-            // 3. Draw text + icons
+            // 3. Scene text + icons (tab labels + panel text)
             self.text_renderer
                 .render(&self.atlas, &self.viewport, &mut pass)
-                .expect("render text");
+                .expect("render scene text");
+
+            // === Overlay layer (dropdown) ===
+
+            // 4. Overlay rounded rects (shadow + border + fill + hover highlight)
+            if has_overlay {
+                pass.set_pipeline(&self.rounded_rect_pipeline);
+                for i in scene_rr_count..total_rounded_rects {
+                    let offset = (i * aligned_size) as u32;
+                    pass.set_bind_group(0, &self.rounded_rect_bind_group, &[offset]);
+                    pass.draw(0..6, 0..1);
+                }
+            }
+
+            // 5. Overlay text (dropdown menu items)
+            self.overlay_text_renderer
+                .render(&self.atlas, &self.viewport, &mut pass)
+                .expect("render overlay text");
         }
 
         // Optional: copy rendered texture to staging buffer for screenshot
@@ -782,9 +912,18 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
     let center = (rect_min + rect_max) * 0.5;
     let half_size = (rect_max - rect_min) * 0.5;
     let radius = u.params.x;
+    let shadow_softness = u.params.y;
 
     let d = rounded_rect_sdf(pixel - center, half_size, radius);
-    let alpha = 1.0 - smoothstep(-0.5, 0.5, d);
+
+    var alpha: f32;
+    if shadow_softness > 0.0 {
+        // Shadow mode: soft Gaussian-like falloff outside the rect
+        alpha = 1.0 - smoothstep(0.0, shadow_softness, d);
+    } else {
+        // Normal mode: sharp anti-aliased edge
+        alpha = 1.0 - smoothstep(-0.5, 0.5, d);
+    }
 
     if alpha < 0.001 {
         discard;

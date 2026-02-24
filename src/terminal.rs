@@ -88,17 +88,26 @@ pub struct Terminal {
 }
 
 impl Terminal {
-    /// Spawn a new terminal with the given size and event proxy.
-    pub fn new(size: TermSize, cell_width: u16, cell_height: u16, event_proxy: EventProxy) -> Self {
+    /// Spawn a new terminal with the given size, event proxy, and optional shell program.
+    /// If `shell` is None, the system default shell is used.
+    pub fn new(
+        size: TermSize,
+        cell_width: u16,
+        cell_height: u16,
+        event_proxy: EventProxy,
+        shell: Option<String>,
+    ) -> Self {
         let config = Config::default();
         let term = Term::new(config, &size, event_proxy.clone());
         let term = Arc::new(FairMutex::new(term));
 
         let pty_config = tty::Options {
-            shell: None,
+            shell: shell.map(|program| tty::Shell::new(program, Vec::new())),
             working_directory: None,
             drain_on_exit: true,
             env: std::collections::HashMap::new(),
+            #[cfg(target_os = "windows")]
+            escape_args: false,
         };
 
         let window_size = WindowSize {
