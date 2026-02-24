@@ -1,0 +1,16 @@
+[package]
+name = "pfauterminal"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+winit = "0.30"
+wgpu = "23.0"
+glyphon = "0.7"
+alacritty_terminal = "0.25"
+bytemuck = { version = "1", features = ["derive"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+pollster = "0.4"
+log = "0.4"
+env_logger = "0.11"
