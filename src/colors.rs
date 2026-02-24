@@ -313,48 +313,28 @@ pub fn srgb_to_linear(c: f32) -> f32 {
 
 // --- Serde defaults ---
 
-fn default_chrome() -> String {
-    "2B2D30FF".into()
+macro_rules! color_default {
+    ($name:ident, $val:expr) => {
+        fn $name() -> String {
+            $val.into()
+        }
+    };
 }
-fn default_tab_active_fill() -> String {
-    "233558FF".into()
-}
-fn default_tab_active_stroke() -> String {
-    "2E4D89FF".into()
-}
-fn default_tab_active_text() -> String {
-    "D1D3D9FF".into()
-}
-fn default_tab_hover_bg() -> String {
-    "393B40FF".into()
-}
-fn default_tab_hover_stroke() -> String {
-    "4E5157FF".into()
-}
-fn default_tab_separator() -> String {
-    "393B40FF".into()
-}
-fn default_panel_stroke() -> String {
-    "3A3A3AFF".into()
-}
-fn default_dropdown_bg() -> String {
-    "2B2D30FF".into()
-}
-fn default_dropdown_border() -> String {
-    "43454AFF".into()
-}
-fn default_dropdown_shadow() -> String {
-    "00000073".into()
-}
-fn default_dropdown_item_hover() -> String {
-    "2E436EFF".into()
-}
-fn default_dropdown_text() -> String {
-    "CDD0D6FF".into()
-}
-fn default_dropdown_text_active() -> String {
-    "FFFFFFFF".into()
-}
+
+color_default!(default_chrome, "2B2D30FF");
+color_default!(default_tab_active_fill, "233558FF");
+color_default!(default_tab_active_stroke, "2E4D89FF");
+color_default!(default_tab_active_text, "D1D3D9FF");
+color_default!(default_tab_hover_bg, "393B40FF");
+color_default!(default_tab_hover_stroke, "4E5157FF");
+color_default!(default_tab_separator, "393B40FF");
+color_default!(default_panel_stroke, "3A3A3AFF");
+color_default!(default_dropdown_bg, "2B2D30FF");
+color_default!(default_dropdown_border, "43454AFF");
+color_default!(default_dropdown_shadow, "00000073");
+color_default!(default_dropdown_item_hover, "2E436EFF");
+color_default!(default_dropdown_text, "CDD0D6FF");
+color_default!(default_dropdown_text_active, "FFFFFFFF");
 
 fn config_dir() -> PathBuf {
     // Windows: %APPDATA%\pfauterminal  (e.g. C:\Users\<name>\AppData\Roaming\pfauterminal)

@@ -11,10 +11,9 @@ use crate::dropdown::{DropdownHit, DropdownMenu, MenuAction, MenuItem};
 use crate::gpu::GpuContext;
 use crate::icons::IconManager;
 use crate::layout::Rect;
-use crate::panel::{PanelAction, PanelId};
-use crate::panels::terminal::TerminalPanel;
 use crate::tab_bar::{TabBar, TabBarHit};
 use crate::terminal::{EventProxy, TerminalEvent};
+use crate::terminal_panel::{PanelId, TerminalPanel};
 use crate::workspace::Workspace;
 
 /// Padding between window edges and panel area (logical pixels).
@@ -78,19 +77,14 @@ impl App {
         )
     }
 
-    /// Full panel rect including tab bar space — the panel island covers this.
-    fn panel_area(&self) -> Rect {
-        Self::panel_area_from_gpu(self.gpu.as_ref().unwrap())
-    }
-
     fn panel_area_from_gpu(gpu: &GpuContext) -> Rect {
         let scale = gpu.scale_factor;
         let pad = PANEL_AREA_PADDING * scale;
         Rect {
             x: pad,
             y: pad,
-            width: gpu.surface_width() as f32 - 2.0 * pad,
-            height: gpu.surface_height() as f32 - 2.0 * pad,
+            width: gpu.surface_config.width as f32 - 2.0 * pad,
+            height: gpu.surface_config.height as f32 - 2.0 * pad,
         }
     }
 
@@ -98,7 +92,7 @@ impl App {
         let gpu = self.gpu.as_ref().unwrap();
         let cell = gpu.cell.clone();
         let scale = gpu.scale_factor;
-        let area = self.panel_area();
+        let area = Self::panel_area_from_gpu(gpu);
         let tab_h = TabBar::height(scale);
 
         if let Some(ws) = self.workspaces.get_mut(self.active_workspace) {
@@ -110,7 +104,7 @@ impl App {
         let gpu = self.gpu.as_mut().unwrap();
         let scale = gpu.scale_factor;
         let pad = PANEL_AREA_PADDING * scale;
-        let panel_width = gpu.surface_width() as f32 - 2.0 * pad;
+        let panel_width = gpu.surface_config.width as f32 - 2.0 * pad;
 
         let titles: Vec<String> = self
             .workspaces
@@ -140,23 +134,10 @@ impl App {
         // Prepare render data from active workspace
         let ws = &mut self.workspaces[self.active_workspace];
 
-        let mut panel_draws = Vec::new();
-
-        // Collect panel IDs first to avoid borrow issues
-        let panel_ids: Vec<PanelId> = ws.panels.keys().copied().collect();
-
-        for panel_id in &panel_ids {
-            if let Some(panel) = ws.panels.get_mut(panel_id) {
-                let draw = panel.prepare_render(&mut gpu.font_system, &gpu.colors);
-                panel_draws.push(draw);
-            }
-        }
-
-        // Collect buffer pool references
-        let panel_buf_refs: Vec<&[glyphon::Buffer]> = panel_ids
-            .iter()
-            .filter_map(|id| ws.panels.get(id).map(|p| p.buffers()))
-            .collect();
+        let draw = ws.panel.prepare_render(&mut gpu.font_system, &gpu.colors);
+        let panel_draws = vec![draw];
+        let bufs = ws.panel.buffers();
+        let panel_buf_refs = vec![bufs];
 
         let dropdown_ref = if self.dropdown.is_open() {
             Some(&self.dropdown)
@@ -189,54 +170,6 @@ impl App {
             }
         }
         took_screenshot
-    }
-
-    fn process_panel_actions(&mut self) {
-        let mut panels_to_remove: Vec<(usize, PanelId)> = Vec::new();
-        let mut title_changed = false;
-
-        for (ws_idx, ws) in self.workspaces.iter_mut().enumerate() {
-            let panel_ids: Vec<PanelId> = ws.panels.keys().copied().collect();
-            for panel_id in panel_ids {
-                if let Some(panel) = ws.panels.get_mut(&panel_id) {
-                    let actions = panel.drain_actions();
-                    for action in actions {
-                        match action {
-                            PanelAction::SetTitle(_title) => {
-                                title_changed = true;
-                            }
-                            PanelAction::Close => {
-                                panels_to_remove.push((ws_idx, panel_id));
-                            }
-                        }
-                    }
-                }
-            }
-        }
-
-        // Remove panels
-        for (ws_idx, panel_id) in panels_to_remove {
-            if let Some(ws) = self.workspaces.get_mut(ws_idx) {
-                ws.remove_panel(panel_id);
-            }
-        }
-
-        // Remove empty workspaces
-        self.workspaces.retain(|ws| !ws.is_empty());
-
-        if self.workspaces.is_empty() {
-            // All workspaces gone, exit
-            std::process::exit(0);
-        }
-
-        // Fix active index
-        if self.active_workspace >= self.workspaces.len() {
-            self.active_workspace = self.workspaces.len() - 1;
-        }
-
-        if title_changed {
-            self.update_window_title();
-        }
     }
 
     fn request_redraw(&self) {
@@ -298,8 +231,8 @@ impl App {
 
         let gpu = self.gpu.as_mut().unwrap();
         let scale = gpu.scale_factor;
-        let surface_w = gpu.surface_width() as f32;
-        let surface_h = gpu.surface_height() as f32;
+        let surface_w = gpu.surface_config.width as f32;
+        let surface_h = gpu.surface_config.height as f32;
 
         let items: Vec<MenuItem> = shells
             .into_iter()
@@ -325,7 +258,6 @@ impl App {
             MenuAction::NewShell(shell_path) => {
                 self.new_workspace(Some(shell_path.clone()));
             }
-            MenuAction::Custom(_) => {}
         }
     }
 }
@@ -343,28 +275,21 @@ impl ApplicationHandler<TerminalEvent> for App {
         let window = Arc::new(event_loop.create_window(attrs).expect("create window"));
         let gpu = GpuContext::new(window.clone(), self.colors.clone());
 
-        // Create first workspace with a terminal panel (system default shell)
-        let panel = self.create_terminal_panel(&gpu, None);
-        let ws = Workspace::new(panel);
-        self.workspaces.push(ws);
-
         self.window = Some(window);
         self.gpu = Some(gpu);
 
-        self.update_viewports();
-        self.update_tab_bar();
-        // Note: not using sync_workspace_state() here since window title is set by WindowAttributes
+        self.new_workspace(None);
     }
 
-    fn user_event(&mut self, _event_loop: &ActiveEventLoop, event: TerminalEvent) {
+    fn user_event(&mut self, event_loop: &ActiveEventLoop, event: TerminalEvent) {
         match event {
             TerminalEvent::Wakeup => {
                 self.request_redraw();
             }
             TerminalEvent::Title(panel_id, title) => {
                 for ws in &mut self.workspaces {
-                    if let Some(panel) = ws.panels.get_mut(&panel_id) {
-                        panel.set_title_from_event(title.clone());
+                    if ws.panel.id() == panel_id {
+                        ws.panel.set_title(title);
                         break;
                     }
                 }
@@ -374,13 +299,15 @@ impl ApplicationHandler<TerminalEvent> for App {
             }
             TerminalEvent::Exit(panel_id) => {
                 log::info!("terminal {panel_id:?} exited");
-                for ws in &mut self.workspaces {
-                    if let Some(panel) = ws.panels.get_mut(&panel_id) {
-                        panel.mark_closed();
-                        break;
-                    }
+                self.workspaces.retain(|ws| ws.panel.id() != panel_id);
+
+                if self.workspaces.is_empty() {
+                    event_loop.exit();
+                    return;
                 }
-                self.process_panel_actions();
+                if self.active_workspace >= self.workspaces.len() {
+                    self.active_workspace = self.workspaces.len() - 1;
+                }
                 self.update_tab_bar();
                 self.request_redraw();
             }
@@ -411,7 +338,7 @@ impl ApplicationHandler<TerminalEvent> for App {
             WindowEvent::ScaleFactorChanged { scale_factor, .. } => {
                 self.dropdown.close();
                 if let Some(gpu) = &mut self.gpu {
-                    gpu.set_scale_factor(scale_factor as f32);
+                    gpu.scale_factor = scale_factor as f32;
                 }
                 self.update_viewports();
                 self.update_tab_bar();
@@ -507,14 +434,6 @@ impl ApplicationHandler<TerminalEvent> for App {
                         }
                         TabBarHit::None => {}
                     }
-                } else {
-                    // Hit test panels
-                    let area = self.panel_area();
-                    if let Some(ws) = self.workspaces.get_mut(self.active_workspace) {
-                        if let Some(panel_id) = ws.hit_test(area, cx, cy) {
-                            ws.focused_panel = panel_id;
-                        }
-                    }
                 }
             }
 
@@ -537,25 +456,13 @@ impl ApplicationHandler<TerminalEvent> for App {
                     }
                 }
 
-                // Track Super key from KeyboardInput events directly
-                match event.physical_key {
-                    PhysicalKey::Code(KeyCode::SuperLeft)
-                    | PhysicalKey::Code(KeyCode::SuperRight) => {
-                        self.super_pressed = event.state == ElementState::Pressed;
-                    }
-                    _ => {}
-                }
-
                 if event.state == ElementState::Pressed && self.super_pressed {
                     match event.physical_key {
                         PhysicalKey::Code(KeyCode::KeyV) => {
                             if let Ok(mut clip) = arboard::Clipboard::new() {
                                 if let Ok(text) = clip.get_text() {
-                                    if let Some(ws) = self.workspaces.get_mut(self.active_workspace)
-                                    {
-                                        if let Some(panel) = ws.panels.get(&ws.focused_panel) {
-                                            panel.write_to_pty(text.into_bytes());
-                                        }
+                                    if let Some(ws) = self.workspaces.get(self.active_workspace) {
+                                        ws.panel.write_to_pty(text.into_bytes());
                                     }
                                 }
                             }
@@ -577,27 +484,20 @@ impl ApplicationHandler<TerminalEvent> for App {
                 }
 
                 if let Some(ws) = self.workspaces.get_mut(self.active_workspace) {
-                    if let Some(panel) = ws.panels.get_mut(&ws.focused_panel) {
-                        panel.handle_key(&event);
-                    }
+                    ws.panel.handle_key(&event);
                 }
             }
 
             WindowEvent::MouseWheel { delta, .. } => {
-                let needs_redraw = self
-                    .workspaces
-                    .get_mut(self.active_workspace)
-                    .and_then(|ws| {
-                        let cell_height = self
-                            .gpu
-                            .as_ref()
-                            .map(|g| g.cell.height as f64)
-                            .unwrap_or(16.0);
-                        let panel = ws.panels.get_mut(&ws.focused_panel)?;
-                        Some(panel.handle_scroll(delta, cell_height))
-                    });
-                if needs_redraw == Some(true) {
-                    self.request_redraw();
+                let cell_height = self
+                    .gpu
+                    .as_ref()
+                    .map(|g| g.cell.height as f64)
+                    .unwrap_or(16.0);
+                if let Some(ws) = self.workspaces.get_mut(self.active_workspace) {
+                    if ws.panel.handle_scroll(delta, cell_height) {
+                        self.request_redraw();
+                    }
                 }
             }
 

@@ -10,7 +10,7 @@ use alacritty_terminal::tty;
 use alacritty_terminal::Term;
 use winit::event_loop::EventLoopProxy;
 
-use crate::panel::PanelId;
+use crate::terminal_panel::PanelId;
 
 /// Custom event sent from the terminal I/O thread to the winit event loop.
 #[derive(Debug, Clone)]

@@ -11,8 +11,8 @@ use crate::dropdown::DropdownMenu;
 use crate::font::{self, CellMetrics};
 use crate::icons::IconManager;
 use crate::layout::Rect;
-use crate::panel::{BgQuad, PanelDrawCommands};
 use crate::tab_bar::TabBar;
+use crate::terminal_panel::{BgQuad, PanelDrawCommands};
 
 /// Max rounded rects: panel islands + tab bar elements (borders, backgrounds)
 const MAX_ROUNDED_RECTS: usize = 64;
@@ -71,7 +71,7 @@ pub struct GpuContext {
     rounded_rect_pipeline: RenderPipeline,
     rounded_rect_uniform_buffer: wgpu::Buffer,
     rounded_rect_bind_group: BindGroup,
-    uniform_alignment: u32,
+    uniform_aligned_size: usize,
 
     pub colors: ColorScheme,
 }
@@ -312,7 +312,7 @@ impl GpuContext {
             rounded_rect_pipeline,
             rounded_rect_uniform_buffer,
             rounded_rect_bind_group,
-            uniform_alignment,
+            uniform_aligned_size: aligned_size as usize,
             colors,
         }
     }
@@ -324,18 +324,6 @@ impl GpuContext {
         self.surface_config.width = width;
         self.surface_config.height = height;
         self.surface.configure(&self.device, &self.surface_config);
-    }
-
-    pub fn set_scale_factor(&mut self, scale_factor: f32) {
-        self.scale_factor = scale_factor;
-    }
-
-    pub fn surface_width(&self) -> u32 {
-        self.surface_config.width
-    }
-
-    pub fn surface_height(&self) -> u32 {
-        self.surface_config.height
     }
 
     /// Render a complete frame with tab bar + multiple panel draw commands.
@@ -359,10 +347,7 @@ impl GpuContext {
         let w = self.surface_config.width as f32;
         let h = self.surface_config.height as f32;
 
-        let aligned_size = align_up(
-            std::mem::size_of::<RoundedRectUniforms>() as u32,
-            self.uniform_alignment,
-        ) as usize;
+        let aligned_size = self.uniform_aligned_size;
 
         // Get tab bar draw commands — use panel bounds for alignment
         let panel_x = panel_draws.first().map(|d| d.island_rect.x).unwrap_or(0.0);
@@ -378,18 +363,14 @@ impl GpuContext {
         // Overlay (dropdown) — drawn after text, on top of everything
         let mut rr_index = 0;
 
-        // Helper closure to upload a rounded rect uniform
-        let upload_rr = |rr_index: &mut usize, uniforms: RoundedRectUniforms| -> bool {
-            if *rr_index >= MAX_ROUNDED_RECTS {
-                return false;
-            }
+        let upload_rr = |rr_index: &mut usize, uniforms: RoundedRectUniforms| {
+            debug_assert!(*rr_index < MAX_ROUNDED_RECTS, "exceeded max rounded rects");
             self.queue.write_buffer(
                 &self.rounded_rect_uniform_buffer,
                 (*rr_index * aligned_size) as u64,
                 bytemuck::cast_slice(&[uniforms]),
             );
             *rr_index += 1;
-            true
         };
 
         // Panel island backgrounds (stroke + fill per panel) — drawn first (behind)
@@ -505,12 +486,7 @@ impl GpuContext {
                     left: ta.left,
                     top: ta.top,
                     scale: scale_factor,
-                    bounds: TextBounds {
-                        left: ta.bounds.x as i32,
-                        top: ta.bounds.y as i32,
-                        right: (ta.bounds.x + ta.bounds.width) as i32,
-                        bottom: (ta.bounds.y + ta.bounds.height) as i32,
-                    },
+                    bounds: rect_to_text_bounds(&ta.bounds),
                     default_color: if ta.is_active {
                         self.colors.tab_active_text()
                     } else {
@@ -536,12 +512,7 @@ impl GpuContext {
                     left: spec.left,
                     top: spec.top,
                     scale: scale_factor,
-                    bounds: TextBounds {
-                        left: spec.bounds.x as i32,
-                        top: spec.bounds.y as i32,
-                        right: (spec.bounds.x + spec.bounds.width) as i32,
-                        bottom: (spec.bounds.y + spec.bounds.height) as i32,
-                    },
+                    bounds: rect_to_text_bounds(&spec.bounds),
                     default_color: spec.color,
                     custom_glyphs: &[],
                 });
@@ -564,45 +535,38 @@ impl GpuContext {
         // Overlay text (dropdown) — rendered after overlay rects paint over scene text
         let has_overlay = scene_rr_count < total_rounded_rects;
         let dropdown_buffers = dropdown.map(|d| d.item_buffers());
-        {
-            let mut overlay_areas: Vec<TextArea> = Vec::new();
-            if let (Some(dd), Some(dd_bufs)) = (&dropdown_draw, dropdown_buffers) {
-                for ta in &dd.text_areas {
-                    if ta.buffer_index < dd_bufs.len() {
-                        let default_color = if ta.is_hovered {
-                            self.colors.dropdown_text_active()
-                        } else {
-                            self.colors.dropdown_text()
-                        };
-                        overlay_areas.push(TextArea {
-                            buffer: &dd_bufs[ta.buffer_index],
-                            left: ta.left,
-                            top: ta.top,
-                            scale: scale_factor,
-                            bounds: TextBounds {
-                                left: ta.bounds.x as i32,
-                                top: ta.bounds.y as i32,
-                                right: (ta.bounds.x + ta.bounds.width) as i32,
-                                bottom: (ta.bounds.y + ta.bounds.height) as i32,
-                            },
-                            default_color,
-                            custom_glyphs: &[],
-                        });
-                    }
+        let mut overlay_areas: Vec<TextArea> = Vec::new();
+        if let (Some(dd), Some(dd_bufs)) = (&dropdown_draw, dropdown_buffers) {
+            for ta in &dd.text_areas {
+                if ta.buffer_index < dd_bufs.len() {
+                    let default_color = if ta.is_hovered {
+                        self.colors.dropdown_text_active()
+                    } else {
+                        self.colors.dropdown_text()
+                    };
+                    overlay_areas.push(TextArea {
+                        buffer: &dd_bufs[ta.buffer_index],
+                        left: ta.left,
+                        top: ta.top,
+                        scale: scale_factor,
+                        bounds: rect_to_text_bounds(&ta.bounds),
+                        default_color,
+                        custom_glyphs: &[],
+                    });
                 }
             }
-            self.overlay_text_renderer
-                .prepare(
-                    &self.device,
-                    &self.queue,
-                    &mut self.font_system,
-                    &mut self.atlas,
-                    &self.viewport,
-                    overlay_areas,
-                    &mut self.swash_cache,
-                )
-                .expect("prepare overlay text");
         }
+        self.overlay_text_renderer
+            .prepare(
+                &self.device,
+                &self.queue,
+                &mut self.font_system,
+                &mut self.atlas,
+                &self.viewport,
+                overlay_areas,
+                &mut self.swash_cache,
+            )
+            .expect("prepare overlay text");
 
         // Encode render pass
         let mut encoder = self
@@ -769,6 +733,15 @@ fn save_screenshot(path: &str, data: &[u8], width: u32, height: u32, padded_row:
 
     writer.write_image_data(&rgba_data).expect("write PNG data");
     log::info!("screenshot saved to {path}");
+}
+
+fn rect_to_text_bounds(r: &Rect) -> TextBounds {
+    TextBounds {
+        left: r.x as i32,
+        top: r.y as i32,
+        right: (r.x + r.width) as i32,
+        bottom: (r.y + r.height) as i32,
+    }
 }
 
 fn push_quad(verts: &mut Vec<QuadVertex>, bq: &BgQuad, surface_w: f32, surface_h: f32) {

@@ -3,7 +3,7 @@ use glyphon::{Attrs, Buffer, CustomGlyph, Family, FontSystem, Metrics, Shaping};
 use crate::colors::ColorScheme;
 use crate::icons;
 use crate::layout::Rect;
-use crate::panel::BgQuad;
+use crate::terminal_panel::BgQuad;
 
 const TAB_BAR_HEIGHT: f32 = 36.0;
 const TAB_PADDING_H: f32 = 12.0;
@@ -34,6 +34,13 @@ pub enum TabBarHit {
     Tab(usize),
     CloseTab(usize),
     NewTab,
+    None,
+}
+
+enum TabBarTarget {
+    Close(usize),
+    Tab(usize),
+    Plus,
     None,
 }
 
@@ -79,12 +86,7 @@ impl TabBar {
             tab_buffers: Vec::new(),
             tab_rects: Vec::new(),
             close_rects: Vec::new(),
-            plus_rect: Rect {
-                x: 0.0,
-                y: 0.0,
-                width: 0.0,
-                height: 0.0,
-            },
+            plus_rect: Rect::ZERO,
             active_tab: 0,
             hover: TabBarHover::None,
         }
@@ -175,7 +177,7 @@ impl TabBar {
         self.tab_rects.clear();
         self.close_rects.clear();
 
-        for (i, &tab_width) in tab_widths.iter().enumerate() {
+        for &tab_width in &tab_widths {
             self.tab_rects.push(Rect {
                 x,
                 y: margin_top,
@@ -193,7 +195,6 @@ impl TabBar {
             });
 
             x += tab_width + gap;
-            let _ = i;
         }
 
         // Plus button (centered vertically in bar)
@@ -206,27 +207,33 @@ impl TabBar {
         };
     }
 
-    pub fn compute_hover(&self, x: f32, y: f32) -> TabBarHover {
+    fn find_target(&self, x: f32, y: f32) -> TabBarTarget {
         // Close buttons checked first with expanded hit area for easier targeting
         for (i, rect) in self.close_rects.iter().enumerate() {
             let is_active = i == self.active_tab;
             let is_tab_hovered = matches!(self.hover, TabBarHover::Tab(idx) | TabBarHover::CloseButton(idx) if idx == i);
             if (is_active || is_tab_hovered) && rect.contains_padded(x, y, 4.0) {
-                return TabBarHover::CloseButton(i);
+                return TabBarTarget::Close(i);
             }
         }
-
         for (i, rect) in self.tab_rects.iter().enumerate() {
             if rect.contains(x, y) {
-                return TabBarHover::Tab(i);
+                return TabBarTarget::Tab(i);
             }
         }
-
         if self.plus_rect.contains(x, y) {
-            return TabBarHover::PlusButton;
+            return TabBarTarget::Plus;
         }
+        TabBarTarget::None
+    }
 
-        TabBarHover::None
+    pub fn compute_hover(&self, x: f32, y: f32) -> TabBarHover {
+        match self.find_target(x, y) {
+            TabBarTarget::Close(i) => TabBarHover::CloseButton(i),
+            TabBarTarget::Tab(i) => TabBarHover::Tab(i),
+            TabBarTarget::Plus => TabBarHover::PlusButton,
+            TabBarTarget::None => TabBarHover::None,
+        }
     }
 
     pub fn set_hover(&mut self, hover: TabBarHover) -> bool {
@@ -239,25 +246,12 @@ impl TabBar {
     }
 
     pub fn hit_test(&self, x: f32, y: f32) -> TabBarHit {
-        for (i, rect) in self.close_rects.iter().enumerate() {
-            let is_active = i == self.active_tab;
-            let is_tab_hovered = matches!(self.hover, TabBarHover::Tab(idx) | TabBarHover::CloseButton(idx) if idx == i);
-            if (is_active || is_tab_hovered) && rect.contains_padded(x, y, 4.0) {
-                return TabBarHit::CloseTab(i);
-            }
+        match self.find_target(x, y) {
+            TabBarTarget::Close(i) => TabBarHit::CloseTab(i),
+            TabBarTarget::Tab(i) => TabBarHit::Tab(i),
+            TabBarTarget::Plus => TabBarHit::NewTab,
+            TabBarTarget::None => TabBarHit::None,
         }
-
-        for (i, rect) in self.tab_rects.iter().enumerate() {
-            if rect.contains(x, y) {
-                return TabBarHit::Tab(i);
-            }
-        }
-
-        if self.plus_rect.contains(x, y) {
-            return TabBarHit::NewTab;
-        }
-
-        TabBarHit::None
     }
 
     pub fn draw_commands(

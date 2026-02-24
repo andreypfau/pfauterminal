@@ -1,5 +1,3 @@
-use crate::panel::PanelId;
-
 #[derive(Debug, Clone, Copy)]
 pub struct Rect {
     pub x: f32,
@@ -9,6 +7,13 @@ pub struct Rect {
 }
 
 impl Rect {
+    pub const ZERO: Self = Self {
+        x: 0.0,
+        y: 0.0,
+        width: 0.0,
+        height: 0.0,
+    };
+
     pub fn contains(&self, x: f32, y: f32) -> bool {
         x >= self.x && x < self.x + self.width && y >= self.y && y < self.y + self.height
     }
@@ -27,28 +32,5 @@ impl Rect {
             width: (self.width - 2.0 * amount).max(0.0),
             height: (self.height - 2.0 * amount).max(0.0),
         }
-    }
-}
-
-#[derive(Debug)]
-pub struct LayoutNode {
-    pub panel_id: PanelId,
-}
-
-impl LayoutNode {
-    pub fn new(panel_id: PanelId) -> Self {
-        Self { panel_id }
-    }
-
-    pub fn compute_layout(&self, available: Rect) -> Vec<(PanelId, Rect)> {
-        vec![(self.panel_id, available)]
-    }
-
-    /// Find which panel contains the given point, given computed layout rects.
-    pub fn hit_test(layouts: &[(PanelId, Rect)], x: f32, y: f32) -> Option<PanelId> {
-        layouts
-            .iter()
-            .find(|(_, rect)| rect.contains(x, y))
-            .map(|(id, _)| *id)
     }
 }

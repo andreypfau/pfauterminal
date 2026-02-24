@@ -1,5 +1,6 @@
 use std::borrow::Cow;
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use glyphon::{Attrs, Buffer, Color as GlyphonColor, Family, FontSystem, Shaping};
 use winit::event::{ElementState, KeyEvent, MouseScrollDelta};
@@ -8,11 +9,75 @@ use winit::keyboard::{Key, NamedKey};
 use crate::colors::ColorScheme;
 use crate::font::{self, CellMetrics};
 use crate::layout::Rect;
-use crate::panel::{
-    BgQuad, CellInfo, CursorInfo, PanelAction, PanelDrawCommands, PanelId, PanelViewport,
-    TextCellSpec,
-};
 use crate::terminal::{EventProxy, TermSize, Terminal};
+
+// --- Panel types ---
+
+static NEXT_PANEL_ID: AtomicU64 = AtomicU64::new(1);
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct PanelId(u64);
+
+impl PanelId {
+    pub fn next() -> Self {
+        Self(NEXT_PANEL_ID.fetch_add(1, Ordering::Relaxed))
+    }
+}
+
+pub struct PanelViewport {
+    pub rect: Rect,
+    pub content_rect: Rect,
+    pub cols: usize,
+    pub rows: usize,
+    pub scale_factor: f32,
+}
+
+/// Per-cell rendering info extracted from a panel.
+pub struct CellInfo {
+    pub c: char,
+    pub fg: GlyphonColor,
+    pub bg: [f32; 4],
+    pub is_default_bg: bool,
+    pub bold: bool,
+    pub italic: bool,
+}
+
+/// Draw commands returned by a panel for the GPU to render.
+pub struct PanelDrawCommands {
+    /// Island background rect (physical px).
+    pub island_rect: Rect,
+    /// Island background color (linear sRGB).
+    pub island_color: [f32; 4],
+    /// Island corner radius (physical px).
+    pub island_radius: f32,
+    /// Island stroke color (linear sRGB). If alpha > 0, renders an inside stroke.
+    pub island_stroke_color: [f32; 4],
+    /// Island stroke width (physical px).
+    pub island_stroke_width: f32,
+    /// Cell background quads: (physical_rect, linear_color).
+    pub bg_quads: Vec<BgQuad>,
+    /// Per-cell text specs for building TextAreas.
+    pub text_cells: Vec<TextCellSpec>,
+}
+
+pub struct BgQuad {
+    pub x: f32,
+    pub y: f32,
+    pub w: f32,
+    pub h: f32,
+    pub color: [f32; 4],
+}
+
+/// Describes a single character cell for glyphon rendering.
+pub struct TextCellSpec {
+    pub left: f32,
+    pub top: f32,
+    pub color: GlyphonColor,
+    pub buffer_index: usize,
+    pub bounds: Rect,
+}
+
+// --- Terminal panel ---
 
 /// Padding between panel edge and cell grid (logical pixels).
 const ISLAND_PADDING: f32 = 16.0;
@@ -34,7 +99,6 @@ pub struct TerminalPanel {
     char_buffers: Vec<Buffer>,
     char_key_map: HashMap<CharKey, usize>,
     title: String,
-    pending_actions: Vec<PanelAction>,
 }
 
 impl TerminalPanel {
@@ -56,11 +120,10 @@ impl TerminalPanel {
             char_buffers: Vec::new(),
             char_key_map: HashMap::new(),
             title: String::from("Terminal"),
-            pending_actions: Vec::new(),
         }
     }
 
-    fn extract_cells(&self, colors: &ColorScheme) -> (Vec<Vec<CellInfo>>, Option<CursorInfo>) {
+    fn extract_cells(&self, colors: &ColorScheme) -> (Vec<Vec<CellInfo>>, Option<(usize, usize)>) {
         let vp = match &self.viewport {
             Some(vp) => vp,
             None => return (Vec::new(), None),
@@ -74,11 +137,9 @@ impl TerminalPanel {
         let default_fg = colors.fg_glyphon();
 
         let mut lines: Vec<Vec<CellInfo>> = (0..rows)
-            .map(|row| {
+            .map(|_| {
                 (0..cols)
-                    .map(|col| CellInfo {
-                        row,
-                        col,
+                    .map(|_| CellInfo {
                         c: ' ',
                         fg: default_fg,
                         bg: [0.0; 4],
@@ -124,8 +185,6 @@ impl TerminalPanel {
                 };
 
                 lines[row][col] = CellInfo {
-                    row,
-                    col,
                     c,
                     fg,
                     bg: colors.to_rgba(bg_color),
@@ -141,7 +200,7 @@ impl TerminalPanel {
             let row = cp.line.0 as usize;
             let col = cp.column.0;
             if row < rows && col < cols {
-                Some(CursorInfo { row, col })
+                Some((row, col))
             } else {
                 None
             }
@@ -183,6 +242,10 @@ impl TerminalPanel {
 
     pub fn title(&self) -> &str {
         &self.title
+    }
+
+    pub fn set_title(&mut self, title: String) {
+        self.title = title;
     }
 
     pub fn set_viewport(&mut self, viewport: PanelViewport, cell: &CellMetrics) {
@@ -276,12 +339,7 @@ impl TerminalPanel {
             Some(vp) => vp,
             None => {
                 return PanelDrawCommands {
-                    island_rect: Rect {
-                        x: 0.0,
-                        y: 0.0,
-                        width: 0.0,
-                        height: 0.0,
-                    },
+                    island_rect: Rect::ZERO,
                     island_color: colors.bg_linear_f32(),
                     island_radius: 0.0,
                     island_stroke_color: [0.0; 4],
@@ -306,12 +364,12 @@ impl TerminalPanel {
         let content_x = vp.content_rect.x;
         let content_y = vp.content_rect.y;
 
-        for line in &lines {
-            for ci in line {
+        for (row, line) in lines.iter().enumerate() {
+            for (col, ci) in line.iter().enumerate() {
                 if !ci.is_default_bg {
                     bg_quads.push(BgQuad {
-                        x: content_x + ci.col as f32 * pcw,
-                        y: content_y + ci.row as f32 * pch,
+                        x: content_x + col as f32 * pcw,
+                        y: content_y + row as f32 * pch,
                         w: pcw,
                         h: pch,
                         color: ci.bg,
@@ -321,10 +379,10 @@ impl TerminalPanel {
         }
 
         // Cursor quad
-        if let Some(cur) = &cursor {
+        if let Some((cur_row, cur_col)) = cursor {
             bg_quads.push(BgQuad {
-                x: content_x + cur.col as f32 * pcw,
-                y: content_y + cur.row as f32 * pch,
+                x: content_x + cur_col as f32 * pcw,
+                y: content_y + cur_row as f32 * pch,
                 w: pcw,
                 h: pch,
                 color: [0.8, 0.8, 0.8, 0.7],
@@ -341,15 +399,15 @@ impl TerminalPanel {
         let cell_metrics = font::measure_cell(font_system);
         let mut text_cells = Vec::new();
 
-        for line in &lines {
-            for ci in line {
+        for (row, line) in lines.iter().enumerate() {
+            for (col, ci) in line.iter().enumerate() {
                 if ci.c == ' ' || ci.c == '\0' {
                     continue;
                 }
 
                 // Block-drawing characters → colored quads
-                let cx = content_x + ci.col as f32 * pcw;
-                let cy = content_y + ci.row as f32 * pch;
+                let cx = content_x + col as f32 * pcw;
+                let cy = content_y + row as f32 * pch;
                 if let Some(rects) = block_char_rects(ci.c, cx, cy, pcw, pch) {
                     let color = glyphon_to_linear(ci.fg);
                     for (rx, ry, rw, rh) in rects {
@@ -394,8 +452,8 @@ impl TerminalPanel {
                 };
 
                 text_cells.push(TextCellSpec {
-                    left: content_x + ci.col as f32 * pcw,
-                    top: content_y + ci.row as f32 * pch,
+                    left: cx,
+                    top: cy,
                     color: ci.fg,
                     buffer_index: buf_idx,
                     bounds: island_rect,
@@ -416,19 +474,6 @@ impl TerminalPanel {
 
     pub fn buffers(&self) -> &[Buffer] {
         &self.char_buffers
-    }
-
-    pub fn drain_actions(&mut self) -> Vec<PanelAction> {
-        std::mem::take(&mut self.pending_actions)
-    }
-
-    pub fn set_title_from_event(&mut self, title: String) {
-        self.title = title.clone();
-        self.pending_actions.push(PanelAction::SetTitle(title));
-    }
-
-    pub fn mark_closed(&mut self) {
-        self.pending_actions.push(PanelAction::Close);
     }
 
     pub fn write_to_pty(&self, data: Vec<u8>) {
@@ -456,7 +501,6 @@ fn block_char_rects(
     cw: f32,
     ch: f32,
 ) -> Option<Vec<(f32, f32, f32, f32)>> {
-    let full = vec![(cx, cy, cw, ch)];
     let hw = cw / 2.0;
     let hh = ch / 2.0;
 
@@ -469,7 +513,7 @@ fn block_char_rects(
         '\u{2585}' => Some(vec![(cx, cy + ch * 3.0 / 8.0, cw, ch * 5.0 / 8.0)]),
         '\u{2586}' => Some(vec![(cx, cy + ch * 2.0 / 8.0, cw, ch * 6.0 / 8.0)]),
         '\u{2587}' => Some(vec![(cx, cy + ch / 8.0, cw, ch * 7.0 / 8.0)]),
-        '\u{2588}' => Some(full), // █ full block
+        '\u{2588}' => Some(vec![(cx, cy, cw, ch)]), // █ full block
         // Horizontal fractional blocks (left N/8)
         '\u{2589}' => Some(vec![(cx, cy, cw * 7.0 / 8.0, ch)]),
         '\u{258A}' => Some(vec![(cx, cy, cw * 6.0 / 8.0, ch)]),

@@ -20,8 +20,6 @@ const MENU_SHADOW_OFFSET_Y: f32 = 4.0;
 #[derive(Debug, Clone)]
 pub enum MenuAction {
     NewShell(String),
-    #[allow(dead_code)]
-    Custom(u32),
 }
 
 pub struct MenuItem {
@@ -70,12 +68,7 @@ impl DropdownMenu {
             items: Vec::new(),
             item_buffers: Vec::new(),
             item_rects: Vec::new(),
-            menu_rect: Rect {
-                x: 0.0,
-                y: 0.0,
-                width: 0.0,
-                height: 0.0,
-            },
+            menu_rect: Rect::ZERO,
             hover: DropdownHover::None,
             visible: false,
         }
