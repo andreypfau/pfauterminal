@@ -59,29 +59,31 @@ impl App {
         let pty_writer = Arc::new(Mutex::new(None));
         let event_proxy = EventProxy::new(self.event_proxy_raw.clone(), panel_id, pty_writer);
 
-        // Compute initial size from full panel area (including tab bar space)
         let scale = gpu.scale_factor;
-        let pad = PANEL_AREA_PADDING * scale;
+        let area = Self::panel_area_from_gpu(gpu);
         let tab_h = TabBar::height(scale);
-        let panel_rect = Rect {
-            x: pad,
-            y: pad,
-            width: gpu.surface_width() as f32 - 2.0 * pad,
-            height: gpu.surface_height() as f32 - 2.0 * pad,
-        };
-
-        let (_, inner) = TerminalPanel::compute_island_rects_static(&panel_rect, scale, tab_h);
-        let (cols, rows) = TerminalPanel::compute_grid_size_static(&inner, &gpu.cell, scale);
+        let vp = TerminalPanel::compute_viewport(&area, &gpu.cell, scale, tab_h);
 
         let cell_w = (gpu.cell.width * scale) as u16;
         let cell_h = (gpu.cell.height * scale) as u16;
 
-        TerminalPanel::new(panel_id, cols, rows, cell_w, cell_h, event_proxy, shell)
+        TerminalPanel::new(
+            panel_id,
+            vp.cols,
+            vp.rows,
+            cell_w,
+            cell_h,
+            event_proxy,
+            shell,
+        )
     }
 
     /// Full panel rect including tab bar space — the panel island covers this.
     fn panel_area(&self) -> Rect {
-        let gpu = self.gpu.as_ref().unwrap();
+        Self::panel_area_from_gpu(self.gpu.as_ref().unwrap())
+    }
+
+    fn panel_area_from_gpu(gpu: &GpuContext) -> Rect {
         let scale = gpu.scale_factor;
         let pad = PANEL_AREA_PADDING * scale;
         Rect {
@@ -206,7 +208,6 @@ impl App {
                             PanelAction::Close => {
                                 panels_to_remove.push((ws_idx, panel_id));
                             }
-                            PanelAction::Redraw => {}
                         }
                     }
                 }
@@ -238,6 +239,18 @@ impl App {
         }
     }
 
+    fn request_redraw(&self) {
+        if let Some(w) = &self.window {
+            w.request_redraw();
+        }
+    }
+
+    fn sync_workspace_state(&mut self) {
+        self.update_viewports();
+        self.update_tab_bar();
+        self.update_window_title();
+    }
+
     fn update_window_title(&self) {
         if let Some(w) = &self.window {
             if let Some(ws) = self.workspaces.get(self.active_workspace) {
@@ -249,12 +262,10 @@ impl App {
     fn new_workspace(&mut self, shell: Option<String>) {
         let gpu = self.gpu.as_ref().unwrap();
         let panel = self.create_terminal_panel(gpu, shell);
-        let ws = Workspace::new(Box::new(panel));
+        let ws = Workspace::new(panel);
         self.workspaces.push(ws);
         self.active_workspace = self.workspaces.len() - 1;
-        self.update_viewports();
-        self.update_tab_bar();
-        self.update_window_title();
+        self.sync_workspace_state();
     }
 
     fn close_workspace(&mut self, idx: usize) {
@@ -272,16 +283,7 @@ impl App {
         if self.active_workspace >= self.workspaces.len() {
             self.active_workspace = self.workspaces.len() - 1;
         }
-        self.update_viewports();
-        self.update_tab_bar();
-        self.update_window_title();
-    }
-
-    #[allow(dead_code)]
-    fn find_panel_workspace(&self, panel_id: PanelId) -> Option<usize> {
-        self.workspaces
-            .iter()
-            .position(|ws| ws.panels.contains_key(&panel_id))
+        self.sync_workspace_state();
     }
 
     fn open_new_tab_dropdown(&mut self) {
@@ -343,7 +345,7 @@ impl ApplicationHandler<TerminalEvent> for App {
 
         // Create first workspace with a terminal panel (system default shell)
         let panel = self.create_terminal_panel(&gpu, None);
-        let ws = Workspace::new(Box::new(panel));
+        let ws = Workspace::new(panel);
         self.workspaces.push(ws);
 
         self.window = Some(window);
@@ -351,17 +353,15 @@ impl ApplicationHandler<TerminalEvent> for App {
 
         self.update_viewports();
         self.update_tab_bar();
+        // Note: not using sync_workspace_state() here since window title is set by WindowAttributes
     }
 
     fn user_event(&mut self, _event_loop: &ActiveEventLoop, event: TerminalEvent) {
         match event {
             TerminalEvent::Wakeup => {
-                if let Some(w) = &self.window {
-                    w.request_redraw();
-                }
+                self.request_redraw();
             }
             TerminalEvent::Title(panel_id, title) => {
-                // Find the panel and update its title
                 for ws in &mut self.workspaces {
                     if let Some(panel) = ws.panels.get_mut(&panel_id) {
                         panel.set_title_from_event(title.clone());
@@ -370,13 +370,10 @@ impl ApplicationHandler<TerminalEvent> for App {
                 }
                 self.update_tab_bar();
                 self.update_window_title();
-                if let Some(w) = &self.window {
-                    w.request_redraw();
-                }
+                self.request_redraw();
             }
             TerminalEvent::Exit(panel_id) => {
                 log::info!("terminal {panel_id:?} exited");
-                // Find and mark for removal
                 for ws in &mut self.workspaces {
                     if let Some(panel) = ws.panels.get_mut(&panel_id) {
                         panel.mark_closed();
@@ -385,9 +382,7 @@ impl ApplicationHandler<TerminalEvent> for App {
                 }
                 self.process_panel_actions();
                 self.update_tab_bar();
-                if let Some(w) = &self.window {
-                    w.request_redraw();
-                }
+                self.request_redraw();
             }
         }
     }
@@ -410,9 +405,7 @@ impl ApplicationHandler<TerminalEvent> for App {
                 }
                 self.update_viewports();
                 self.update_tab_bar();
-                if let Some(w) = &self.window {
-                    w.request_redraw();
-                }
+                self.request_redraw();
             }
 
             WindowEvent::ScaleFactorChanged { scale_factor, .. } => {
@@ -437,9 +430,7 @@ impl ApplicationHandler<TerminalEvent> for App {
                 if self.dropdown.is_open() {
                     let hover = self.dropdown.compute_hover(cx, cy);
                     if self.dropdown.set_hover(hover) {
-                        if let Some(w) = &self.window {
-                            w.request_redraw();
-                        }
+                        self.request_redraw();
                     }
                     return;
                 }
@@ -454,17 +445,13 @@ impl ApplicationHandler<TerminalEvent> for App {
                     crate::tab_bar::TabBarHover::None
                 };
                 if self.tab_bar.set_hover(hover) {
-                    if let Some(w) = &self.window {
-                        w.request_redraw();
-                    }
+                    self.request_redraw();
                 }
             }
 
             WindowEvent::CursorLeft { .. } => {
                 if self.tab_bar.set_hover(crate::tab_bar::TabBarHover::None) {
-                    if let Some(w) = &self.window {
-                        w.request_redraw();
-                    }
+                    self.request_redraw();
                 }
             }
 
@@ -488,13 +475,9 @@ impl ApplicationHandler<TerminalEvent> for App {
                         DropdownHit::Outside => {
                             self.dropdown.close();
                         }
-                        DropdownHit::None => {
-                            // Clicked on menu padding — do nothing
-                        }
+                        DropdownHit::None => {}
                     }
-                    if let Some(w) = &self.window {
-                        w.request_redraw();
-                    }
+                    self.request_redraw();
                     return;
                 }
 
@@ -503,33 +486,24 @@ impl ApplicationHandler<TerminalEvent> for App {
                 let tab_h = TabBar::height(scale);
 
                 if cy >= pad && cy < pad + tab_h {
-                    // Hit test tab bar
                     match self.tab_bar.hit_test(cx, cy) {
                         TabBarHit::Tab(idx) => {
                             if idx < self.workspaces.len() {
                                 self.active_workspace = idx;
                                 self.tab_bar.set_active(idx);
-                                self.update_viewports();
-                                self.update_tab_bar();
-                                self.update_window_title();
-                                if let Some(w) = &self.window {
-                                    w.request_redraw();
-                                }
+                                self.sync_workspace_state();
+                                self.request_redraw();
                             }
                         }
                         TabBarHit::CloseTab(idx) => {
                             if idx < self.workspaces.len() {
                                 self.close_workspace(idx);
-                                if let Some(w) = &self.window {
-                                    w.request_redraw();
-                                }
+                                self.request_redraw();
                             }
                         }
                         TabBarHit::NewTab => {
                             self.open_new_tab_dropdown();
-                            if let Some(w) = &self.window {
-                                w.request_redraw();
-                            }
+                            self.request_redraw();
                         }
                         TabBarHit::None => {}
                     }
@@ -557,9 +531,7 @@ impl ApplicationHandler<TerminalEvent> for App {
                         ) = event.physical_key
                         {
                             self.dropdown.close();
-                            if let Some(w) = &self.window {
-                                w.request_redraw();
-                            }
+                            self.request_redraw();
                             return;
                         }
                     }
@@ -596,9 +568,7 @@ impl ApplicationHandler<TerminalEvent> for App {
                         PhysicalKey::Code(KeyCode::KeyS) => {
                             self.screenshot_pending =
                                 Some("/tmp/pfauterminal_screenshot.png".to_string());
-                            if let Some(w) = &self.window {
-                                w.request_redraw();
-                            }
+                            self.request_redraw();
                             log::info!("screenshot requested");
                             return;
                         }
@@ -614,19 +584,20 @@ impl ApplicationHandler<TerminalEvent> for App {
             }
 
             WindowEvent::MouseWheel { delta, .. } => {
-                if let Some(ws) = self.workspaces.get_mut(self.active_workspace) {
-                    let cell_height = self
-                        .gpu
-                        .as_ref()
-                        .map(|g| g.cell.height as f64)
-                        .unwrap_or(16.0);
-                    if let Some(panel) = ws.panels.get_mut(&ws.focused_panel) {
-                        if panel.handle_scroll(delta, cell_height) {
-                            if let Some(w) = &self.window {
-                                w.request_redraw();
-                            }
-                        }
-                    }
+                let needs_redraw = self
+                    .workspaces
+                    .get_mut(self.active_workspace)
+                    .and_then(|ws| {
+                        let cell_height = self
+                            .gpu
+                            .as_ref()
+                            .map(|g| g.cell.height as f64)
+                            .unwrap_or(16.0);
+                        let panel = ws.panels.get_mut(&ws.focused_panel)?;
+                        Some(panel.handle_scroll(delta, cell_height))
+                    });
+                if needs_redraw == Some(true) {
+                    self.request_redraw();
                 }
             }
 

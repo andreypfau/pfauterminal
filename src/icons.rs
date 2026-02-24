@@ -1,4 +1,3 @@
-use glyphon::cosmic_text::SubpixelBin;
 use glyphon::{CustomGlyphId, RasterizeCustomGlyphRequest, RasterizedCustomGlyph};
 
 pub const ICON_TERMINAL: CustomGlyphId = 1;
@@ -57,20 +56,6 @@ impl IconManager {
             resvg::tiny_skia::Transform::from_scale(sx, sy),
             &mut pixmap.as_mut(),
         );
-
-        // Apply subpixel offset if needed
-        let _x_offset = match req.x_bin {
-            SubpixelBin::Zero => 0.0,
-            SubpixelBin::One => 0.25,
-            SubpixelBin::Two => 0.5,
-            SubpixelBin::Three => 0.75,
-        };
-        let _y_offset = match req.y_bin {
-            SubpixelBin::Zero => 0.0,
-            SubpixelBin::One => 0.25,
-            SubpixelBin::Two => 0.5,
-            SubpixelBin::Three => 0.75,
-        };
 
         Some(RasterizedCustomGlyph {
             data: pixmap.data().to_vec(),

@@ -1,10 +1,7 @@
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use glyphon::{Buffer, Color as GlyphonColor, FontSystem};
-use winit::event::{KeyEvent, MouseScrollDelta};
+use glyphon::Color as GlyphonColor;
 
-use crate::colors::ColorScheme;
-use crate::font::CellMetrics;
 use crate::layout::Rect;
 
 static NEXT_PANEL_ID: AtomicU64 = AtomicU64::new(1);
@@ -13,8 +10,6 @@ static NEXT_PANEL_ID: AtomicU64 = AtomicU64::new(1);
 pub struct PanelId(u64);
 
 impl PanelId {
-    pub const ZERO: PanelId = PanelId(0);
-
     pub fn next() -> Self {
         Self(NEXT_PANEL_ID.fetch_add(1, Ordering::Relaxed))
     }
@@ -84,24 +79,4 @@ pub struct TextCellSpec {
 pub enum PanelAction {
     SetTitle(String),
     Close,
-    #[allow(dead_code)]
-    Redraw,
-}
-
-pub trait Panel {
-    fn id(&self) -> PanelId;
-    fn title(&self) -> &str;
-    fn set_viewport(&mut self, viewport: PanelViewport, cell: &CellMetrics);
-    fn handle_key(&mut self, event: &KeyEvent) -> bool;
-    fn handle_scroll(&mut self, delta: MouseScrollDelta, cell_height: f64) -> bool;
-    fn prepare_render(
-        &mut self,
-        font_system: &mut FontSystem,
-        colors: &ColorScheme,
-    ) -> PanelDrawCommands;
-    fn buffers(&self) -> &[Buffer];
-    fn drain_actions(&mut self) -> Vec<PanelAction>;
-    fn set_title_from_event(&mut self, title: String);
-    fn mark_closed(&mut self);
-    fn write_to_pty(&self, data: Vec<u8>);
 }

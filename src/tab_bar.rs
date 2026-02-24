@@ -69,7 +69,6 @@ pub struct TabBar {
     tab_rects: Vec<Rect>,
     close_rects: Vec<Rect>,
     plus_rect: Rect,
-    tab_titles: Vec<String>,
     active_tab: usize,
     hover: TabBarHover,
 }
@@ -86,7 +85,6 @@ impl TabBar {
                 width: 0.0,
                 height: 0.0,
             },
-            tab_titles: Vec::new(),
             active_tab: 0,
             hover: TabBarHover::None,
         }
@@ -110,7 +108,6 @@ impl TabBar {
         font_system: &mut FontSystem,
     ) {
         self.active_tab = active;
-        self.tab_titles = titles.to_vec();
 
         let tab_metrics = Metrics::new(TAB_FONT_SIZE, TAB_FONT_SIZE * TAB_LINE_HEIGHT);
         let pad_h = TAB_PADDING_H * scale_factor;
@@ -214,29 +211,18 @@ impl TabBar {
         for (i, rect) in self.close_rects.iter().enumerate() {
             let is_active = i == self.active_tab;
             let is_tab_hovered = matches!(self.hover, TabBarHover::Tab(idx) | TabBarHover::CloseButton(idx) if idx == i);
-            if is_active || is_tab_hovered {
-                let pad = 4.0; // extra hit area padding
-                if x >= rect.x - pad
-                    && x < rect.x + rect.width + pad
-                    && y >= rect.y - pad
-                    && y < rect.y + rect.height + pad
-                {
-                    return TabBarHover::CloseButton(i);
-                }
+            if (is_active || is_tab_hovered) && rect.contains_padded(x, y, 4.0) {
+                return TabBarHover::CloseButton(i);
             }
         }
 
         for (i, rect) in self.tab_rects.iter().enumerate() {
-            if x >= rect.x && x < rect.x + rect.width && y >= rect.y && y < rect.y + rect.height {
+            if rect.contains(x, y) {
                 return TabBarHover::Tab(i);
             }
         }
 
-        if x >= self.plus_rect.x
-            && x < self.plus_rect.x + self.plus_rect.width
-            && y >= self.plus_rect.y
-            && y < self.plus_rect.y + self.plus_rect.height
-        {
+        if self.plus_rect.contains(x, y) {
             return TabBarHover::PlusButton;
         }
 
@@ -256,29 +242,18 @@ impl TabBar {
         for (i, rect) in self.close_rects.iter().enumerate() {
             let is_active = i == self.active_tab;
             let is_tab_hovered = matches!(self.hover, TabBarHover::Tab(idx) | TabBarHover::CloseButton(idx) if idx == i);
-            if is_active || is_tab_hovered {
-                let pad = 4.0;
-                if x >= rect.x - pad
-                    && x < rect.x + rect.width + pad
-                    && y >= rect.y - pad
-                    && y < rect.y + rect.height + pad
-                {
-                    return TabBarHit::CloseTab(i);
-                }
+            if (is_active || is_tab_hovered) && rect.contains_padded(x, y, 4.0) {
+                return TabBarHit::CloseTab(i);
             }
         }
 
         for (i, rect) in self.tab_rects.iter().enumerate() {
-            if x >= rect.x && x < rect.x + rect.width && y >= rect.y && y < rect.y + rect.height {
+            if rect.contains(x, y) {
                 return TabBarHit::Tab(i);
             }
         }
 
-        if x >= self.plus_rect.x
-            && x < self.plus_rect.x + self.plus_rect.width
-            && y >= self.plus_rect.y
-            && y < self.plus_rect.y + self.plus_rect.height
-        {
+        if self.plus_rect.contains(x, y) {
             return TabBarHit::NewTab;
         }
 
@@ -318,50 +293,29 @@ impl TabBar {
             let is_hovered = matches!(self.hover, TabBarHover::Tab(idx) | TabBarHover::CloseButton(idx) if idx == i);
 
             if is_active {
-                // Active tab: stroke outline + blue fill (back to front)
-                // 1. Stroke (inside 1px)
-                rounded_quads.push(RoundedQuad {
-                    rect: *rect,
-                    color: active_stroke,
+                push_stroked_rounded_rect(
+                    &mut rounded_quads,
+                    rect,
+                    active_stroke,
+                    active_fill,
                     radius,
-                    shadow_softness: 0.0,
-                });
-                // 2. Fill inset by stroke width
-                rounded_quads.push(RoundedQuad {
-                    rect: inset_rect(rect, border),
-                    color: active_fill,
-                    radius: (radius - border).max(0.0),
-                    shadow_softness: 0.0,
-                });
+                    border,
+                );
             } else if is_hovered {
-                // Hovered inactive tab: stroke outline + gray fill
-                rounded_quads.push(RoundedQuad {
-                    rect: *rect,
-                    color: hover_stroke,
+                push_stroked_rounded_rect(
+                    &mut rounded_quads,
+                    rect,
+                    hover_stroke,
+                    hover_bg,
                     radius,
-                    shadow_softness: 0.0,
-                });
-                rounded_quads.push(RoundedQuad {
-                    rect: inset_rect(rect, border),
-                    color: hover_bg,
-                    radius: (radius - border).max(0.0),
-                    shadow_softness: 0.0,
-                });
+                    border,
+                );
             }
 
             // Terminal icon
             let icon_x = rect.x + pad_h;
             let icon_y = rect.y + (rect.height - icon_size) / 2.0;
-            custom_glyphs.push(CustomGlyph {
-                id: icons::ICON_TERMINAL,
-                left: icon_x,
-                top: icon_y,
-                width: icon_size,
-                height: icon_size,
-                color: None,
-                snap_to_physical_pixel: true,
-                metadata: 0,
-            });
+            custom_glyphs.push(icon_glyph(icons::ICON_TERMINAL, icon_x, icon_y, icon_size));
 
             // Tab label text area — vertically centered within the tab rect
             let text_left = icon_x + icon_size + icon_gap;
@@ -391,16 +345,12 @@ impl TabBar {
                 } else {
                     icons::ICON_CLOSE
                 };
-                custom_glyphs.push(CustomGlyph {
-                    id: close_icon,
-                    left: close_rect.x,
-                    top: close_rect.y,
-                    width: close_size,
-                    height: close_size,
-                    color: None,
-                    snap_to_physical_pixel: true,
-                    metadata: 0,
-                });
+                custom_glyphs.push(icon_glyph(
+                    close_icon,
+                    close_rect.x,
+                    close_rect.y,
+                    close_size,
+                ));
             }
         }
 
@@ -419,16 +369,12 @@ impl TabBar {
         // "+" icon centered in plus button
         let plus_ix = self.plus_rect.x + (self.plus_rect.width - plus_icon_size) / 2.0;
         let plus_iy = self.plus_rect.y + (self.plus_rect.height - plus_icon_size) / 2.0;
-        custom_glyphs.push(CustomGlyph {
-            id: icons::ICON_ADD,
-            left: plus_ix,
-            top: plus_iy,
-            width: plus_icon_size,
-            height: plus_icon_size,
-            color: None,
-            snap_to_physical_pixel: true,
-            metadata: 0,
-        });
+        custom_glyphs.push(icon_glyph(
+            icons::ICON_ADD,
+            plus_ix,
+            plus_iy,
+            plus_icon_size,
+        ));
 
         // Separator line at bottom of tab bar area (inside panel)
         flat_quads.push(BgQuad {
@@ -456,11 +402,37 @@ impl TabBar {
     }
 }
 
-fn inset_rect(r: &Rect, inset: f32) -> Rect {
-    Rect {
-        x: r.x + inset,
-        y: r.y + inset,
-        width: (r.width - 2.0 * inset).max(0.0),
-        height: (r.height - 2.0 * inset).max(0.0),
+fn push_stroked_rounded_rect(
+    quads: &mut Vec<RoundedQuad>,
+    rect: &Rect,
+    stroke_color: [f32; 4],
+    fill_color: [f32; 4],
+    radius: f32,
+    border: f32,
+) {
+    quads.push(RoundedQuad {
+        rect: *rect,
+        color: stroke_color,
+        radius,
+        shadow_softness: 0.0,
+    });
+    quads.push(RoundedQuad {
+        rect: rect.inset(border),
+        color: fill_color,
+        radius: (radius - border).max(0.0),
+        shadow_softness: 0.0,
+    });
+}
+
+fn icon_glyph(id: glyphon::CustomGlyphId, left: f32, top: f32, size: f32) -> CustomGlyph {
+    CustomGlyph {
+        id,
+        left,
+        top,
+        width: size,
+        height: size,
+        color: None,
+        snap_to_physical_pixel: true,
+        metadata: 0,
     }
 }

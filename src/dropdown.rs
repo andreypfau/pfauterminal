@@ -181,7 +181,7 @@ impl DropdownMenu {
             return DropdownHover::None;
         }
         for (i, rect) in self.item_rects.iter().enumerate() {
-            if x >= rect.x && x < rect.x + rect.width && y >= rect.y && y < rect.y + rect.height {
+            if rect.contains(x, y) {
                 return DropdownHover::Item(i);
             }
         }
@@ -202,16 +202,13 @@ impl DropdownMenu {
             return DropdownHit::None;
         }
 
-        // Check if inside any item rect
         for (i, rect) in self.item_rects.iter().enumerate() {
-            if x >= rect.x && x < rect.x + rect.width && y >= rect.y && y < rect.y + rect.height {
+            if rect.contains(x, y) {
                 return DropdownHit::Item(i);
             }
         }
 
-        // Check if inside menu rect (clicked on padding/border area)
-        let r = &self.menu_rect;
-        if x >= r.x && x < r.x + r.width && y >= r.y && y < r.y + r.height {
+        if self.menu_rect.contains(x, y) {
             return DropdownHit::None;
         }
 
@@ -263,12 +260,7 @@ impl DropdownMenu {
 
         // 2. Fill rect (inset by border)
         rounded_quads.push(RoundedQuad {
-            rect: Rect {
-                x: self.menu_rect.x + border,
-                y: self.menu_rect.y + border,
-                width: (self.menu_rect.width - 2.0 * border).max(0.0),
-                height: (self.menu_rect.height - 2.0 * border).max(0.0),
-            },
+            rect: self.menu_rect.inset(border),
             color: colors.dropdown_bg(),
             radius: (radius - border).max(0.0),
             shadow_softness: 0.0,

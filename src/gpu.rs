@@ -10,6 +10,7 @@ use crate::colors::ColorScheme;
 use crate::dropdown::DropdownMenu;
 use crate::font::{self, CellMetrics};
 use crate::icons::IconManager;
+use crate::layout::Rect;
 use crate::panel::{BgQuad, PanelDrawCommands};
 use crate::tab_bar::TabBar;
 
@@ -31,6 +32,16 @@ struct RoundedRectUniforms {
     rect_bounds: [f32; 4],
     params: [f32; 4],
     color: [f32; 4],
+}
+
+impl RoundedRectUniforms {
+    fn new(rect: &Rect, radius: f32, shadow_softness: f32, color: [f32; 4]) -> Self {
+        Self {
+            rect_bounds: [rect.x, rect.y, rect.x + rect.width, rect.y + rect.height],
+            params: [radius, shadow_softness, 0.0, 0.0],
+            color,
+        }
+    }
 }
 
 pub struct GpuContext {
@@ -327,11 +338,6 @@ impl GpuContext {
         self.surface_config.height
     }
 
-    #[allow(dead_code)]
-    pub fn font_system(&mut self) -> &mut FontSystem {
-        &mut self.font_system
-    }
-
     /// Render a complete frame with tab bar + multiple panel draw commands.
     /// If `screenshot_path` is Some, saves the rendered frame as a PNG.
     pub fn render_frame(
@@ -372,103 +378,64 @@ impl GpuContext {
         // Overlay (dropdown) — drawn after text, on top of everything
         let mut rr_index = 0;
 
+        // Helper closure to upload a rounded rect uniform
+        let upload_rr = |rr_index: &mut usize, uniforms: RoundedRectUniforms| -> bool {
+            if *rr_index >= MAX_ROUNDED_RECTS {
+                return false;
+            }
+            self.queue.write_buffer(
+                &self.rounded_rect_uniform_buffer,
+                (*rr_index * aligned_size) as u64,
+                bytemuck::cast_slice(&[uniforms]),
+            );
+            *rr_index += 1;
+            true
+        };
+
         // Panel island backgrounds (stroke + fill per panel) — drawn first (behind)
         for draw in panel_draws {
-            // Stroke layer (only if stroke has alpha)
             if draw.island_stroke_width > 0.0 && draw.island_stroke_color[3] > 0.0 {
-                if rr_index >= MAX_ROUNDED_RECTS {
-                    break;
-                }
-                let uniforms = RoundedRectUniforms {
-                    rect_bounds: [
-                        draw.island_rect.x,
-                        draw.island_rect.y,
-                        draw.island_rect.x + draw.island_rect.width,
-                        draw.island_rect.y + draw.island_rect.height,
-                    ],
-                    params: [draw.island_radius, 0.0, 0.0, 0.0],
-                    color: draw.island_stroke_color,
-                };
-                self.queue.write_buffer(
-                    &self.rounded_rect_uniform_buffer,
-                    (rr_index * aligned_size) as u64,
-                    bytemuck::cast_slice(&[uniforms]),
+                upload_rr(
+                    &mut rr_index,
+                    RoundedRectUniforms::new(
+                        &draw.island_rect,
+                        draw.island_radius,
+                        0.0,
+                        draw.island_stroke_color,
+                    ),
                 );
-                rr_index += 1;
-            }
-
-            // Fill layer (inset by stroke width)
-            if rr_index >= MAX_ROUNDED_RECTS {
-                break;
             }
             let sw = draw.island_stroke_width;
-            let uniforms = RoundedRectUniforms {
-                rect_bounds: [
-                    draw.island_rect.x + sw,
-                    draw.island_rect.y + sw,
-                    draw.island_rect.x + draw.island_rect.width - sw,
-                    draw.island_rect.y + draw.island_rect.height - sw,
-                ],
-                params: [(draw.island_radius - sw).max(0.0), 0.0, 0.0, 0.0],
-                color: draw.island_color,
-            };
-            self.queue.write_buffer(
-                &self.rounded_rect_uniform_buffer,
-                (rr_index * aligned_size) as u64,
-                bytemuck::cast_slice(&[uniforms]),
+            let inset = draw.island_rect.inset(sw);
+            upload_rr(
+                &mut rr_index,
+                RoundedRectUniforms::new(
+                    &inset,
+                    (draw.island_radius - sw).max(0.0),
+                    0.0,
+                    draw.island_color,
+                ),
             );
-            rr_index += 1;
         }
 
-        // Tab bar rounded rects (tab backgrounds, borders) — drawn on top of panel islands
+        // Tab bar rounded rects (tab backgrounds, borders)
         for rq in &tab_draw.rounded_quads {
-            if rr_index >= MAX_ROUNDED_RECTS {
-                break;
-            }
-            let uniforms = RoundedRectUniforms {
-                rect_bounds: [
-                    rq.rect.x,
-                    rq.rect.y,
-                    rq.rect.x + rq.rect.width,
-                    rq.rect.y + rq.rect.height,
-                ],
-                params: [rq.radius, 0.0, 0.0, 0.0],
-                color: rq.color,
-            };
-            self.queue.write_buffer(
-                &self.rounded_rect_uniform_buffer,
-                (rr_index * aligned_size) as u64,
-                bytemuck::cast_slice(&[uniforms]),
+            upload_rr(
+                &mut rr_index,
+                RoundedRectUniforms::new(&rq.rect, rq.radius, 0.0, rq.color),
             );
-            rr_index += 1;
         }
 
-        // Split point: scene rects end here, overlay rects start after
         let scene_rr_count = rr_index;
 
         // Dropdown menu rounded rects (shadow + border + fill + hover) — overlay layer
         let dropdown_draw = dropdown.map(|d| d.draw_commands(&self.colors, scale_factor));
         if let Some(ref dd) = dropdown_draw {
             for rq in &dd.rounded_quads {
-                if rr_index >= MAX_ROUNDED_RECTS {
-                    break;
-                }
-                let uniforms = RoundedRectUniforms {
-                    rect_bounds: [
-                        rq.rect.x,
-                        rq.rect.y,
-                        rq.rect.x + rq.rect.width,
-                        rq.rect.y + rq.rect.height,
-                    ],
-                    params: [rq.radius, rq.shadow_softness, 0.0, 0.0],
-                    color: rq.color,
-                };
-                self.queue.write_buffer(
-                    &self.rounded_rect_uniform_buffer,
-                    (rr_index * aligned_size) as u64,
-                    bytemuck::cast_slice(&[uniforms]),
+                upload_rr(
+                    &mut rr_index,
+                    RoundedRectUniforms::new(&rq.rect, rq.radius, rq.shadow_softness, rq.color),
                 );
-                rr_index += 1;
             }
         }
 

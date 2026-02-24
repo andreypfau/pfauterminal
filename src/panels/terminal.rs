@@ -9,7 +9,7 @@ use crate::colors::ColorScheme;
 use crate::font::{self, CellMetrics};
 use crate::layout::Rect;
 use crate::panel::{
-    BgQuad, CellInfo, CursorInfo, Panel, PanelAction, PanelDrawCommands, PanelId, PanelViewport,
+    BgQuad, CellInfo, CursorInfo, PanelAction, PanelDrawCommands, PanelId, PanelViewport,
     TextCellSpec,
 };
 use crate::terminal::{EventProxy, TermSize, Terminal};
@@ -150,52 +150,42 @@ impl TerminalPanel {
         (lines, cursor)
     }
 
-    /// Compute island and content rects from the panel's allocated rect.
-    /// `top_inset` reserves space at the top of the island for the tab bar (physical px).
-    /// The island covers the full rect; the content area is below the top_inset with padding.
-    pub fn compute_island_rects_static(
+    /// Compute a full PanelViewport for the given rect, cell metrics, scale, and tab bar inset.
+    pub fn compute_viewport(
         rect: &Rect,
-        scale_factor: f32,
-        top_inset: f32,
-    ) -> (Rect, Rect) {
-        let p = ISLAND_PADDING * scale_factor;
-
-        let island = *rect;
-
-        let content = Rect {
-            x: island.x + p,
-            y: island.y + top_inset + p,
-            width: island.width - 2.0 * p,
-            height: island.height - top_inset - 2.0 * p,
-        };
-
-        (island, content)
-    }
-
-    /// Compute cols/rows that fit in the content rect.
-    pub fn compute_grid_size_static(
-        content_rect: &Rect,
         cell: &CellMetrics,
         scale_factor: f32,
-    ) -> (usize, usize) {
+        tab_bar_height: f32,
+    ) -> PanelViewport {
+        let p = ISLAND_PADDING * scale_factor;
+        let content = Rect {
+            x: rect.x + p,
+            y: rect.y + tab_bar_height + p,
+            width: rect.width - 2.0 * p,
+            height: rect.height - tab_bar_height - 2.0 * p,
+        };
         let pcw = cell.width * scale_factor;
         let pch = cell.height * scale_factor;
-        let cols = (content_rect.width / pcw).floor().max(1.0) as usize;
-        let rows = (content_rect.height / pch).floor().max(1.0) as usize;
-        (cols, rows)
+        let cols = (content.width / pcw).floor().max(1.0) as usize;
+        let rows = (content.height / pch).floor().max(1.0) as usize;
+        PanelViewport {
+            rect: *rect,
+            content_rect: content,
+            cols,
+            rows,
+            scale_factor,
+        }
     }
-}
 
-impl Panel for TerminalPanel {
-    fn id(&self) -> PanelId {
+    pub fn id(&self) -> PanelId {
         self.id
     }
 
-    fn title(&self) -> &str {
+    pub fn title(&self) -> &str {
         &self.title
     }
 
-    fn set_viewport(&mut self, viewport: PanelViewport, cell: &CellMetrics) {
+    pub fn set_viewport(&mut self, viewport: PanelViewport, cell: &CellMetrics) {
         let old_cols = self.viewport.as_ref().map(|v| v.cols);
         let old_rows = self.viewport.as_ref().map(|v| v.rows);
 
@@ -213,7 +203,7 @@ impl Panel for TerminalPanel {
         self.viewport = Some(viewport);
     }
 
-    fn handle_key(&mut self, event: &KeyEvent) -> bool {
+    pub fn handle_key(&mut self, event: &KeyEvent) -> bool {
         if event.state != ElementState::Pressed {
             return false;
         }
@@ -264,7 +254,7 @@ impl Panel for TerminalPanel {
         }
     }
 
-    fn handle_scroll(&mut self, delta: MouseScrollDelta, cell_height: f64) -> bool {
+    pub fn handle_scroll(&mut self, delta: MouseScrollDelta, cell_height: f64) -> bool {
         let lines = match delta {
             MouseScrollDelta::LineDelta(_, y) => y as i32,
             MouseScrollDelta::PixelDelta(pos) => (pos.y / cell_height) as i32,
@@ -277,7 +267,7 @@ impl Panel for TerminalPanel {
         }
     }
 
-    fn prepare_render(
+    pub fn prepare_render(
         &mut self,
         font_system: &mut FontSystem,
         colors: &ColorScheme,
@@ -424,37 +414,31 @@ impl Panel for TerminalPanel {
         }
     }
 
-    fn buffers(&self) -> &[Buffer] {
+    pub fn buffers(&self) -> &[Buffer] {
         &self.char_buffers
     }
 
-    fn drain_actions(&mut self) -> Vec<PanelAction> {
+    pub fn drain_actions(&mut self) -> Vec<PanelAction> {
         std::mem::take(&mut self.pending_actions)
     }
 
-    fn set_title_from_event(&mut self, title: String) {
+    pub fn set_title_from_event(&mut self, title: String) {
         self.title = title.clone();
         self.pending_actions.push(PanelAction::SetTitle(title));
     }
 
-    fn mark_closed(&mut self) {
+    pub fn mark_closed(&mut self) {
         self.pending_actions.push(PanelAction::Close);
     }
 
-    fn write_to_pty(&self, data: Vec<u8>) {
+    pub fn write_to_pty(&self, data: Vec<u8>) {
         self.terminal.write(Cow::Owned(data));
     }
 }
 
 /// Convert a GlyphonColor (sRGB u8) to linear f32 RGBA for GPU quads.
 fn glyphon_to_linear(c: GlyphonColor) -> [f32; 4] {
-    fn srgb_to_linear(c: f32) -> f32 {
-        if c <= 0.04045 {
-            c / 12.92
-        } else {
-            ((c + 0.055) / 1.055).powf(2.4)
-        }
-    }
+    use crate::colors::srgb_to_linear;
     [
         srgb_to_linear(c.r() as f32 / 255.0),
         srgb_to_linear(c.g() as f32 / 255.0),

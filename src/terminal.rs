@@ -40,11 +40,6 @@ impl EventProxy {
             pty_writer,
         }
     }
-
-    #[allow(dead_code)]
-    pub fn raw_proxy(&self) -> &EventLoopProxy<TerminalEvent> {
-        &self.proxy
-    }
 }
 
 impl EventListener for EventProxy {

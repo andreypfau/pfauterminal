@@ -149,29 +149,18 @@ impl ColorScheme {
         }
     }
 
-    pub fn bg_wgpu(&self) -> [f64; 4] {
-        let (r, g, b, a) = hex_to_rgba(&self.background);
-        [
-            srgb_to_linear(r as f64 / 255.0),
-            srgb_to_linear(g as f64 / 255.0),
-            srgb_to_linear(b as f64 / 255.0),
-            a as f64 / 255.0,
-        ]
-    }
-
     /// Background color as linear f32 (for shader uniforms).
     pub fn bg_linear_f32(&self) -> [f32; 4] {
-        let bg = self.bg_wgpu();
-        [bg[0] as f32, bg[1] as f32, bg[2] as f32, bg[3] as f32]
+        hex_to_linear_f32(&self.background)
     }
 
     /// Chrome (window) background as linear f64 for wgpu clear color.
     pub fn chrome_wgpu(&self) -> [f64; 4] {
         let (r, g, b, a) = hex_to_rgba(&self.chrome);
         [
-            srgb_to_linear(r as f64 / 255.0),
-            srgb_to_linear(g as f64 / 255.0),
-            srgb_to_linear(b as f64 / 255.0),
+            srgb_to_linear(r as f32 / 255.0) as f64,
+            srgb_to_linear(g as f32 / 255.0) as f64,
+            srgb_to_linear(b as f32 / 255.0) as f64,
             a as f64 / 255.0,
         ]
     }
@@ -225,9 +214,9 @@ impl ColorScheme {
             Color::Spec(rgb) => (rgb.r, rgb.g, rgb.b),
         };
         [
-            srgb_to_linear(r as f64 / 255.0) as f32,
-            srgb_to_linear(g as f64 / 255.0) as f32,
-            srgb_to_linear(b as f64 / 255.0) as f32,
+            srgb_to_linear(r as f32 / 255.0),
+            srgb_to_linear(g as f32 / 255.0),
+            srgb_to_linear(b as f32 / 255.0),
             1.0,
         ]
     }
@@ -306,15 +295,15 @@ impl ColorScheme {
 fn hex_to_linear_f32(hex: &str) -> [f32; 4] {
     let (r, g, b, a) = hex_to_rgba(hex);
     [
-        srgb_to_linear(r as f64 / 255.0) as f32,
-        srgb_to_linear(g as f64 / 255.0) as f32,
-        srgb_to_linear(b as f64 / 255.0) as f32,
+        srgb_to_linear(r as f32 / 255.0),
+        srgb_to_linear(g as f32 / 255.0),
+        srgb_to_linear(b as f32 / 255.0),
         a as f32 / 255.0,
     ]
 }
 
 /// Convert an sRGB component (0.0..1.0) to linear.
-fn srgb_to_linear(c: f64) -> f64 {
+pub fn srgb_to_linear(c: f32) -> f32 {
     if c <= 0.04045 {
         c / 12.92
     } else {
