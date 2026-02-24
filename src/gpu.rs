@@ -339,7 +339,7 @@ impl GpuContext {
         tab_bar: &TabBar,
         dropdown: Option<&DropdownMenu>,
         panel_draws: &[PanelDrawCommands],
-        panel_line_buffers: &[&[Buffer]],
+        panel_buffers: &[&[Buffer]],
         scale_factor: f32,
         icon_manager: &IconManager,
         screenshot_path: Option<&str>,
@@ -554,18 +554,18 @@ impl GpuContext {
             }
         }
 
-        // Panel text
+        // Panel text — per-cell rendering
         for (panel_idx, draw) in panel_draws.iter().enumerate() {
-            if panel_idx >= panel_line_buffers.len() {
+            if panel_idx >= panel_buffers.len() {
                 break;
             }
-            let line_bufs = panel_line_buffers[panel_idx];
-            for (line_idx, spec) in draw.text_lines.iter().enumerate() {
-                if line_idx >= line_bufs.len() {
-                    break;
+            let bufs = panel_buffers[panel_idx];
+            for spec in &draw.text_cells {
+                if spec.buffer_index >= bufs.len() {
+                    continue;
                 }
                 text_areas.push(TextArea {
-                    buffer: &line_bufs[line_idx],
+                    buffer: &bufs[spec.buffer_index],
                     left: spec.left,
                     top: spec.top,
                     scale: scale_factor,
@@ -575,7 +575,7 @@ impl GpuContext {
                         right: (spec.bounds.x + spec.bounds.width) as i32,
                         bottom: (spec.bounds.y + spec.bounds.height) as i32,
                     },
-                    default_color: self.colors.fg_glyphon(),
+                    default_color: spec.color,
                     custom_glyphs: &[],
                 });
             }

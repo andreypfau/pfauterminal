@@ -60,8 +60,8 @@ pub struct PanelDrawCommands {
     pub island_stroke_width: f32,
     /// Cell background quads: (physical_rect, linear_color).
     pub bg_quads: Vec<BgQuad>,
-    /// Text line specs for building TextAreas.
-    pub text_lines: Vec<TextLineSpec>,
+    /// Per-cell text specs for building TextAreas.
+    pub text_cells: Vec<TextCellSpec>,
 }
 
 pub struct BgQuad {
@@ -72,10 +72,12 @@ pub struct BgQuad {
     pub color: [f32; 4],
 }
 
-/// Describes one line of text for glyphon rendering.
-pub struct TextLineSpec {
+/// Describes a single character cell for glyphon rendering.
+pub struct TextCellSpec {
     pub left: f32,
     pub top: f32,
+    pub color: GlyphonColor,
+    pub buffer_index: usize,
     pub bounds: Rect,
 }
 
@@ -97,7 +99,9 @@ pub trait Panel {
         font_system: &mut FontSystem,
         colors: &ColorScheme,
     ) -> PanelDrawCommands;
-    fn line_buffers(&self) -> &[Buffer];
+    fn buffers(&self) -> &[Buffer];
     fn drain_actions(&mut self) -> Vec<PanelAction>;
-    fn as_any_mut(&mut self) -> &mut dyn std::any::Any;
+    fn set_title_from_event(&mut self, title: String);
+    fn mark_closed(&mut self);
+    fn write_to_pty(&self, data: Vec<u8>);
 }

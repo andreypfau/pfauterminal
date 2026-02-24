@@ -1,5 +1,5 @@
 use std::borrow::Cow;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use alacritty_terminal::event::{Event, EventListener, WindowSize};
 use alacritty_terminal::event_loop::{EventLoop, EventLoopSender, Msg};
@@ -25,11 +25,20 @@ pub enum TerminalEvent {
 pub struct EventProxy {
     proxy: EventLoopProxy<TerminalEvent>,
     panel_id: PanelId,
+    pty_writer: Arc<Mutex<Option<EventLoopSender>>>,
 }
 
 impl EventProxy {
-    pub fn new(proxy: EventLoopProxy<TerminalEvent>, panel_id: PanelId) -> Self {
-        Self { proxy, panel_id }
+    pub fn new(
+        proxy: EventLoopProxy<TerminalEvent>,
+        panel_id: PanelId,
+        pty_writer: Arc<Mutex<Option<EventLoopSender>>>,
+    ) -> Self {
+        Self {
+            proxy,
+            panel_id,
+            pty_writer,
+        }
     }
 
     #[allow(dead_code)]
@@ -47,6 +56,14 @@ impl EventListener for EventProxy {
                 .send_event(TerminalEvent::Title(self.panel_id, t)),
             Event::Exit | Event::ChildExit(_) => {
                 self.proxy.send_event(TerminalEvent::Exit(self.panel_id))
+            }
+            Event::PtyWrite(text) => {
+                if let Ok(guard) = self.pty_writer.lock() {
+                    if let Some(sender) = guard.as_ref() {
+                        let _ = sender.send(Msg::Input(Cow::Owned(text.into_bytes())));
+                    }
+                }
+                Ok(())
             }
             _ => Ok(()),
         };
@@ -105,7 +122,12 @@ impl Terminal {
             shell: shell.map(|program| tty::Shell::new(program, Vec::new())),
             working_directory: None,
             drain_on_exit: true,
-            env: std::collections::HashMap::new(),
+            env: {
+                let mut env = std::collections::HashMap::new();
+                env.insert("TERM".into(), "xterm-256color".into());
+                env.insert("COLORTERM".into(), "truecolor".into());
+                env
+            },
             #[cfg(target_os = "windows")]
             escape_args: false,
         };
@@ -119,10 +141,16 @@ impl Terminal {
 
         let pty = tty::new(&pty_config, window_size, 0).expect("failed to create PTY");
 
-        let event_loop = EventLoop::new(term.clone(), event_proxy, pty, false, false)
+        let event_loop = EventLoop::new(term.clone(), event_proxy.clone(), pty, false, false)
             .expect("failed to create event loop");
 
         let channel = event_loop.channel();
+
+        // Wire up the PTY writer so EventProxy can send responses back to the PTY.
+        if let Ok(mut guard) = event_proxy.pty_writer.lock() {
+            *guard = Some(channel.clone());
+        }
+
         event_loop.spawn();
 
         Self { term, channel }

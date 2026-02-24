@@ -1,8 +1,9 @@
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use winit::application::ApplicationHandler;
 use winit::event::{ElementState, MouseButton, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, EventLoopProxy};
+use winit::keyboard::{KeyCode, PhysicalKey};
 use winit::window::{Window, WindowAttributes, WindowId};
 
 use crate::colors::ColorScheme;
@@ -30,6 +31,7 @@ pub struct App {
     tab_bar: TabBar,
     dropdown: DropdownMenu,
     cursor_position: (f32, f32),
+    super_pressed: bool,
     screenshot_pending: Option<String>,
 }
 
@@ -47,13 +49,15 @@ impl App {
             tab_bar: TabBar::new(),
             dropdown: DropdownMenu::new(),
             cursor_position: (0.0, 0.0),
+            super_pressed: false,
             screenshot_pending: std::env::var("SCREENSHOT").ok().filter(|s| !s.is_empty()),
         }
     }
 
     fn create_terminal_panel(&self, gpu: &GpuContext, shell: Option<String>) -> TerminalPanel {
         let panel_id = PanelId::next();
-        let event_proxy = EventProxy::new(self.event_proxy_raw.clone(), panel_id);
+        let pty_writer = Arc::new(Mutex::new(None));
+        let event_proxy = EventProxy::new(self.event_proxy_raw.clone(), panel_id, pty_writer);
 
         // Compute initial size from full panel area (including tab bar space)
         let scale = gpu.scale_factor;
@@ -135,7 +139,6 @@ impl App {
         let ws = &mut self.workspaces[self.active_workspace];
 
         let mut panel_draws = Vec::new();
-        let mut panel_line_bufs_owned: Vec<Vec<&glyphon::Buffer>> = Vec::new();
 
         // Collect panel IDs first to avoid borrow issues
         let panel_ids: Vec<PanelId> = ws.panels.keys().copied().collect();
@@ -147,17 +150,10 @@ impl App {
             }
         }
 
-        // Now collect line buffer references
-        for panel_id in &panel_ids {
-            if let Some(panel) = ws.panels.get(panel_id) {
-                let bufs: Vec<&glyphon::Buffer> = panel.line_buffers().iter().collect();
-                panel_line_bufs_owned.push(bufs);
-            }
-        }
-
-        let panel_line_refs: Vec<&[glyphon::Buffer]> = panel_ids
+        // Collect buffer pool references
+        let panel_buf_refs: Vec<&[glyphon::Buffer]> = panel_ids
             .iter()
-            .filter_map(|id| ws.panels.get(id).map(|p| p.line_buffers()))
+            .filter_map(|id| ws.panels.get(id).map(|p| p.buffers()))
             .collect();
 
         let dropdown_ref = if self.dropdown.is_open() {
@@ -172,7 +168,7 @@ impl App {
             &self.tab_bar,
             dropdown_ref,
             &panel_draws,
-            &panel_line_refs,
+            &panel_buf_refs,
             scale,
             &self.icon_manager,
             screenshot.as_deref(),
@@ -368,9 +364,7 @@ impl ApplicationHandler<TerminalEvent> for App {
                 // Find the panel and update its title
                 for ws in &mut self.workspaces {
                     if let Some(panel) = ws.panels.get_mut(&panel_id) {
-                        if let Some(tp) = panel.as_any_mut().downcast_mut::<TerminalPanel>() {
-                            tp.set_title_from_event(title.clone());
-                        }
+                        panel.set_title_from_event(title.clone());
                         break;
                     }
                 }
@@ -385,9 +379,7 @@ impl ApplicationHandler<TerminalEvent> for App {
                 // Find and mark for removal
                 for ws in &mut self.workspaces {
                     if let Some(panel) = ws.panels.get_mut(&panel_id) {
-                        if let Some(tp) = panel.as_any_mut().downcast_mut::<TerminalPanel>() {
-                            tp.mark_closed();
-                        }
+                        panel.mark_closed();
                         break;
                     }
                 }
@@ -433,10 +425,7 @@ impl ApplicationHandler<TerminalEvent> for App {
             }
 
             WindowEvent::RedrawRequested => {
-                if self.redraw() {
-                    // Screenshot captured — auto-exit
-                    event_loop.exit();
-                }
+                self.redraw();
             }
 
             WindowEvent::CursorMoved { position, .. } => {
@@ -555,6 +544,10 @@ impl ApplicationHandler<TerminalEvent> for App {
                 }
             }
 
+            WindowEvent::ModifiersChanged(new_modifiers) => {
+                self.super_pressed = new_modifiers.state().super_key();
+            }
+
             WindowEvent::KeyboardInput { event, .. } => {
                 // Close dropdown on Escape
                 if self.dropdown.is_open() {
@@ -569,6 +562,47 @@ impl ApplicationHandler<TerminalEvent> for App {
                             }
                             return;
                         }
+                    }
+                }
+
+                // Track Super key from KeyboardInput events directly
+                match event.physical_key {
+                    PhysicalKey::Code(KeyCode::SuperLeft)
+                    | PhysicalKey::Code(KeyCode::SuperRight) => {
+                        self.super_pressed = event.state == ElementState::Pressed;
+                    }
+                    _ => {}
+                }
+
+                if event.state == ElementState::Pressed && self.super_pressed {
+                    match event.physical_key {
+                        PhysicalKey::Code(KeyCode::KeyV) => {
+                            if let Ok(mut clip) = arboard::Clipboard::new() {
+                                if let Ok(text) = clip.get_text() {
+                                    if let Some(ws) = self.workspaces.get_mut(self.active_workspace)
+                                    {
+                                        if let Some(panel) = ws.panels.get(&ws.focused_panel) {
+                                            panel.write_to_pty(text.into_bytes());
+                                        }
+                                    }
+                                }
+                            }
+                            return;
+                        }
+                        PhysicalKey::Code(KeyCode::KeyC) => {
+                            // TODO: copy selection
+                            return;
+                        }
+                        PhysicalKey::Code(KeyCode::KeyS) => {
+                            self.screenshot_pending =
+                                Some("/tmp/pfauterminal_screenshot.png".to_string());
+                            if let Some(w) = &self.window {
+                                w.request_redraw();
+                            }
+                            log::info!("screenshot requested");
+                            return;
+                        }
+                        _ => {}
                     }
                 }
 
