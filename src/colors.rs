@@ -186,6 +186,36 @@ impl ColorScheme {
         ]
     }
 
+    /// Active tab fill color.
+    pub fn tab_active_fill(&self) -> [f32; 4] {
+        hex_to_linear_f32("2E436EFF")
+    }
+
+    /// Active tab stroke color (1px inside).
+    pub fn tab_active_stroke(&self) -> [f32; 4] {
+        hex_to_linear_f32("4A6FA5FF")
+    }
+
+    /// Hovered inactive tab fill.
+    pub fn tab_hover_bg(&self) -> [f32; 4] {
+        hex_to_linear_f32("393B40FF")
+    }
+
+    /// Hovered inactive tab stroke (1px inside).
+    pub fn tab_hover_stroke(&self) -> [f32; 4] {
+        hex_to_linear_f32("4E5157FF")
+    }
+
+    /// Separator line between tab bar and content.
+    pub fn tab_separator(&self) -> [f32; 4] {
+        hex_to_linear_f32("393B40FF")
+    }
+
+    /// Panel border stroke color (0.5px inside).
+    pub fn panel_stroke(&self) -> [f32; 4] {
+        hex_to_linear_f32("3A3A3AFF")
+    }
+
     /// Check if a color is the default background.
     pub fn is_default_bg(&self, color: Color) -> bool {
         matches!(
@@ -193,6 +223,17 @@ impl ColorScheme {
             Color::Named(NamedColor::Background) | Color::Named(NamedColor::Cursor)
         )
     }
+}
+
+/// Convert a hex color string to linear f32 RGBA.
+fn hex_to_linear_f32(hex: &str) -> [f32; 4] {
+    let (r, g, b, a) = hex_to_rgba(hex);
+    [
+        srgb_to_linear(r as f64 / 255.0) as f32,
+        srgb_to_linear(g as f64 / 255.0) as f32,
+        srgb_to_linear(b as f64 / 255.0) as f32,
+        a as f32 / 255.0,
+    ]
 }
 
 /// Convert an sRGB component (0.0..1.0) to linear.

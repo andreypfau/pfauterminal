@@ -10,23 +10,31 @@ use alacritty_terminal::tty;
 use alacritty_terminal::Term;
 use winit::event_loop::EventLoopProxy;
 
+use crate::panel::PanelId;
+
 /// Custom event sent from the terminal I/O thread to the winit event loop.
 #[derive(Debug, Clone)]
 pub enum TerminalEvent {
     Wakeup,
-    Title(String),
-    Exit,
+    Title(PanelId, String),
+    Exit(PanelId),
 }
 
 /// Bridges alacritty's EventListener to winit's EventLoopProxy.
 #[derive(Clone)]
 pub struct EventProxy {
     proxy: EventLoopProxy<TerminalEvent>,
+    panel_id: PanelId,
 }
 
 impl EventProxy {
-    pub fn new(proxy: EventLoopProxy<TerminalEvent>) -> Self {
-        Self { proxy }
+    pub fn new(proxy: EventLoopProxy<TerminalEvent>, panel_id: PanelId) -> Self {
+        Self { proxy, panel_id }
+    }
+
+    #[allow(dead_code)]
+    pub fn raw_proxy(&self) -> &EventLoopProxy<TerminalEvent> {
+        &self.proxy
     }
 }
 
@@ -34,8 +42,12 @@ impl EventListener for EventProxy {
     fn send_event(&self, event: Event) {
         let _ = match event {
             Event::Wakeup => self.proxy.send_event(TerminalEvent::Wakeup),
-            Event::Title(t) => self.proxy.send_event(TerminalEvent::Title(t)),
-            Event::Exit | Event::ChildExit(_) => self.proxy.send_event(TerminalEvent::Exit),
+            Event::Title(t) => self
+                .proxy
+                .send_event(TerminalEvent::Title(self.panel_id, t)),
+            Event::Exit | Event::ChildExit(_) => {
+                self.proxy.send_event(TerminalEvent::Exit(self.panel_id))
+            }
             _ => Ok(()),
         };
     }

@@ -1,0 +1,795 @@
+use std::sync::Arc;
+
+use glyphon::{
+    Buffer, Cache, FontSystem, Metrics, Resolution, SwashCache, TextArea, TextAtlas, TextBounds,
+    TextRenderer, Viewport,
+};
+use wgpu::*;
+
+use crate::colors::ColorScheme;
+use crate::font::{self, CellMetrics};
+use crate::icons::IconManager;
+use crate::panel::{BgQuad, PanelDrawCommands};
+use crate::tab_bar::TabBar;
+
+/// Max rounded rects: panel islands + tab bar elements (borders, backgrounds)
+const MAX_ROUNDED_RECTS: usize = 64;
+
+/// Background quad vertex.
+#[repr(C)]
+#[derive(Copy, Clone, bytemuck::Pod, bytemuck::Zeroable)]
+struct QuadVertex {
+    position: [f32; 2],
+    color: [f32; 4],
+}
+
+/// Uniform data for the rounded rectangle shader.
+#[repr(C)]
+#[derive(Copy, Clone, bytemuck::Pod, bytemuck::Zeroable)]
+struct RoundedRectUniforms {
+    rect_bounds: [f32; 4],
+    params: [f32; 4],
+    color: [f32; 4],
+}
+
+pub struct GpuContext {
+    pub device: Device,
+    pub queue: Queue,
+    pub surface: Surface<'static>,
+    pub surface_config: SurfaceConfiguration,
+
+    pub font_system: FontSystem,
+    swash_cache: SwashCache,
+    atlas: TextAtlas,
+    text_renderer: TextRenderer,
+    viewport: Viewport,
+    _cache: Cache,
+
+    pub cell: CellMetrics,
+    pub scale_factor: f32,
+
+    // Background quad rendering
+    quad_pipeline: RenderPipeline,
+    quad_vertex_buffer: wgpu::Buffer,
+
+    // Rounded rect (island backgrounds) — dynamic offset uniform buffer
+    rounded_rect_pipeline: RenderPipeline,
+    rounded_rect_uniform_buffer: wgpu::Buffer,
+    rounded_rect_bind_group: BindGroup,
+    uniform_alignment: u32,
+
+    pub colors: ColorScheme,
+}
+
+impl GpuContext {
+    pub fn new(window: Arc<winit::window::Window>, colors: ColorScheme) -> Self {
+        let size = window.inner_size();
+        let scale_factor = window.scale_factor() as f32;
+
+        let instance = Instance::new(InstanceDescriptor {
+            backends: Backends::PRIMARY,
+            ..Default::default()
+        });
+
+        let surface = instance.create_surface(window).expect("create surface");
+
+        let adapter = pollster::block_on(instance.request_adapter(&RequestAdapterOptions {
+            compatible_surface: Some(&surface),
+            power_preference: PowerPreference::LowPower,
+            ..Default::default()
+        }))
+        .expect("no adapter");
+
+        let (device, queue) = pollster::block_on(adapter.request_device(
+            &DeviceDescriptor {
+                label: Some("terminal device"),
+                ..Default::default()
+            },
+            None,
+        ))
+        .expect("request device");
+
+        let caps = surface.get_capabilities(&adapter);
+        let format = caps
+            .formats
+            .iter()
+            .find(|f| f.is_srgb())
+            .copied()
+            .unwrap_or(caps.formats[0]);
+
+        let surface_config = SurfaceConfiguration {
+            usage: TextureUsages::RENDER_ATTACHMENT | TextureUsages::COPY_SRC,
+            format,
+            width: size.width.max(1),
+            height: size.height.max(1),
+            present_mode: PresentMode::Fifo,
+            desired_maximum_frame_latency: 2,
+            alpha_mode: caps.alpha_modes[0],
+            view_formats: vec![],
+        };
+        surface.configure(&device, &surface_config);
+
+        // glyphon setup
+        let mut font_system = font::create_font_system();
+        let swash_cache = SwashCache::new();
+        let cache = Cache::new(&device);
+        let viewport = Viewport::new(&device, &cache);
+        let mut atlas = TextAtlas::new(&device, &queue, &cache, format);
+        let text_renderer =
+            TextRenderer::new(&mut atlas, &device, MultisampleState::default(), None);
+
+        let cell = font::measure_cell(&mut font_system);
+
+        // Quad pipeline
+        let quad_shader = device.create_shader_module(ShaderModuleDescriptor {
+            label: Some("quad shader"),
+            source: ShaderSource::Wgsl(QUAD_SHADER.into()),
+        });
+
+        let quad_pipeline_layout = device.create_pipeline_layout(&PipelineLayoutDescriptor {
+            label: Some("quad pipeline layout"),
+            bind_group_layouts: &[],
+            push_constant_ranges: &[],
+        });
+
+        let quad_pipeline = device.create_render_pipeline(&RenderPipelineDescriptor {
+            label: Some("quad pipeline"),
+            layout: Some(&quad_pipeline_layout),
+            vertex: VertexState {
+                module: &quad_shader,
+                entry_point: Some("vs_main"),
+                buffers: &[VertexBufferLayout {
+                    array_stride: std::mem::size_of::<QuadVertex>() as BufferAddress,
+                    step_mode: VertexStepMode::Vertex,
+                    attributes: &vertex_attr_array![0 => Float32x2, 1 => Float32x4],
+                }],
+                compilation_options: Default::default(),
+            },
+            fragment: Some(FragmentState {
+                module: &quad_shader,
+                entry_point: Some("fs_main"),
+                targets: &[Some(ColorTargetState {
+                    format,
+                    blend: Some(BlendState::ALPHA_BLENDING),
+                    write_mask: ColorWrites::ALL,
+                })],
+                compilation_options: Default::default(),
+            }),
+            primitive: PrimitiveState {
+                topology: PrimitiveTopology::TriangleList,
+                ..Default::default()
+            },
+            depth_stencil: None,
+            multisample: MultisampleState::default(),
+            multiview: None,
+            cache: None,
+        });
+
+        let quad_vertex_buffer = device.create_buffer(&BufferDescriptor {
+            label: Some("quad vertex buffer"),
+            size: 2 * 1024 * 1024,
+            usage: BufferUsages::VERTEX | BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+
+        // Rounded rect pipeline with dynamic uniform buffer
+        let uniform_alignment = device.limits().min_uniform_buffer_offset_alignment;
+        let uniform_size = std::mem::size_of::<RoundedRectUniforms>() as u32;
+        let aligned_size = align_up(uniform_size, uniform_alignment);
+
+        let rounded_rect_uniform_buffer = device.create_buffer(&BufferDescriptor {
+            label: Some("rounded rect uniforms"),
+            size: (aligned_size as usize * MAX_ROUNDED_RECTS) as u64,
+            usage: BufferUsages::UNIFORM | BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+
+        let rounded_rect_bind_group_layout =
+            device.create_bind_group_layout(&BindGroupLayoutDescriptor {
+                label: Some("rounded rect bind group layout"),
+                entries: &[BindGroupLayoutEntry {
+                    binding: 0,
+                    visibility: ShaderStages::FRAGMENT,
+                    ty: BindingType::Buffer {
+                        ty: BufferBindingType::Uniform,
+                        has_dynamic_offset: true,
+                        min_binding_size: wgpu::BufferSize::new(std::mem::size_of::<
+                            RoundedRectUniforms,
+                        >() as u64),
+                    },
+                    count: None,
+                }],
+            });
+
+        let rounded_rect_bind_group = device.create_bind_group(&BindGroupDescriptor {
+            label: Some("rounded rect bind group"),
+            layout: &rounded_rect_bind_group_layout,
+            entries: &[BindGroupEntry {
+                binding: 0,
+                resource: BindingResource::Buffer(BufferBinding {
+                    buffer: &rounded_rect_uniform_buffer,
+                    offset: 0,
+                    size: wgpu::BufferSize::new(std::mem::size_of::<RoundedRectUniforms>() as u64),
+                }),
+            }],
+        });
+
+        let rounded_rect_shader = device.create_shader_module(ShaderModuleDescriptor {
+            label: Some("rounded rect shader"),
+            source: ShaderSource::Wgsl(ROUNDED_RECT_SHADER.into()),
+        });
+
+        let rounded_rect_pipeline_layout =
+            device.create_pipeline_layout(&PipelineLayoutDescriptor {
+                label: Some("rounded rect pipeline layout"),
+                bind_group_layouts: &[&rounded_rect_bind_group_layout],
+                push_constant_ranges: &[],
+            });
+
+        let rounded_rect_pipeline = device.create_render_pipeline(&RenderPipelineDescriptor {
+            label: Some("rounded rect pipeline"),
+            layout: Some(&rounded_rect_pipeline_layout),
+            vertex: VertexState {
+                module: &rounded_rect_shader,
+                entry_point: Some("vs_main"),
+                buffers: &[],
+                compilation_options: Default::default(),
+            },
+            fragment: Some(FragmentState {
+                module: &rounded_rect_shader,
+                entry_point: Some("fs_main"),
+                targets: &[Some(ColorTargetState {
+                    format,
+                    blend: Some(BlendState::ALPHA_BLENDING),
+                    write_mask: ColorWrites::ALL,
+                })],
+                compilation_options: Default::default(),
+            }),
+            primitive: PrimitiveState {
+                topology: PrimitiveTopology::TriangleList,
+                ..Default::default()
+            },
+            depth_stencil: None,
+            multisample: MultisampleState::default(),
+            multiview: None,
+            cache: None,
+        });
+
+        Self {
+            device,
+            queue,
+            surface,
+            surface_config,
+            font_system,
+            swash_cache,
+            atlas,
+            text_renderer,
+            viewport,
+            _cache: cache,
+            cell,
+            scale_factor,
+            quad_pipeline,
+            quad_vertex_buffer,
+            rounded_rect_pipeline,
+            rounded_rect_uniform_buffer,
+            rounded_rect_bind_group,
+            uniform_alignment,
+            colors,
+        }
+    }
+
+    pub fn resize(&mut self, width: u32, height: u32) {
+        if width == 0 || height == 0 {
+            return;
+        }
+        self.surface_config.width = width;
+        self.surface_config.height = height;
+        self.surface.configure(&self.device, &self.surface_config);
+    }
+
+    pub fn set_scale_factor(&mut self, scale_factor: f32) {
+        self.scale_factor = scale_factor;
+    }
+
+    pub fn surface_width(&self) -> u32 {
+        self.surface_config.width
+    }
+
+    pub fn surface_height(&self) -> u32 {
+        self.surface_config.height
+    }
+
+    #[allow(dead_code)]
+    pub fn font_system(&mut self) -> &mut FontSystem {
+        &mut self.font_system
+    }
+
+    /// Render a complete frame with tab bar + multiple panel draw commands.
+    /// If `screenshot_path` is Some, saves the rendered frame as a PNG.
+    pub fn render_frame(
+        &mut self,
+        tab_bar: &TabBar,
+        panel_draws: &[PanelDrawCommands],
+        panel_line_buffers: &[&[Buffer]],
+        scale_factor: f32,
+        icon_manager: &IconManager,
+        screenshot_path: Option<&str>,
+    ) -> Result<(), SurfaceError> {
+        let frame = self.surface.get_current_texture()?;
+        let view = frame.texture.create_view(&TextureViewDescriptor::default());
+
+        let w = self.surface_config.width as f32;
+        let h = self.surface_config.height as f32;
+
+        let aligned_size = align_up(
+            std::mem::size_of::<RoundedRectUniforms>() as u32,
+            self.uniform_alignment,
+        ) as usize;
+
+        // Get tab bar draw commands — use panel bounds for alignment
+        let panel_x = panel_draws.first().map(|d| d.island_rect.x).unwrap_or(0.0);
+        let panel_y = panel_draws.first().map(|d| d.island_rect.y).unwrap_or(0.0);
+        let panel_w = panel_draws
+            .first()
+            .map(|d| d.island_rect.width)
+            .unwrap_or(w);
+        let tab_draw = tab_bar.draw_commands(&self.colors, scale_factor, panel_x, panel_y, panel_w);
+
+        // Upload all rounded rect uniforms: panels first (behind), then tab bar on top
+        let mut rr_index = 0;
+
+        // Panel island backgrounds (stroke + fill per panel) — drawn first (behind)
+        for draw in panel_draws {
+            // Stroke layer (only if stroke has alpha)
+            if draw.island_stroke_width > 0.0 && draw.island_stroke_color[3] > 0.0 {
+                if rr_index >= MAX_ROUNDED_RECTS {
+                    break;
+                }
+                let uniforms = RoundedRectUniforms {
+                    rect_bounds: [
+                        draw.island_rect.x,
+                        draw.island_rect.y,
+                        draw.island_rect.x + draw.island_rect.width,
+                        draw.island_rect.y + draw.island_rect.height,
+                    ],
+                    params: [draw.island_radius, 0.0, 0.0, 0.0],
+                    color: draw.island_stroke_color,
+                };
+                self.queue.write_buffer(
+                    &self.rounded_rect_uniform_buffer,
+                    (rr_index * aligned_size) as u64,
+                    bytemuck::cast_slice(&[uniforms]),
+                );
+                rr_index += 1;
+            }
+
+            // Fill layer (inset by stroke width)
+            if rr_index >= MAX_ROUNDED_RECTS {
+                break;
+            }
+            let sw = draw.island_stroke_width;
+            let uniforms = RoundedRectUniforms {
+                rect_bounds: [
+                    draw.island_rect.x + sw,
+                    draw.island_rect.y + sw,
+                    draw.island_rect.x + draw.island_rect.width - sw,
+                    draw.island_rect.y + draw.island_rect.height - sw,
+                ],
+                params: [(draw.island_radius - sw).max(0.0), 0.0, 0.0, 0.0],
+                color: draw.island_color,
+            };
+            self.queue.write_buffer(
+                &self.rounded_rect_uniform_buffer,
+                (rr_index * aligned_size) as u64,
+                bytemuck::cast_slice(&[uniforms]),
+            );
+            rr_index += 1;
+        }
+
+        // Tab bar rounded rects (tab backgrounds, borders) — drawn on top of panel islands
+        for rq in &tab_draw.rounded_quads {
+            if rr_index >= MAX_ROUNDED_RECTS {
+                break;
+            }
+            let uniforms = RoundedRectUniforms {
+                rect_bounds: [
+                    rq.rect.x,
+                    rq.rect.y,
+                    rq.rect.x + rq.rect.width,
+                    rq.rect.y + rq.rect.height,
+                ],
+                params: [rq.radius, 0.0, 0.0, 0.0],
+                color: rq.color,
+            };
+            self.queue.write_buffer(
+                &self.rounded_rect_uniform_buffer,
+                (rr_index * aligned_size) as u64,
+                bytemuck::cast_slice(&[uniforms]),
+            );
+            rr_index += 1;
+        }
+        let total_rounded_rects = rr_index;
+
+        // Build all quad vertices (tab bar flat quads + all panel cell backgrounds)
+        let mut quad_verts: Vec<QuadVertex> = Vec::new();
+
+        // Tab bar flat quads (separator line)
+        for bq in &tab_draw.flat_quads {
+            push_quad(&mut quad_verts, bq, w, h);
+        }
+
+        // Panel cell background quads
+        for draw in panel_draws {
+            for bq in &draw.bg_quads {
+                push_quad(&mut quad_verts, bq, w, h);
+            }
+        }
+
+        let quad_vertex_count = quad_verts.len() as u32;
+        if !quad_verts.is_empty() {
+            self.queue.write_buffer(
+                &self.quad_vertex_buffer,
+                0,
+                bytemuck::cast_slice(&quad_verts),
+            );
+        }
+
+        // glyphon text
+        self.viewport.update(
+            &self.queue,
+            Resolution {
+                width: self.surface_config.width,
+                height: self.surface_config.height,
+            },
+        );
+
+        // Build TextAreas from tab bar + all panels
+        let mut text_areas: Vec<TextArea> = Vec::new();
+
+        // Carrier buffer for tab bar icons (empty buffer, scale=1.0 so positions are physical px)
+        let mut icon_carrier = Buffer::new(&mut self.font_system, Metrics::new(1.0, 1.0));
+        icon_carrier.set_size(&mut self.font_system, Some(0.0), Some(0.0));
+
+        text_areas.push(TextArea {
+            buffer: &icon_carrier,
+            left: 0.0,
+            top: 0.0,
+            scale: 1.0,
+            bounds: TextBounds {
+                left: 0,
+                top: 0,
+                right: w as i32,
+                bottom: h as i32,
+            },
+            default_color: self.colors.fg_glyphon(),
+            custom_glyphs: &tab_draw.custom_glyphs,
+        });
+
+        // Tab bar label text areas
+        let tab_buffers = tab_bar.tab_buffers();
+        for ta in &tab_draw.text_areas {
+            if ta.buffer_index < tab_buffers.len() {
+                text_areas.push(TextArea {
+                    buffer: &tab_buffers[ta.buffer_index],
+                    left: ta.left,
+                    top: ta.top,
+                    scale: scale_factor,
+                    bounds: TextBounds {
+                        left: ta.bounds.x as i32,
+                        top: ta.bounds.y as i32,
+                        right: (ta.bounds.x + ta.bounds.width) as i32,
+                        bottom: (ta.bounds.y + ta.bounds.height) as i32,
+                    },
+                    default_color: self.colors.fg_glyphon(),
+                    custom_glyphs: &[],
+                });
+            }
+        }
+
+        // Panel text
+        for (panel_idx, draw) in panel_draws.iter().enumerate() {
+            if panel_idx >= panel_line_buffers.len() {
+                break;
+            }
+            let line_bufs = panel_line_buffers[panel_idx];
+            for (line_idx, spec) in draw.text_lines.iter().enumerate() {
+                if line_idx >= line_bufs.len() {
+                    break;
+                }
+                text_areas.push(TextArea {
+                    buffer: &line_bufs[line_idx],
+                    left: spec.left,
+                    top: spec.top,
+                    scale: scale_factor,
+                    bounds: TextBounds {
+                        left: spec.bounds.x as i32,
+                        top: spec.bounds.y as i32,
+                        right: (spec.bounds.x + spec.bounds.width) as i32,
+                        bottom: (spec.bounds.y + spec.bounds.height) as i32,
+                    },
+                    default_color: self.colors.fg_glyphon(),
+                    custom_glyphs: &[],
+                });
+            }
+        }
+
+        self.text_renderer
+            .prepare_with_custom(
+                &self.device,
+                &self.queue,
+                &mut self.font_system,
+                &mut self.atlas,
+                &self.viewport,
+                text_areas,
+                &mut self.swash_cache,
+                |req| icon_manager.rasterize(req),
+            )
+            .expect("prepare text");
+
+        // Encode render pass
+        let mut encoder = self
+            .device
+            .create_command_encoder(&CommandEncoderDescriptor {
+                label: Some("render encoder"),
+            });
+
+        {
+            let mut pass = encoder.begin_render_pass(&RenderPassDescriptor {
+                label: Some("main pass"),
+                color_attachments: &[Some(RenderPassColorAttachment {
+                    view: &view,
+                    resolve_target: None,
+                    ops: Operations {
+                        load: LoadOp::Clear({
+                            let chrome = self.colors.chrome_wgpu();
+                            wgpu::Color {
+                                r: chrome[0],
+                                g: chrome[1],
+                                b: chrome[2],
+                                a: chrome[3],
+                            }
+                        }),
+                        store: StoreOp::Store,
+                    },
+                })],
+                depth_stencil_attachment: None,
+                ..Default::default()
+            });
+
+            // 1. Draw all rounded rects (tab bar elements + island backgrounds)
+            if total_rounded_rects > 0 {
+                pass.set_pipeline(&self.rounded_rect_pipeline);
+                for i in 0..total_rounded_rects {
+                    let offset = (i * aligned_size) as u32;
+                    pass.set_bind_group(0, &self.rounded_rect_bind_group, &[offset]);
+                    pass.draw(0..6, 0..1);
+                }
+            }
+
+            // 2. Draw quads (tab bar + cell backgrounds + cursors)
+            if quad_vertex_count > 0 {
+                pass.set_pipeline(&self.quad_pipeline);
+                pass.set_vertex_buffer(0, self.quad_vertex_buffer.slice(..));
+                pass.draw(0..quad_vertex_count, 0..1);
+            }
+
+            // 3. Draw text + icons
+            self.text_renderer
+                .render(&self.atlas, &self.viewport, &mut pass)
+                .expect("render text");
+        }
+
+        // Optional: copy rendered texture to staging buffer for screenshot
+        let staging = if screenshot_path.is_some() {
+            let width = self.surface_config.width;
+            let height = self.surface_config.height;
+            let bytes_per_pixel = 4u32;
+            let padded_row = align_up(width * bytes_per_pixel, 256);
+
+            let staging_buf = self.device.create_buffer(&BufferDescriptor {
+                label: Some("screenshot staging"),
+                size: (padded_row * height) as u64,
+                usage: BufferUsages::COPY_DST | BufferUsages::MAP_READ,
+                mapped_at_creation: false,
+            });
+
+            encoder.copy_texture_to_buffer(
+                frame.texture.as_image_copy(),
+                ImageCopyBuffer {
+                    buffer: &staging_buf,
+                    layout: ImageDataLayout {
+                        offset: 0,
+                        bytes_per_row: Some(padded_row),
+                        rows_per_image: Some(height),
+                    },
+                },
+                Extent3d {
+                    width,
+                    height,
+                    depth_or_array_layers: 1,
+                },
+            );
+
+            Some((staging_buf, padded_row, width, height))
+        } else {
+            None
+        };
+
+        self.queue.submit(std::iter::once(encoder.finish()));
+
+        // Read back screenshot if requested
+        if let (Some(path), Some((staging_buf, padded_row, width, height))) =
+            (screenshot_path, &staging)
+        {
+            let buffer_slice = staging_buf.slice(..);
+            let (tx, rx) = std::sync::mpsc::channel();
+            buffer_slice.map_async(MapMode::Read, move |result| {
+                tx.send(result).unwrap();
+            });
+            self.device.poll(Maintain::Wait);
+            rx.recv().unwrap().expect("map staging buffer");
+
+            let data = buffer_slice.get_mapped_range();
+            save_screenshot(path, &data, *width, *height, *padded_row);
+            drop(data);
+            staging_buf.unmap();
+        }
+
+        frame.present();
+
+        self.atlas.trim();
+
+        Ok(())
+    }
+}
+
+fn save_screenshot(path: &str, data: &[u8], width: u32, height: u32, padded_row: u32) {
+    let file = std::fs::File::create(path).expect("create screenshot file");
+    let writer = std::io::BufWriter::new(file);
+
+    let mut encoder = png::Encoder::new(writer, width, height);
+    encoder.set_color(png::ColorType::Rgba);
+    encoder.set_depth(png::BitDepth::Eight);
+    encoder.set_source_srgb(png::SrgbRenderingIntent::Perceptual);
+
+    let mut writer = encoder.write_header().expect("write PNG header");
+
+    // Convert from BGRA (wgpu surface format) to RGBA, stripping row padding
+    let unpadded_row = width * 4;
+    let mut rgba_data = Vec::with_capacity((unpadded_row * height) as usize);
+    for row in 0..height {
+        let row_start = (row * padded_row) as usize;
+        let row_end = row_start + unpadded_row as usize;
+        let row_data = &data[row_start..row_end];
+        for pixel in row_data.chunks_exact(4) {
+            // BGRA -> RGBA
+            rgba_data.push(pixel[2]); // R
+            rgba_data.push(pixel[1]); // G
+            rgba_data.push(pixel[0]); // B
+            rgba_data.push(pixel[3]); // A
+        }
+    }
+
+    writer.write_image_data(&rgba_data).expect("write PNG data");
+    log::info!("screenshot saved to {path}");
+}
+
+fn push_quad(verts: &mut Vec<QuadVertex>, bq: &BgQuad, surface_w: f32, surface_h: f32) {
+    let x0 = bq.x;
+    let y0 = bq.y;
+    let x1 = x0 + bq.w;
+    let y1 = y0 + bq.h;
+
+    let nx0 = (x0 / surface_w) * 2.0 - 1.0;
+    let ny0 = 1.0 - (y0 / surface_h) * 2.0;
+    let nx1 = (x1 / surface_w) * 2.0 - 1.0;
+    let ny1 = 1.0 - (y1 / surface_h) * 2.0;
+
+    let c = bq.color;
+    verts.push(QuadVertex {
+        position: [nx0, ny0],
+        color: c,
+    });
+    verts.push(QuadVertex {
+        position: [nx1, ny0],
+        color: c,
+    });
+    verts.push(QuadVertex {
+        position: [nx0, ny1],
+        color: c,
+    });
+    verts.push(QuadVertex {
+        position: [nx0, ny1],
+        color: c,
+    });
+    verts.push(QuadVertex {
+        position: [nx1, ny0],
+        color: c,
+    });
+    verts.push(QuadVertex {
+        position: [nx1, ny1],
+        color: c,
+    });
+}
+
+fn align_up(value: u32, alignment: u32) -> u32 {
+    (value + alignment - 1) & !(alignment - 1)
+}
+
+const QUAD_SHADER: &str = r#"
+struct VertexInput {
+    @location(0) position: vec2<f32>,
+    @location(1) color: vec4<f32>,
+};
+
+struct VertexOutput {
+    @builtin(position) clip_position: vec4<f32>,
+    @location(0) color: vec4<f32>,
+};
+
+@vertex
+fn vs_main(in: VertexInput) -> VertexOutput {
+    var out: VertexOutput;
+    out.clip_position = vec4<f32>(in.position, 0.0, 1.0);
+    out.color = in.color;
+    return out;
+}
+
+@fragment
+fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
+    return in.color;
+}
+"#;
+
+const ROUNDED_RECT_SHADER: &str = r#"
+struct Uniforms {
+    rect_bounds: vec4<f32>,
+    params: vec4<f32>,
+    color: vec4<f32>,
+};
+
+@group(0) @binding(0) var<uniform> u: Uniforms;
+
+struct VertexOutput {
+    @builtin(position) position: vec4<f32>,
+};
+
+@vertex
+fn vs_main(@builtin(vertex_index) vi: u32) -> VertexOutput {
+    var positions = array<vec2<f32>, 6>(
+        vec2(-1.0, 1.0),
+        vec2(1.0, 1.0),
+        vec2(-1.0, -1.0),
+        vec2(-1.0, -1.0),
+        vec2(1.0, 1.0),
+        vec2(1.0, -1.0),
+    );
+    var out: VertexOutput;
+    out.position = vec4(positions[vi], 0.0, 1.0);
+    return out;
+}
+
+fn rounded_rect_sdf(p: vec2<f32>, half_size: vec2<f32>, r: f32) -> f32 {
+    let q = abs(p) - half_size + vec2(r);
+    return min(max(q.x, q.y), 0.0) + length(max(q, vec2(0.0))) - r;
+}
+
+@fragment
+fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
+    let pixel = in.position.xy;
+    let rect_min = u.rect_bounds.xy;
+    let rect_max = u.rect_bounds.zw;
+    let center = (rect_min + rect_max) * 0.5;
+    let half_size = (rect_max - rect_min) * 0.5;
+    let radius = u.params.x;
+
+    let d = rounded_rect_sdf(pixel - center, half_size, radius);
+    let alpha = 1.0 - smoothstep(-0.5, 0.5, d);
+
+    if alpha < 0.001 {
+        discard;
+    }
+
+    return vec4(u.color.rgb, u.color.a * alpha);
+}
+"#;

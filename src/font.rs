@@ -4,6 +4,7 @@ pub const FONT_DATA: &[u8] = include_bytes!("../fonts/JetBrainsMono-Regular.ttf"
 pub const FONT_SIZE: f32 = 14.0;
 pub const LINE_HEIGHT: f32 = 1.2;
 
+#[derive(Clone)]
 pub struct CellMetrics {
     pub width: f32,
     pub height: f32,
