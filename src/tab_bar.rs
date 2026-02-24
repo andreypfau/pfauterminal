@@ -207,9 +207,19 @@ impl TabBar {
     }
 
     pub fn compute_hover(&self, x: f32, y: f32) -> TabBarHover {
+        // Close buttons checked first with expanded hit area for easier targeting
         for (i, rect) in self.close_rects.iter().enumerate() {
-            if x >= rect.x && x < rect.x + rect.width && y >= rect.y && y < rect.y + rect.height {
-                return TabBarHover::CloseButton(i);
+            let is_active = i == self.active_tab;
+            let is_tab_hovered = matches!(self.hover, TabBarHover::Tab(idx) | TabBarHover::CloseButton(idx) if idx == i);
+            if is_active || is_tab_hovered {
+                let pad = 4.0; // extra hit area padding
+                if x >= rect.x - pad
+                    && x < rect.x + rect.width + pad
+                    && y >= rect.y - pad
+                    && y < rect.y + rect.height + pad
+                {
+                    return TabBarHover::CloseButton(i);
+                }
             }
         }
 
@@ -241,8 +251,17 @@ impl TabBar {
 
     pub fn hit_test(&self, x: f32, y: f32) -> TabBarHit {
         for (i, rect) in self.close_rects.iter().enumerate() {
-            if x >= rect.x && x < rect.x + rect.width && y >= rect.y && y < rect.y + rect.height {
-                return TabBarHit::CloseTab(i);
+            let is_active = i == self.active_tab;
+            let is_tab_hovered = matches!(self.hover, TabBarHover::Tab(idx) | TabBarHover::CloseButton(idx) if idx == i);
+            if is_active || is_tab_hovered {
+                let pad = 4.0;
+                if x >= rect.x - pad
+                    && x < rect.x + rect.width + pad
+                    && y >= rect.y - pad
+                    && y < rect.y + rect.height + pad
+                {
+                    return TabBarHit::CloseTab(i);
+                }
             }
         }
 

@@ -258,7 +258,9 @@ impl App {
         self.workspaces.remove(idx);
 
         if self.workspaces.is_empty() {
-            std::process::exit(0);
+            // Last tab closed — open a fresh one instead of exiting
+            self.new_workspace();
+            return;
         }
 
         if self.active_workspace >= self.workspaces.len() {
@@ -383,11 +385,12 @@ impl ApplicationHandler<TerminalEvent> for App {
             }
 
             WindowEvent::CursorMoved { position, .. } => {
-                let scale = self.gpu.as_ref().map(|g| g.scale_factor).unwrap_or(1.0);
-                self.cursor_position = (position.x as f32 * scale, position.y as f32 * scale);
+                // position is already in physical pixels
+                self.cursor_position = (position.x as f32, position.y as f32);
 
                 // Update tab bar hover state
                 let (cx, cy) = self.cursor_position;
+                let scale = self.gpu.as_ref().map(|g| g.scale_factor).unwrap_or(1.0);
                 let pad = PANEL_AREA_PADDING * scale;
                 let tab_h = TabBar::height(scale);
                 let hover = if cy >= pad && cy < pad + tab_h {
