@@ -6,7 +6,7 @@ use glyphon::Color as GlyphonColor;
 use serde::{Deserialize, Serialize};
 
 /// RGBA color as 8-bit hex string "RRGGBBAA".
-fn hex_to_rgba(hex: &str) -> (u8, u8, u8, u8) {
+pub fn hex_to_rgba(hex: &str) -> (u8, u8, u8, u8) {
     let hex = hex.strip_prefix('#').unwrap_or(hex);
     let r = u8::from_str_radix(&hex[0..2], 16).unwrap_or(0);
     let g = u8::from_str_radix(&hex[2..4], 16).unwrap_or(0);
@@ -292,7 +292,7 @@ impl ColorScheme {
 }
 
 /// Convert a hex color string to linear f32 RGBA.
-fn hex_to_linear_f32(hex: &str) -> [f32; 4] {
+pub fn hex_to_linear_f32(hex: &str) -> [f32; 4] {
     let (r, g, b, a) = hex_to_rgba(hex);
     [
         srgb_to_linear(r as f32 / 255.0),

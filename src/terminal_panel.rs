@@ -9,6 +9,7 @@ use winit::keyboard::{Key, NamedKey};
 use crate::colors::ColorScheme;
 use crate::font::{self, CellMetrics};
 use crate::layout::Rect;
+use crate::ssh::SshConfig;
 use crate::terminal::{EventProxy, TermSize, Terminal};
 
 // --- Panel types ---
@@ -110,9 +111,10 @@ impl TerminalPanel {
         cell_height: u16,
         event_proxy: EventProxy,
         shell: Option<String>,
+        args: Vec<String>,
     ) -> Self {
         let size = TermSize::new(cols, rows);
-        let terminal = Terminal::new(size, cell_width, cell_height, event_proxy, shell);
+        let terminal = Terminal::new(size, cell_width, cell_height, event_proxy, shell, args);
         Self {
             id,
             terminal,
@@ -120,6 +122,27 @@ impl TerminalPanel {
             char_buffers: Vec::new(),
             char_key_map: HashMap::new(),
             title: String::from("Terminal"),
+        }
+    }
+
+    pub fn new_ssh(
+        id: PanelId,
+        cols: usize,
+        rows: usize,
+        cell_width: u16,
+        cell_height: u16,
+        event_proxy: EventProxy,
+        ssh_config: SshConfig,
+    ) -> Self {
+        let size = TermSize::new(cols, rows);
+        let terminal = Terminal::new_ssh(size, cell_width, cell_height, event_proxy, ssh_config);
+        Self {
+            id,
+            terminal,
+            viewport: None,
+            char_buffers: Vec::new(),
+            char_key_map: HashMap::new(),
+            title: String::from("SSH"),
         }
     }
 

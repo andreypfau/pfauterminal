@@ -5,6 +5,8 @@ mod font;
 mod gpu;
 mod icons;
 mod layout;
+mod ssh;
+mod ssh_dialog;
 mod tab_bar;
 mod terminal;
 mod terminal_panel;

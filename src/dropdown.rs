@@ -20,6 +20,7 @@ const MENU_SHADOW_OFFSET_Y: f32 = 4.0;
 #[derive(Debug, Clone)]
 pub enum MenuAction {
     NewShell(String),
+    OpenSshDialog,
 }
 
 pub struct MenuItem {

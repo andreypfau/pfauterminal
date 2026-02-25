@@ -28,14 +28,14 @@ struct QuadVertex {
 /// Uniform data for the rounded rectangle shader.
 #[repr(C)]
 #[derive(Copy, Clone, bytemuck::Pod, bytemuck::Zeroable)]
-struct RoundedRectUniforms {
+pub struct RoundedRectUniforms {
     rect_bounds: [f32; 4],
     params: [f32; 4],
     color: [f32; 4],
 }
 
 impl RoundedRectUniforms {
-    fn new(rect: &Rect, radius: f32, shadow_softness: f32, color: [f32; 4]) -> Self {
+    pub fn new(rect: &Rect, radius: f32, shadow_softness: f32, color: [f32; 4]) -> Self {
         Self {
             rect_bounds: [rect.x, rect.y, rect.x + rect.width, rect.y + rect.height],
             params: [radius, shadow_softness, 0.0, 0.0],
@@ -532,7 +532,7 @@ impl GpuContext {
             )
             .expect("prepare scene text");
 
-        // Overlay text (dropdown) — rendered after overlay rects paint over scene text
+        // Overlay text (dropdown + SSH dialog) — rendered after overlay rects paint over scene text
         let has_overlay = scene_rr_count < total_rounded_rects;
         let dropdown_buffers = dropdown.map(|d| d.item_buffers());
         let mut overlay_areas: Vec<TextArea> = Vec::new();
@@ -556,6 +556,7 @@ impl GpuContext {
                 }
             }
         }
+
         self.overlay_text_renderer
             .prepare(
                 &self.device,
@@ -735,7 +736,7 @@ fn save_screenshot(path: &str, data: &[u8], width: u32, height: u32, padded_row:
     log::info!("screenshot saved to {path}");
 }
 
-fn rect_to_text_bounds(r: &Rect) -> TextBounds {
+pub fn rect_to_text_bounds(r: &Rect) -> TextBounds {
     TextBounds {
         left: r.x as i32,
         top: r.y as i32,
@@ -782,7 +783,7 @@ fn push_quad(verts: &mut Vec<QuadVertex>, bq: &BgQuad, surface_w: f32, surface_h
     });
 }
 
-fn align_up(value: u32, alignment: u32) -> u32 {
+pub fn align_up(value: u32, alignment: u32) -> u32 {
     (value + alignment - 1) & !(alignment - 1)
 }
 
@@ -811,7 +812,7 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
 }
 "#;
 
-const ROUNDED_RECT_SHADER: &str = r#"
+pub const ROUNDED_RECT_SHADER: &str = r#"
 struct Uniforms {
     rect_bounds: vec4<f32>,
     params: vec4<f32>,

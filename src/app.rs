@@ -1,4 +1,4 @@
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
 use winit::application::ApplicationHandler;
 use winit::event::{ElementState, MouseButton, WindowEvent};
@@ -11,6 +11,7 @@ use crate::dropdown::{DropdownHit, DropdownMenu, MenuAction, MenuItem};
 use crate::gpu::GpuContext;
 use crate::icons::IconManager;
 use crate::layout::Rect;
+use crate::ssh_dialog::{SshDialogWindow, SshResult};
 use crate::tab_bar::{TabBar, TabBarHit};
 use crate::terminal::{EventProxy, TerminalEvent};
 use crate::terminal_panel::{PanelId, TerminalPanel};
@@ -29,6 +30,7 @@ pub struct App {
     active_workspace: usize,
     tab_bar: TabBar,
     dropdown: DropdownMenu,
+    ssh_dialog_window: Option<SshDialogWindow>,
     cursor_position: (f32, f32),
     super_pressed: bool,
     screenshot_pending: Option<String>,
@@ -47,16 +49,21 @@ impl App {
             active_workspace: 0,
             tab_bar: TabBar::new(),
             dropdown: DropdownMenu::new(),
+            ssh_dialog_window: None,
             cursor_position: (0.0, 0.0),
             super_pressed: false,
             screenshot_pending: std::env::var("SCREENSHOT").ok().filter(|s| !s.is_empty()),
         }
     }
 
-    fn create_terminal_panel(&self, gpu: &GpuContext, shell: Option<String>) -> TerminalPanel {
+    fn create_terminal_panel(
+        &self,
+        gpu: &GpuContext,
+        shell: Option<String>,
+        args: Vec<String>,
+    ) -> TerminalPanel {
         let panel_id = PanelId::next();
-        let pty_writer = Arc::new(Mutex::new(None));
-        let event_proxy = EventProxy::new(self.event_proxy_raw.clone(), panel_id, pty_writer);
+        let event_proxy = EventProxy::new(self.event_proxy_raw.clone(), panel_id);
 
         let scale = gpu.scale_factor;
         let area = Self::panel_area_from_gpu(gpu);
@@ -74,6 +81,7 @@ impl App {
             cell_h,
             event_proxy,
             shell,
+            args,
         )
     }
 
@@ -194,7 +202,37 @@ impl App {
 
     fn new_workspace(&mut self, shell: Option<String>) {
         let gpu = self.gpu.as_ref().unwrap();
-        let panel = self.create_terminal_panel(gpu, shell);
+        let panel = self.create_terminal_panel(gpu, shell, Vec::new());
+        let ws = Workspace::new(panel);
+        self.workspaces.push(ws);
+        self.active_workspace = self.workspaces.len() - 1;
+        self.sync_workspace_state();
+    }
+
+    fn new_workspace_ssh(&mut self, result: SshResult) {
+        let ssh_config = result.to_ssh_config();
+
+        let gpu = self.gpu.as_ref().unwrap();
+        let panel_id = PanelId::next();
+        let event_proxy = EventProxy::new(self.event_proxy_raw.clone(), panel_id);
+
+        let scale = gpu.scale_factor;
+        let area = Self::panel_area_from_gpu(gpu);
+        let tab_h = TabBar::height(scale);
+        let vp = TerminalPanel::compute_viewport(&area, &gpu.cell, scale, tab_h);
+
+        let cell_w = (gpu.cell.width * scale) as u16;
+        let cell_h = (gpu.cell.height * scale) as u16;
+
+        let panel = TerminalPanel::new_ssh(
+            panel_id,
+            vp.cols,
+            vp.rows,
+            cell_w,
+            cell_h,
+            event_proxy,
+            ssh_config,
+        );
         let ws = Workspace::new(panel);
         self.workspaces.push(ws);
         self.active_workspace = self.workspaces.len() - 1;
@@ -222,25 +260,23 @@ impl App {
     fn open_new_tab_dropdown(&mut self) {
         let shells = detect_shells();
 
-        // If only one shell available, open it directly — no menu needed
-        if shells.len() <= 1 {
-            let shell = shells.into_iter().next().map(|(_, path)| path);
-            self.new_workspace(shell);
-            return;
-        }
-
         let gpu = self.gpu.as_mut().unwrap();
         let scale = gpu.scale_factor;
         let surface_w = gpu.surface_config.width as f32;
         let surface_h = gpu.surface_config.height as f32;
 
-        let items: Vec<MenuItem> = shells
+        let mut items: Vec<MenuItem> = shells
             .into_iter()
             .map(|(label, path)| MenuItem {
                 label,
                 action: MenuAction::NewShell(path),
             })
             .collect();
+
+        items.push(MenuItem {
+            label: "SSH Session...".to_string(),
+            action: MenuAction::OpenSshDialog,
+        });
 
         let anchor = self.tab_bar.plus_rect();
         self.dropdown.open(
@@ -253,10 +289,20 @@ impl App {
         );
     }
 
-    fn execute_menu_action(&mut self, action: &MenuAction) {
+    fn open_ssh_dialog(&mut self, event_loop: &ActiveEventLoop) {
+        if self.ssh_dialog_window.is_some() {
+            return; // already open
+        }
+        self.ssh_dialog_window = Some(SshDialogWindow::open(event_loop));
+    }
+
+    fn execute_menu_action(&mut self, action: &MenuAction, event_loop: &ActiveEventLoop) {
         match action {
             MenuAction::NewShell(shell_path) => {
                 self.new_workspace(Some(shell_path.clone()));
+            }
+            MenuAction::OpenSshDialog => {
+                self.open_ssh_dialog(event_loop);
             }
         }
     }
@@ -297,6 +343,15 @@ impl ApplicationHandler<TerminalEvent> for App {
                 self.update_window_title();
                 self.request_redraw();
             }
+            TerminalEvent::SshDialogClose(result) => {
+                self.ssh_dialog_window = None;
+                if let Some(result) = result {
+                    if !result.host.is_empty() {
+                        self.new_workspace_ssh(result);
+                        self.request_redraw();
+                    }
+                }
+            }
             TerminalEvent::Exit(panel_id) => {
                 log::info!("terminal {panel_id:?} exited");
                 self.workspaces.retain(|ws| ws.panel.id() != panel_id);
@@ -317,9 +372,40 @@ impl ApplicationHandler<TerminalEvent> for App {
     fn window_event(
         &mut self,
         event_loop: &ActiveEventLoop,
-        _window_id: WindowId,
+        window_id: WindowId,
         event: WindowEvent,
     ) {
+        // Route events to SSH dialog window if it matches
+        if let Some(dialog_win) = &mut self.ssh_dialog_window {
+            if window_id == dialog_win.window_id() {
+                match dialog_win.handle_event(event) {
+                    Ok(None) => {} // continue
+                    Ok(Some(result)) => {
+                        // Defer close — dropping the window inside its own event
+                        // handler (e.g. key_down) crashes on macOS because the
+                        // NSView is deallocated while Objective-C still holds it.
+                        let _ = self
+                            .event_proxy_raw
+                            .send_event(TerminalEvent::SshDialogClose(Some(result)));
+                    }
+                    Err(()) => {
+                        // Defer cancel
+                        let _ = self
+                            .event_proxy_raw
+                            .send_event(TerminalEvent::SshDialogClose(None));
+                    }
+                }
+                return;
+            }
+        }
+
+        // Ignore events for unknown windows (stale events from recently closed dialog)
+        if let Some(main_window) = &self.window {
+            if window_id != main_window.id() {
+                return;
+            }
+        }
+
         match event {
             WindowEvent::CloseRequested => {
                 event_loop.exit();
@@ -396,7 +482,7 @@ impl ApplicationHandler<TerminalEvent> for App {
                             let action = self.dropdown.action_for(idx).cloned();
                             self.dropdown.close();
                             if let Some(action) = action {
-                                self.execute_menu_action(&action);
+                                self.execute_menu_action(&action, event_loop);
                             }
                         }
                         DropdownHit::Outside => {
