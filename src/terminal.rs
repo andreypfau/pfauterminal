@@ -23,11 +23,42 @@ pub enum TerminalEvent {
     SshDialogClose(Option<crate::ssh_dialog::SshResult>),
 }
 
-/// Generalizes the write-back path used by `EventProxy`:
-/// either a local PTY sender or an SSH channel sender.
-enum PtyWriter {
+/// I/O backend: either a local PTY or an SSH channel.
+enum Backend {
     Local(EventLoopSender),
     Ssh(mpsc::UnboundedSender<SshMsg>),
+}
+
+impl Backend {
+    fn send_input(&self, data: Cow<'static, [u8]>) {
+        match self {
+            Backend::Local(ch) => {
+                let _ = ch.send(Msg::Input(data));
+            }
+            Backend::Ssh(tx) => {
+                let _ = tx.send(SshMsg::Input(data));
+            }
+        }
+    }
+
+    fn send_resize(&self, size: TermSize, cell_width: u16, cell_height: u16) {
+        match self {
+            Backend::Local(ch) => {
+                let _ = ch.send(Msg::Resize(WindowSize {
+                    num_lines: size.screen_lines as u16,
+                    num_cols: size.columns as u16,
+                    cell_width,
+                    cell_height,
+                }));
+            }
+            Backend::Ssh(tx) => {
+                let _ = tx.send(SshMsg::Resize {
+                    cols: size.columns as u16,
+                    rows: size.screen_lines as u16,
+                });
+            }
+        }
+    }
 }
 
 /// Bridges alacritty's EventListener to winit's EventLoopProxy.
@@ -35,7 +66,7 @@ enum PtyWriter {
 pub struct EventProxy {
     proxy: EventLoopProxy<TerminalEvent>,
     panel_id: PanelId,
-    pty_writer: Arc<Mutex<Option<PtyWriter>>>,
+    backend: Arc<Mutex<Option<Backend>>>,
 }
 
 impl EventProxy {
@@ -43,7 +74,7 @@ impl EventProxy {
         Self {
             proxy,
             panel_id,
-            pty_writer: Arc::new(Mutex::new(None)),
+            backend: Arc::new(Mutex::new(None)),
         }
     }
 }
@@ -59,15 +90,9 @@ impl EventListener for EventProxy {
                 self.proxy.send_event(TerminalEvent::Exit(self.panel_id))
             }
             Event::PtyWrite(text) => {
-                if let Ok(guard) = self.pty_writer.lock() {
-                    match guard.as_ref() {
-                        Some(PtyWriter::Local(sender)) => {
-                            let _ = sender.send(Msg::Input(Cow::Owned(text.into_bytes())));
-                        }
-                        Some(PtyWriter::Ssh(sender)) => {
-                            let _ = sender.send(SshMsg::Input(Cow::Owned(text.into_bytes())));
-                        }
-                        None => {}
+                if let Ok(guard) = self.backend.lock() {
+                    if let Some(backend) = guard.as_ref() {
+                        backend.send_input(Cow::Owned(text.into_bytes()));
                     }
                 }
                 Ok(())
@@ -105,20 +130,10 @@ impl Dimensions for TermSize {
     }
 }
 
-/// I/O backend: either a local PTY or an SSH channel.
-enum TerminalBackend {
-    Local {
-        channel: EventLoopSender,
-    },
-    Ssh {
-        sender: mpsc::UnboundedSender<SshMsg>,
-    },
-}
-
 /// Wraps alacritty_terminal's Term with either a local PTY or SSH backend.
 pub struct Terminal {
     pub term: Arc<FairMutex<Term<EventProxy>>>,
-    backend: TerminalBackend,
+    backend: Backend,
 }
 
 impl Terminal {
@@ -163,73 +178,40 @@ impl Terminal {
 
         let channel = event_loop.channel();
 
-        // Wire up the PTY writer so EventProxy can send responses back.
-        if let Ok(mut guard) = event_proxy.pty_writer.lock() {
-            *guard = Some(PtyWriter::Local(channel.clone()));
+        if let Ok(mut guard) = event_proxy.backend.lock() {
+            *guard = Some(Backend::Local(channel.clone()));
         }
 
         event_loop.spawn();
 
         Self {
             term,
-            backend: TerminalBackend::Local { channel },
+            backend: Backend::Local(channel),
         }
     }
 
     /// Create a terminal backed by a native SSH connection.
-    pub fn new_ssh(
-        size: TermSize,
-        cell_width: u16,
-        cell_height: u16,
-        event_proxy: EventProxy,
-        ssh_config: SshConfig,
-    ) -> Self {
-        let _ = (cell_width, cell_height); // not needed for SSH PTY creation
-
+    pub fn new_ssh(size: TermSize, event_proxy: EventProxy, ssh_config: SshConfig) -> Self {
         let (term, sender) = crate::ssh::spawn_ssh_thread(ssh_config, size, event_proxy.clone());
 
-        // Wire up the PTY writer so EventProxy can route PtyWrite events to SSH.
-        if let Ok(mut guard) = event_proxy.pty_writer.lock() {
-            *guard = Some(PtyWriter::Ssh(sender.clone()));
+        if let Ok(mut guard) = event_proxy.backend.lock() {
+            *guard = Some(Backend::Ssh(sender.clone()));
         }
 
         Self {
             term,
-            backend: TerminalBackend::Ssh { sender },
+            backend: Backend::Ssh(sender),
         }
     }
 
     /// Send raw bytes (keyboard input) to the backend.
     pub fn write(&self, data: impl Into<Cow<'static, [u8]>>) {
-        match &self.backend {
-            TerminalBackend::Local { channel } => {
-                let _ = channel.send(Msg::Input(data.into()));
-            }
-            TerminalBackend::Ssh { sender } => {
-                let _ = sender.send(SshMsg::Input(data.into()));
-            }
-        }
+        self.backend.send_input(data.into());
     }
 
     /// Resize the terminal grid and notify the backend.
     pub fn resize(&self, size: TermSize, cell_width: u16, cell_height: u16) {
-        match &self.backend {
-            TerminalBackend::Local { channel } => {
-                let window_size = WindowSize {
-                    num_lines: size.screen_lines as u16,
-                    num_cols: size.columns as u16,
-                    cell_width,
-                    cell_height,
-                };
-                let _ = channel.send(Msg::Resize(window_size));
-            }
-            TerminalBackend::Ssh { sender } => {
-                let _ = sender.send(SshMsg::Resize {
-                    cols: size.columns as u16,
-                    rows: size.screen_lines as u16,
-                });
-            }
-        }
+        self.backend.send_resize(size, cell_width, cell_height);
         self.term.lock().resize(size);
     }
 

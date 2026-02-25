@@ -1,9 +1,9 @@
 use glyphon::{Attrs, Buffer, CustomGlyph, Family, FontSystem, Metrics, Shaping};
 
-use crate::colors::ColorScheme;
+use crate::colors::{hex_to_glyphon_color, hex_to_linear_f32, ColorScheme};
 use crate::icons;
-use crate::layout::Rect;
-use crate::terminal_panel::BgQuad;
+use crate::layout::{push_stroked_rounded_rect, Rect, RoundedQuad};
+use crate::terminal_panel::{BgQuad, TextSpec};
 
 const TAB_BAR_HEIGHT: f32 = 36.0;
 const TAB_PADDING_H: f32 = 12.0;
@@ -37,22 +37,6 @@ pub enum TabBarHit {
     None,
 }
 
-enum TabBarTarget {
-    Close(usize),
-    Tab(usize),
-    Plus,
-    None,
-}
-
-/// A filled rounded rectangle for SDF rendering.
-/// When `shadow_softness` > 0, renders as a soft shadow instead of a sharp rect.
-pub struct RoundedQuad {
-    pub rect: Rect,
-    pub color: [f32; 4],
-    pub radius: f32,
-    pub shadow_softness: f32,
-}
-
 /// Structured draw commands for the tab bar.
 pub struct TabBarDrawCommands {
     /// Flat quads (separator line only)
@@ -60,15 +44,7 @@ pub struct TabBarDrawCommands {
     /// Rounded rect fills (tab backgrounds, borders — rendered via SDF pipeline)
     pub rounded_quads: Vec<RoundedQuad>,
     pub custom_glyphs: Vec<CustomGlyph>,
-    pub text_areas: Vec<TabBarTextArea>,
-}
-
-pub struct TabBarTextArea {
-    pub buffer_index: usize,
-    pub left: f32,
-    pub top: f32,
-    pub bounds: Rect,
-    pub is_active: bool,
+    pub text_areas: Vec<TextSpec>,
 }
 
 pub struct TabBar {
@@ -207,32 +183,32 @@ impl TabBar {
         };
     }
 
-    fn find_target(&self, x: f32, y: f32) -> TabBarTarget {
+    pub fn hit_test(&self, x: f32, y: f32) -> TabBarHit {
         // Close buttons checked first with expanded hit area for easier targeting
         for (i, rect) in self.close_rects.iter().enumerate() {
             let is_active = i == self.active_tab;
             let is_tab_hovered = matches!(self.hover, TabBarHover::Tab(idx) | TabBarHover::CloseButton(idx) if idx == i);
             if (is_active || is_tab_hovered) && rect.contains_padded(x, y, 4.0) {
-                return TabBarTarget::Close(i);
+                return TabBarHit::CloseTab(i);
             }
         }
         for (i, rect) in self.tab_rects.iter().enumerate() {
             if rect.contains(x, y) {
-                return TabBarTarget::Tab(i);
+                return TabBarHit::Tab(i);
             }
         }
         if self.plus_rect.contains(x, y) {
-            return TabBarTarget::Plus;
+            return TabBarHit::NewTab;
         }
-        TabBarTarget::None
+        TabBarHit::None
     }
 
     pub fn compute_hover(&self, x: f32, y: f32) -> TabBarHover {
-        match self.find_target(x, y) {
-            TabBarTarget::Close(i) => TabBarHover::CloseButton(i),
-            TabBarTarget::Tab(i) => TabBarHover::Tab(i),
-            TabBarTarget::Plus => TabBarHover::PlusButton,
-            TabBarTarget::None => TabBarHover::None,
+        match self.hit_test(x, y) {
+            TabBarHit::CloseTab(i) => TabBarHover::CloseButton(i),
+            TabBarHit::Tab(i) => TabBarHover::Tab(i),
+            TabBarHit::NewTab => TabBarHover::PlusButton,
+            TabBarHit::None => TabBarHover::None,
         }
     }
 
@@ -242,15 +218,6 @@ impl TabBar {
             true
         } else {
             false
-        }
-    }
-
-    pub fn hit_test(&self, x: f32, y: f32) -> TabBarHit {
-        match self.find_target(x, y) {
-            TabBarTarget::Close(i) => TabBarHit::CloseTab(i),
-            TabBarTarget::Tab(i) => TabBarHit::Tab(i),
-            TabBarTarget::Plus => TabBarHit::NewTab,
-            TabBarTarget::None => TabBarHit::None,
         }
     }
 
@@ -277,10 +244,10 @@ impl TabBar {
         let plus_icon_size = PLUS_ICON_SIZE * scale_factor;
         let plus_radius = PLUS_RADIUS * scale_factor;
 
-        let active_fill = colors.tab_active_fill();
-        let active_stroke = colors.tab_active_stroke();
-        let hover_bg = colors.tab_hover_bg();
-        let hover_stroke = colors.tab_hover_stroke();
+        let active_fill = hex_to_linear_f32(&colors.tab_active_fill);
+        let active_stroke = hex_to_linear_f32(&colors.tab_active_stroke);
+        let hover_bg = hex_to_linear_f32(&colors.tab_hover_bg);
+        let hover_stroke = hex_to_linear_f32(&colors.tab_hover_stroke);
 
         for (i, rect) in self.tab_rects.iter().enumerate() {
             let is_active = i == self.active_tab;
@@ -317,7 +284,12 @@ impl TabBar {
                 rect.width - pad_h - icon_size - icon_gap - icon_gap - close_size - pad_h;
             let line_h = TAB_FONT_SIZE * TAB_LINE_HEIGHT * scale_factor;
             let text_top = rect.y + (rect.height - line_h) / 2.0;
-            text_areas.push(TabBarTextArea {
+            let color = if is_active {
+                hex_to_glyphon_color(&colors.tab_active_text)
+            } else {
+                hex_to_glyphon_color(&colors.foreground)
+            };
+            text_areas.push(TextSpec {
                 buffer_index: i,
                 left: text_left,
                 top: text_top,
@@ -327,7 +299,7 @@ impl TabBar {
                     width: text_width,
                     height: rect.height,
                 },
-                is_active,
+                color,
             });
 
             // Close button icon (only on active or hovered tabs)
@@ -372,11 +344,13 @@ impl TabBar {
 
         // Separator line at bottom of tab bar area (inside panel)
         flat_quads.push(BgQuad {
-            x: panel_x,
-            y: panel_y + tab_bar_h - SEPARATOR_HEIGHT * scale_factor,
-            w: panel_width,
-            h: SEPARATOR_HEIGHT * scale_factor,
-            color: colors.tab_separator(),
+            rect: Rect {
+                x: panel_x,
+                y: panel_y + tab_bar_h - SEPARATOR_HEIGHT * scale_factor,
+                width: panel_width,
+                height: SEPARATOR_HEIGHT * scale_factor,
+            },
+            color: hex_to_linear_f32(&colors.tab_separator),
         });
 
         TabBarDrawCommands {
@@ -394,28 +368,6 @@ impl TabBar {
     pub fn tab_buffers(&self) -> &[Buffer] {
         &self.tab_buffers
     }
-}
-
-fn push_stroked_rounded_rect(
-    quads: &mut Vec<RoundedQuad>,
-    rect: &Rect,
-    stroke_color: [f32; 4],
-    fill_color: [f32; 4],
-    radius: f32,
-    border: f32,
-) {
-    quads.push(RoundedQuad {
-        rect: *rect,
-        color: stroke_color,
-        radius,
-        shadow_softness: 0.0,
-    });
-    quads.push(RoundedQuad {
-        rect: rect.inset(border),
-        color: fill_color,
-        radius: (radius - border).max(0.0),
-        shadow_softness: 0.0,
-    });
 }
 
 fn icon_glyph(id: glyphon::CustomGlyphId, left: f32, top: f32, size: f32) -> CustomGlyph {

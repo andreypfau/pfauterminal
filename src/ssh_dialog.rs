@@ -10,11 +10,11 @@ use winit::event_loop::ActiveEventLoop;
 use winit::keyboard::{Key, NamedKey};
 use winit::window::{Window, WindowAttributes, WindowId};
 
-use crate::colors::{hex_to_linear_f32, hex_to_rgba};
+use crate::colors::{hex_to_glyphon_color, hex_to_linear_f32};
 use crate::font;
-use crate::gpu::{align_up, rect_to_text_bounds, RoundedRectUniforms, ROUNDED_RECT_SHADER};
-use crate::layout::Rect;
-use crate::tab_bar::RoundedQuad;
+use crate::gpu::{pick_srgb_format, push_text_specs, RoundedRectPipeline};
+use crate::layout::{push_stroked_rounded_rect, Rect, RoundedQuad};
+use crate::terminal_panel::TextSpec;
 
 // Design constants (logical pixels, from Pencil spec)
 const DIALOG_WIDTH: f32 = 620.0;
@@ -57,31 +57,6 @@ const DROPDOWN_ITEM_RADIUS: f32 = 6.0;
 const DROPDOWN_CORNER_RADIUS: f32 = 8.0;
 const DROPDOWN_SHADOW_SPREAD: f32 = 20.0;
 const DROPDOWN_SHADOW_OFFSET_Y: f32 = 4.0;
-const COL_DROPDOWN_SHADOW: &str = "00000073";
-
-// Colors (sRGB hex from Pencil design)
-const COL_DIALOG_BG: &str = "1E1F22FF";
-const COL_DIALOG_BORDER: &str = "43454AFF";
-const COL_FIELD_BG: &str = "1E1F22FF";
-const COL_FIELD_BORDER: &str = "5E6066FF";
-const COL_FIELD_FOCUSED: &str = "2F7CF6FF";
-const COL_DROPDOWN_BG: &str = "2B2D30FF";
-const COL_DROPDOWN_BORDER: &str = "43454AFF";
-const COL_DROPDOWN_BTN_BG: &str = "393B40FF";
-const COL_DROPDOWN_BTN_BORDER: &str = "6F737AFF";
-const COL_DROPDOWN_ITEM_SELECTED: &str = "2E436EFF";
-const COL_CANCEL_BG: &str = "393B40FF";
-const COL_CANCEL_BORDER: &str = "4E5157FF";
-const COL_OK_BG: &str = "2F7CF6FF";
-const COL_TEXT: &str = "CDD0D6FF";
-const COL_TEXT_WHITE: &str = "FFFFFFFF";
-const COL_TEXT_DIM: &str = "6F737AFF";
-const COL_TEXT_PLACEHOLDER: &str = "9A9DA3FF";
-const COL_CHEVRON: &str = "9A9DA3FF";
-const COL_CURSOR: &str = "BCBEC4FF";
-const COL_BROWSE_BG: &str = "393B40FF";
-const COL_BROWSE_BORDER: &str = "5E6066FF";
-
 // Max rounded rects for the dialog
 const MAX_ROUNDED_RECTS: usize = 80;
 
@@ -112,11 +87,6 @@ const BUF_DD_AGENT: usize = 20;
 const BUF_BROWSE_ICON: usize = 21;
 const BUF_COUNT: usize = 22;
 
-fn glyphon_color(hex: &str) -> GlyphonColor {
-    let (r, g, b, a) = hex_to_rgba(hex);
-    GlyphonColor::rgba(r, g, b, a)
-}
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum DialogField {
     Host,
@@ -140,14 +110,7 @@ impl DialogField {
     }
 
     fn cursor_idx(self) -> usize {
-        match self {
-            DialogField::Host => 0,
-            DialogField::Port => 1,
-            DialogField::Username => 2,
-            DialogField::Password => 3,
-            DialogField::KeyPath => 4,
-            DialogField::Passphrase => 5,
-        }
+        self as usize
     }
 }
 
@@ -172,20 +135,12 @@ enum DialogHit {
     Outside, // clicked outside dropdown
 }
 
-struct SshDialogTextArea {
-    buffer_index: usize,
-    left: f32,
-    top: f32,
-    bounds: Rect,
-    color: GlyphonColor,
-}
-
 struct SshDialogDrawCommands {
     rounded_quads: Vec<RoundedQuad>,
-    text_areas: Vec<SshDialogTextArea>,
+    text_areas: Vec<TextSpec>,
     /// Overlay layer (dropdown popup) — rendered after base text, on top of everything.
     overlay_rounded_quads: Vec<RoundedQuad>,
-    overlay_text_areas: Vec<SshDialogTextArea>,
+    overlay_text_areas: Vec<TextSpec>,
 }
 
 /// Authentication method selected in the dialog.
@@ -255,14 +210,9 @@ struct SshDialog {
     focused_field: DialogField,
     cursor_pos: [usize; 6], // Host, Port, Username, Password, KeyPath, Passphrase
     // Layout rects (physical pixels, relative to window origin)
-    host_input_rect: Rect,
-    port_input_rect: Rect,
-    username_input_rect: Rect,
+    field_rects: [Rect; 6],   // indexed by DialogField as usize
     auth_dropdown_rect: Rect, // the dropdown trigger button
-    password_input_rect: Rect,
-    keypath_input_rect: Rect,
     browse_btn_rect: Rect,
-    passphrase_input_rect: Rect,
     // Dropdown popup rects
     dropdown_popup_rect: Rect,
     dd_item_password_rect: Rect,
@@ -290,14 +240,9 @@ impl SshDialog {
             dropdown_open: false,
             focused_field: DialogField::Host,
             cursor_pos: [0, 2, 0, 0, 0, 0],
-            host_input_rect: Rect::ZERO,
-            port_input_rect: Rect::ZERO,
-            username_input_rect: Rect::ZERO,
+            field_rects: [Rect::ZERO; 6],
             auth_dropdown_rect: Rect::ZERO,
-            password_input_rect: Rect::ZERO,
-            keypath_input_rect: Rect::ZERO,
             browse_btn_rect: Rect::ZERO,
-            passphrase_input_rect: Rect::ZERO,
             dropdown_popup_rect: Rect::ZERO,
             dd_item_password_rect: Rect::ZERO,
             dd_item_key_rect: Rect::ZERO,
@@ -344,13 +289,13 @@ impl SshDialog {
         let mut row_y = TITLE_BAR_HEIGHT * s + FORM_PAD_V * s;
 
         // Host row
-        self.host_input_rect = Rect {
+        self.field_rects[DialogField::Host as usize] = Rect {
             x: form_x + label_w + field_gap,
             y: row_y,
             width: host_input_w,
             height: field_h,
         };
-        self.port_input_rect = Rect {
+        self.field_rects[DialogField::Port as usize] = Rect {
             x: form_x + form_w - port_w,
             y: row_y,
             width: port_w,
@@ -360,7 +305,7 @@ impl SshDialog {
 
         // Username row
         let username_input_w = form_w - label_w - field_gap - PORT_SPACER_WIDTH * s;
-        self.username_input_rect = Rect {
+        self.field_rects[DialogField::Username as usize] = Rect {
             x: form_x + label_w + field_gap,
             y: row_y,
             width: username_input_w,
@@ -383,7 +328,7 @@ impl SshDialog {
         let cred_input_w = form_w - label_w - field_gap;
 
         // Password field
-        self.password_input_rect = Rect {
+        self.field_rects[DialogField::Password as usize] = Rect {
             x: form_x + label_w + field_gap,
             y: row_y,
             width: cred_input_w,
@@ -392,7 +337,7 @@ impl SshDialog {
 
         // Key path field (narrower to make room for browse button)
         let browse_w = BROWSE_BTN_SIZE * s;
-        self.keypath_input_rect = Rect {
+        self.field_rects[DialogField::KeyPath as usize] = Rect {
             x: form_x + label_w + field_gap,
             y: row_y,
             width: cred_input_w - browse_w - field_gap,
@@ -407,7 +352,7 @@ impl SshDialog {
 
         // Passphrase field (only for Key auth, row below key path)
         let passphrase_y = row_y + field_h + FORM_ROW_GAP * s;
-        self.passphrase_input_rect = Rect {
+        self.field_rects[DialogField::Passphrase as usize] = Rect {
             x: form_x + label_w + field_gap,
             y: passphrase_y,
             width: cred_input_w,
@@ -640,14 +585,7 @@ impl SshDialog {
     }
 
     fn field_rect(&self, field: DialogField) -> Rect {
-        match field {
-            DialogField::Host => self.host_input_rect,
-            DialogField::Port => self.port_input_rect,
-            DialogField::Username => self.username_input_rect,
-            DialogField::Password => self.password_input_rect,
-            DialogField::KeyPath => self.keypath_input_rect,
-            DialogField::Passphrase => self.passphrase_input_rect,
-        }
+        self.field_rects[field as usize]
     }
 
     fn compute_hover(&self, x: f32, y: f32) -> DialogHover {
@@ -707,14 +645,10 @@ impl SshDialog {
             return DialogHit::Outside;
         }
 
-        if self.host_input_rect.contains(x, y) {
-            return DialogHit::Field(DialogField::Host);
-        }
-        if self.port_input_rect.contains(x, y) {
-            return DialogHit::Field(DialogField::Port);
-        }
-        if self.username_input_rect.contains(x, y) {
-            return DialogHit::Field(DialogField::Username);
+        for field in [DialogField::Host, DialogField::Port, DialogField::Username] {
+            if self.field_rect(field).contains(x, y) {
+                return DialogHit::Field(field);
+            }
         }
         if self.auth_dropdown_rect.contains(x, y) {
             return DialogHit::AuthDropdown;
@@ -722,18 +656,18 @@ impl SshDialog {
         // Credential fields: only active based on auth method
         match self.auth_method {
             AuthMethod::Password => {
-                if self.password_input_rect.contains(x, y) {
+                if self.field_rect(DialogField::Password).contains(x, y) {
                     return DialogHit::Field(DialogField::Password);
                 }
             }
             AuthMethod::Key => {
-                if self.keypath_input_rect.contains(x, y) {
+                if self.field_rect(DialogField::KeyPath).contains(x, y) {
                     return DialogHit::Field(DialogField::KeyPath);
                 }
                 if self.browse_btn_rect.contains(x, y) {
                     return DialogHit::BrowseButton;
                 }
-                if self.passphrase_input_rect.contains(x, y) {
+                if self.field_rect(DialogField::Passphrase).contains(x, y) {
                     return DialogHit::Field(DialogField::Passphrase);
                 }
             }
@@ -939,7 +873,11 @@ impl SshDialog {
         }
     }
 
-    fn draw_commands(&self, scale: f32) -> SshDialogDrawCommands {
+    fn draw_commands(
+        &self,
+        scale: f32,
+        colors: &crate::colors::ColorScheme,
+    ) -> SshDialogDrawCommands {
         let mut rq = Vec::new();
         let mut ta = Vec::new();
 
@@ -957,7 +895,6 @@ impl SshDialog {
         };
 
         let form_x = FORM_PAD_H * s;
-        let _form_w = dialog_w - 2.0 * FORM_PAD_H * s;
         let field_gap = FIELD_GAP * s;
         let field_h = FIELD_HEIGHT * s;
         let row_gap = FORM_ROW_GAP * s;
@@ -965,12 +902,12 @@ impl SshDialog {
         // Title text
         let title_x = form_x;
         let title_y = (TITLE_BAR_HEIGHT * s - line_h * s) / 2.0;
-        ta.push(SshDialogTextArea {
+        ta.push(TextSpec {
             buffer_index: BUF_TITLE,
             left: title_x,
             top: title_y,
             bounds: dialog_rect,
-            color: glyphon_color(COL_TEXT),
+            color: hex_to_glyphon_color(&colors.dropdown_text),
         });
 
         // Title bar bottom border
@@ -981,7 +918,7 @@ impl SshDialog {
                 width: dialog_w,
                 height: border,
             },
-            color: hex_to_linear_f32(COL_DIALOG_BORDER),
+            color: hex_to_linear_f32(&colors.dropdown_border),
             radius: 0.0,
             shadow_softness: 0.0,
         });
@@ -990,97 +927,100 @@ impl SshDialog {
 
         // --- Host row ---
         let label_y = row_y + (field_h - line_h * s) / 2.0;
-        ta.push(SshDialogTextArea {
+        ta.push(TextSpec {
             buffer_index: BUF_HOST_LABEL,
             left: form_x,
             top: label_y,
             bounds: dialog_rect,
-            color: glyphon_color(COL_TEXT),
+            color: hex_to_glyphon_color(&colors.dropdown_text),
         });
+        let host_rect = self.field_rect(DialogField::Host);
         self.draw_input_field(
             &mut rq,
             &mut ta,
-            &self.host_input_rect,
+            &host_rect,
             BUF_HOST_VALUE,
             self.focused_field == DialogField::Host,
             DialogField::Host,
             s,
+            false,
+            colors,
         );
 
         // Port label
-        let port_label_x = self.host_input_rect.x + self.host_input_rect.width + field_gap;
-        ta.push(SshDialogTextArea {
+        let port_label_x = host_rect.x + host_rect.width + field_gap;
+        ta.push(TextSpec {
             buffer_index: BUF_PORT_LABEL,
             left: port_label_x,
             top: label_y,
             bounds: dialog_rect,
-            color: glyphon_color(COL_TEXT),
+            color: hex_to_glyphon_color(&colors.dropdown_text),
         });
         self.draw_input_field(
             &mut rq,
             &mut ta,
-            &self.port_input_rect,
+            &self.field_rect(DialogField::Port),
             BUF_PORT_VALUE,
             self.focused_field == DialogField::Port,
             DialogField::Port,
             s,
+            false,
+            colors,
         );
 
         row_y += field_h + row_gap;
 
         // --- Username row ---
         let label_y = row_y + (field_h - line_h * s) / 2.0;
-        ta.push(SshDialogTextArea {
+        ta.push(TextSpec {
             buffer_index: BUF_USERNAME_LABEL,
             left: form_x,
             top: label_y,
             bounds: dialog_rect,
-            color: glyphon_color(COL_TEXT),
+            color: hex_to_glyphon_color(&colors.dropdown_text),
         });
         self.draw_input_field(
             &mut rq,
             &mut ta,
-            &self.username_input_rect,
+            &self.field_rect(DialogField::Username),
             BUF_USERNAME_VALUE,
             self.focused_field == DialogField::Username,
             DialogField::Username,
             s,
+            false,
+            colors,
         );
 
         row_y += field_h + row_gap;
 
         // --- Auth dropdown row ---
         let label_y = row_y + (field_h - line_h * s) / 2.0;
-        ta.push(SshDialogTextArea {
+        ta.push(TextSpec {
             buffer_index: BUF_AUTH_LABEL,
             left: form_x,
             top: label_y,
             bounds: dialog_rect,
-            color: glyphon_color(COL_TEXT),
+            color: hex_to_glyphon_color(&colors.dropdown_text),
         });
 
         let fr = FIELD_RADIUS * s;
         // Dropdown trigger button
         let dd = &self.auth_dropdown_rect;
-        rq.push(RoundedQuad {
-            rect: *dd,
-            color: hex_to_linear_f32(COL_DROPDOWN_BTN_BORDER),
-            radius: fr,
-            shadow_softness: 0.0,
-        });
-        rq.push(RoundedQuad {
-            rect: dd.inset(1.0 * s),
-            color: hex_to_linear_f32(COL_DROPDOWN_BTN_BG),
-            radius: (fr - 1.0 * s).max(0.0),
-            shadow_softness: 0.0,
-        });
+        push_stroked_rounded_rect(
+            &mut rq,
+            dd,
+            hex_to_linear_f32(&colors.text_dim),
+            hex_to_linear_f32(&colors.tab_hover_bg),
+            fr,
+            1.0 * s,
+        );
         let text_y = dd.y + (dd.height - line_h * s) / 2.0;
-        ta.push(SshDialogTextArea {
+        ta.push(TextSpec {
             buffer_index: BUF_AUTH_VALUE,
             left: dd.x + field_pad,
             top: text_y,
             bounds: *dd,
-            color: glyphon_color(COL_TEXT),
+            color: hex_to_glyphon_color(&colors.dropdown_text),
         });
 
         // Chevron-down indicator (draw as a small V shape using two thin quads)
@@ -1094,7 +1034,7 @@ impl SshDialog {
         // draw two small lines
         // Draw chevron as horizontal bars forming a V shape
         let chev_steps = 4;
-        let chev_col = hex_to_linear_f32(COL_CHEVRON);
+        let chev_col = hex_to_linear_f32(&colors.text_placeholder);
         for i in 0..chev_steps {
             let frac = i as f32 / (chev_steps - 1) as f32;
             let bar_y = chevron_cy - chev_half * 0.4 + chev_half * 0.8 * frac;
@@ -1119,69 +1059,67 @@ impl SshDialog {
         match self.auth_method {
             AuthMethod::Password => {
                 let label_y = row_y + (field_h - line_h * s) / 2.0;
-                ta.push(SshDialogTextArea {
+                ta.push(TextSpec {
                     buffer_index: BUF_PASSWORD_LABEL,
                     left: form_x,
                     top: label_y,
                     bounds: dialog_rect,
-                    color: glyphon_color(COL_TEXT),
+                    color: hex_to_glyphon_color(&colors.dropdown_text),
                 });
                 self.draw_input_field(
                     &mut rq,
                     &mut ta,
-                    &self.password_input_rect,
+                    &self.field_rect(DialogField::Password),
                     BUF_PASSWORD_VALUE,
                     self.focused_field == DialogField::Password,
                     DialogField::Password,
                     s,
+                    false,
+                    colors,
                 );
             }
             AuthMethod::Key => {
                 // Private key file row
                 let label_y = row_y + (field_h - line_h * s) / 2.0;
-                ta.push(SshDialogTextArea {
+                ta.push(TextSpec {
                     buffer_index: BUF_KEYPATH_LABEL,
                     left: form_x,
                     top: label_y,
                     bounds: dialog_rect,
-                    color: glyphon_color(COL_TEXT),
+                    color: hex_to_glyphon_color(&colors.dropdown_text),
                 });
-                let is_placeholder = self.key_path.is_empty();
-                self.draw_input_field_ex(
+                self.draw_input_field(
                     &mut rq,
                     &mut ta,
-                    &self.keypath_input_rect,
+                    &self.field_rect(DialogField::KeyPath),
                     BUF_KEYPATH_VALUE,
                     self.focused_field == DialogField::KeyPath,
                     DialogField::KeyPath,
                     s,
-                    is_placeholder,
+                    self.key_path.is_empty(),
+                    colors,
                 );
 
                 // Browse button
                 let br = &self.browse_btn_rect;
                 let is_browse_hover = self.hover == DialogHover::BrowseButton;
-                rq.push(RoundedQuad {
-                    rect: *br,
-                    color: hex_to_linear_f32(COL_BROWSE_BORDER),
-                    radius: fr,
-                    shadow_softness: 0.0,
-                });
-                rq.push(RoundedQuad {
-                    rect: br.inset(1.0 * s),
-                    color: if is_browse_hover {
-                        hex_to_linear_f32("4E5157FF")
+                push_stroked_rounded_rect(
+                    &mut rq,
+                    br,
+                    hex_to_linear_f32(&colors.field_border),
+                    if is_browse_hover {
+                        hex_to_linear_f32(&colors.tab_hover_stroke)
                     } else {
-                        hex_to_linear_f32(COL_BROWSE_BG)
+                        hex_to_linear_f32(&colors.tab_hover_bg)
                     },
-                    radius: (fr - 1.0 * s).max(0.0),
-                    shadow_softness: 0.0,
-                });
+                    fr,
+                    1.0 * s,
+                );
                 // Folder icon
                 let icon_s = 16.0 * s;
                 let icon_x = br.x + (br.width - icon_s) / 2.0;
                 let icon_y = br.y + (br.height - icon_s) / 2.0;
-                let folder_col = hex_to_linear_f32(COL_CHEVRON);
+                let folder_col = hex_to_linear_f32(&colors.text_placeholder);
                 rq.push(RoundedQuad {
                     rect: Rect {
                         x: icon_x,
@@ -1200,7 +1138,7 @@ impl SshDialog {
                         width: icon_s - 3.0 * s,
                         height: icon_s * 0.65 - 3.0 * s,
                     },
-                    color: hex_to_linear_f32(COL_BROWSE_BG),
+                    color: hex_to_linear_f32(&colors.tab_hover_bg),
                     radius: 1.0 * s,
                     shadow_softness: 0.0,
                 });
@@ -1220,21 +1158,23 @@ impl SshDialog {
 
                 // Passphrase row
                 let label_y = row_y + (field_h - line_h * s) / 2.0;
-                ta.push(SshDialogTextArea {
+                ta.push(TextSpec {
                     buffer_index: BUF_PASSPHRASE_LABEL,
                     left: form_x,
                     top: label_y,
                     bounds: dialog_rect,
-                    color: glyphon_color(COL_TEXT),
+                    color: hex_to_glyphon_color(&colors.dropdown_text),
                 });
                 self.draw_input_field(
                     &mut rq,
                     &mut ta,
-                    &self.passphrase_input_rect,
+                    &self.field_rect(DialogField::Passphrase),
                     BUF_PASSPHRASE_VALUE,
                     self.focused_field == DialogField::Passphrase,
                     DialogField::Passphrase,
                     s,
+                    false,
+                    colors,
                 );
             }
             AuthMethod::Agent => {}
@@ -1242,49 +1182,45 @@ impl SshDialog {
 
         // --- Footer buttons ---
         let is_cancel_hover = self.hover == DialogHover::CancelButton;
-        rq.push(RoundedQuad {
-            rect: self.cancel_rect,
-            color: hex_to_linear_f32(COL_CANCEL_BORDER),
-            radius: BUTTON_RADIUS * s,
-            shadow_softness: 0.0,
-        });
-        rq.push(RoundedQuad {
-            rect: self.cancel_rect.inset(1.0 * s),
-            color: if is_cancel_hover {
-                hex_to_linear_f32("4E5157FF")
+        push_stroked_rounded_rect(
+            &mut rq,
+            &self.cancel_rect,
+            hex_to_linear_f32(&colors.tab_hover_stroke),
+            if is_cancel_hover {
+                hex_to_linear_f32(&colors.tab_hover_stroke)
             } else {
-                hex_to_linear_f32(COL_CANCEL_BG)
+                hex_to_linear_f32(&colors.tab_hover_bg)
             },
-            radius: (BUTTON_RADIUS * s - 1.0 * s).max(0.0),
-            shadow_softness: 0.0,
-        });
+            BUTTON_RADIUS * s,
+            1.0 * s,
+        );
         let cancel_text_y = self.cancel_rect.y + (self.cancel_rect.height - line_h * s) / 2.0;
-        ta.push(SshDialogTextArea {
+        ta.push(TextSpec {
             buffer_index: BUF_CANCEL,
             left: self.cancel_rect.x + CANCEL_PAD_H * s,
             top: cancel_text_y,
             bounds: self.cancel_rect,
-            color: glyphon_color(COL_TEXT),
+            color: hex_to_glyphon_color(&colors.dropdown_text),
         });
 
         let is_ok_hover = self.hover == DialogHover::OkButton;
         rq.push(RoundedQuad {
             rect: self.ok_rect,
             color: if is_ok_hover {
-                hex_to_linear_f32("3D8BFAFF")
+                hex_to_linear_f32(&colors.ok_hover_bg)
             } else {
-                hex_to_linear_f32(COL_OK_BG)
+                hex_to_linear_f32(&colors.ok_bg)
             },
             radius: BUTTON_RADIUS * s,
             shadow_softness: 0.0,
         });
         let ok_text_y = self.ok_rect.y + (self.ok_rect.height - line_h * s) / 2.0;
-        ta.push(SshDialogTextArea {
+        ta.push(TextSpec {
             buffer_index: BUF_OK,
             left: self.ok_rect.x + OK_PAD_H * s,
             top: ok_text_y,
             bounds: self.ok_rect,
-            color: glyphon_color(COL_TEXT_WHITE),
+            color: hex_to_glyphon_color(&colors.dropdown_text_active),
         });
 
         // --- Dropdown popup (overlay layer — rendered after base text) ---
@@ -1305,126 +1241,75 @@ impl SshDialog {
                     width: dp.width,
                     height: dp.height,
                 },
-                color: hex_to_linear_f32(COL_DROPDOWN_SHADOW),
+                color: hex_to_linear_f32(&colors.dropdown_shadow),
                 radius: dd_r,
                 shadow_softness: shadow_spread,
             });
 
-            // Border rect (outer)
-            overlay_rq.push(RoundedQuad {
-                rect: *dp,
-                color: hex_to_linear_f32(COL_DROPDOWN_BORDER),
-                radius: dd_r,
-                shadow_softness: 0.0,
-            });
-
-            // Fill rect (inset by border)
-            overlay_rq.push(RoundedQuad {
-                rect: dp.inset(1.0 * s),
-                color: hex_to_linear_f32(COL_DROPDOWN_BG),
-                radius: (dd_r - 1.0 * s).max(0.0),
-                shadow_softness: 0.0,
-            });
+            // Border + fill
+            push_stroked_rounded_rect(
+                &mut overlay_rq,
+                dp,
+                hex_to_linear_f32(&colors.dropdown_border),
+                hex_to_linear_f32(&colors.dropdown_bg),
+                dd_r,
+                1.0 * s,
+            );
 
             let item_r = DROPDOWN_ITEM_RADIUS * s;
             let small_line_h = SMALL_FONT_SIZE * LINE_HEIGHT_MULT;
 
-            // Password item
-            let pw_selected = self.auth_method == AuthMethod::Password;
-            let pw_hover = self.dd_hover_item == Some(AuthMethod::Password);
-            if pw_selected {
-                overlay_rq.push(RoundedQuad {
-                    rect: self.dd_item_password_rect,
-                    color: hex_to_linear_f32(COL_DROPDOWN_ITEM_SELECTED),
-                    radius: item_r,
-                    shadow_softness: 0.0,
-                });
-            } else if pw_hover {
-                overlay_rq.push(RoundedQuad {
-                    rect: self.dd_item_password_rect,
-                    color: hex_to_linear_f32("393B40FF"),
-                    radius: item_r,
-                    shadow_softness: 0.0,
-                });
-            }
-            let pw_text_y = self.dd_item_password_rect.y
-                + (self.dd_item_password_rect.height - line_h * s) / 2.0;
-            overlay_ta.push(SshDialogTextArea {
-                buffer_index: BUF_DD_PASSWORD,
-                left: self.dd_item_password_rect.x + DROPDOWN_ITEM_PAD_H * s,
-                top: pw_text_y,
-                bounds: self.dd_item_password_rect,
-                color: glyphon_color(COL_TEXT),
-            });
+            let items: [(AuthMethod, Rect, usize, GlyphonColor); 3] = [
+                (
+                    AuthMethod::Password,
+                    self.dd_item_password_rect,
+                    BUF_DD_PASSWORD,
+                    hex_to_glyphon_color(&colors.dropdown_text),
+                ),
+                (
+                    AuthMethod::Key,
+                    self.dd_item_key_rect,
+                    BUF_DD_KEY,
+                    hex_to_glyphon_color(&colors.dropdown_text),
+                ),
+                (
+                    AuthMethod::Agent,
+                    self.dd_item_agent_rect,
+                    BUF_DD_AGENT,
+                    if self.auth_method == AuthMethod::Agent {
+                        hex_to_glyphon_color(&colors.dropdown_text_active)
+                    } else {
+                        hex_to_glyphon_color(&colors.dropdown_text)
+                    },
+                ),
+            ];
 
-            // Key pair item
-            let key_selected = self.auth_method == AuthMethod::Key;
-            let key_hover = self.dd_hover_item == Some(AuthMethod::Key);
-            if key_selected {
-                overlay_rq.push(RoundedQuad {
-                    rect: self.dd_item_key_rect,
-                    color: hex_to_linear_f32(COL_DROPDOWN_ITEM_SELECTED),
-                    radius: item_r,
-                    shadow_softness: 0.0,
-                });
-            } else if key_hover {
-                overlay_rq.push(RoundedQuad {
-                    rect: self.dd_item_key_rect,
-                    color: hex_to_linear_f32("393B40FF"),
-                    radius: item_r,
-                    shadow_softness: 0.0,
-                });
+            for (method, rect, buf_idx, text_color) in &items {
+                draw_dropdown_item(
+                    &mut overlay_rq,
+                    &mut overlay_ta,
+                    *rect,
+                    *buf_idx,
+                    self.auth_method == *method,
+                    self.dd_hover_item == Some(*method),
+                    item_r,
+                    s,
+                    line_h,
+                    *text_color,
+                    colors,
+                );
             }
-            let key_text_y =
-                self.dd_item_key_rect.y + (self.dd_item_key_rect.height - line_h * s) / 2.0;
-            overlay_ta.push(SshDialogTextArea {
-                buffer_index: BUF_DD_KEY,
-                left: self.dd_item_key_rect.x + DROPDOWN_ITEM_PAD_H * s,
-                top: key_text_y,
-                bounds: self.dd_item_key_rect,
-                color: glyphon_color(COL_TEXT),
-            });
+
+            // Key pair hint text
             let hint_offset = self.char_width * 9.0;
             let hint_text_y =
                 self.dd_item_key_rect.y + (self.dd_item_key_rect.height - small_line_h * s) / 2.0;
-            overlay_ta.push(SshDialogTextArea {
+            overlay_ta.push(TextSpec {
                 buffer_index: BUF_DD_KEY_HINT,
                 left: self.dd_item_key_rect.x + DROPDOWN_ITEM_PAD_H * s + hint_offset * s,
                 top: hint_text_y,
                 bounds: self.dd_item_key_rect,
-                color: glyphon_color(COL_TEXT_DIM),
-            });
-
-            // Agent item
-            let agent_selected = self.auth_method == AuthMethod::Agent;
-            let agent_hover = self.dd_hover_item == Some(AuthMethod::Agent);
-            if agent_selected {
-                overlay_rq.push(RoundedQuad {
-                    rect: self.dd_item_agent_rect,
-                    color: hex_to_linear_f32(COL_DROPDOWN_ITEM_SELECTED),
-                    radius: item_r,
-                    shadow_softness: 0.0,
-                });
-            } else if agent_hover {
-                overlay_rq.push(RoundedQuad {
-                    rect: self.dd_item_agent_rect,
-                    color: hex_to_linear_f32("393B40FF"),
-                    radius: item_r,
-                    shadow_softness: 0.0,
-                });
-            }
-            let agent_text_y =
-                self.dd_item_agent_rect.y + (self.dd_item_agent_rect.height - line_h * s) / 2.0;
-            overlay_ta.push(SshDialogTextArea {
-                buffer_index: BUF_DD_AGENT,
-                left: self.dd_item_agent_rect.x + DROPDOWN_ITEM_PAD_H * s,
-                top: agent_text_y,
-                bounds: self.dd_item_agent_rect,
-                color: if agent_selected {
-                    glyphon_color(COL_TEXT_WHITE)
-                } else {
-                    glyphon_color(COL_TEXT)
-                },
+                color: hex_to_glyphon_color(&colors.text_dim),
             });
         }
 
@@ -1439,60 +1324,44 @@ impl SshDialog {
     fn draw_input_field(
         &self,
         rq: &mut Vec<RoundedQuad>,
-        ta: &mut Vec<SshDialogTextArea>,
-        rect: &Rect,
-        buf_idx: usize,
-        focused: bool,
-        field: DialogField,
-        s: f32,
-    ) {
-        self.draw_input_field_ex(rq, ta, rect, buf_idx, focused, field, s, false);
-    }
-
-    fn draw_input_field_ex(
-        &self,
-        rq: &mut Vec<RoundedQuad>,
-        ta: &mut Vec<SshDialogTextArea>,
+        ta: &mut Vec<TextSpec>,
         rect: &Rect,
         buf_idx: usize,
         focused: bool,
         field: DialogField,
         s: f32,
         is_placeholder: bool,
+        colors: &crate::colors::ColorScheme,
     ) {
         let fr = FIELD_RADIUS * s;
         let border_w = if focused { 2.0 * s } else { 1.0 * s };
         let border_col = if focused {
-            COL_FIELD_FOCUSED
+            &colors.field_focused
         } else {
-            COL_FIELD_BORDER
+            &colors.field_border
         };
 
-        rq.push(RoundedQuad {
-            rect: *rect,
-            color: hex_to_linear_f32(border_col),
-            radius: fr,
-            shadow_softness: 0.0,
-        });
-        rq.push(RoundedQuad {
-            rect: rect.inset(border_w),
-            color: hex_to_linear_f32(COL_FIELD_BG),
-            radius: (fr - border_w).max(0.0),
-            shadow_softness: 0.0,
-        });
+        push_stroked_rounded_rect(
+            rq,
+            rect,
+            hex_to_linear_f32(border_col),
+            hex_to_linear_f32(&colors.background),
+            fr,
+            border_w,
+        );
 
         let pad = FIELD_PAD_H * s;
         let line_h = FONT_SIZE * LINE_HEIGHT_MULT;
         let text_y = rect.y + (rect.height - line_h * s) / 2.0;
-        ta.push(SshDialogTextArea {
+        ta.push(TextSpec {
             buffer_index: buf_idx,
             left: rect.x + pad,
             top: text_y,
             bounds: *rect,
             color: if is_placeholder {
-                glyphon_color(COL_TEXT_PLACEHOLDER)
+                hex_to_glyphon_color(&colors.text_placeholder)
             } else {
-                glyphon_color(COL_TEXT)
+                hex_to_glyphon_color(&colors.dropdown_text)
             },
         });
 
@@ -1508,12 +1377,50 @@ impl SshDialog {
                     width: 1.5 * s,
                     height: cursor_h,
                 },
-                color: hex_to_linear_f32(COL_CURSOR),
+                color: hex_to_linear_f32(&colors.cursor),
                 radius: 0.0,
                 shadow_softness: 0.0,
             });
         }
     }
+}
+
+fn draw_dropdown_item(
+    rq: &mut Vec<RoundedQuad>,
+    ta: &mut Vec<TextSpec>,
+    rect: Rect,
+    buf_idx: usize,
+    selected: bool,
+    hovered: bool,
+    radius: f32,
+    s: f32,
+    line_h: f32,
+    text_color: GlyphonColor,
+    colors: &crate::colors::ColorScheme,
+) {
+    if selected {
+        rq.push(RoundedQuad {
+            rect,
+            color: hex_to_linear_f32(&colors.dropdown_item_hover),
+            radius,
+            shadow_softness: 0.0,
+        });
+    } else if hovered {
+        rq.push(RoundedQuad {
+            rect,
+            color: hex_to_linear_f32(&colors.tab_hover_bg),
+            radius,
+            shadow_softness: 0.0,
+        });
+    }
+    let text_y = rect.y + (rect.height - line_h * s) / 2.0;
+    ta.push(TextSpec {
+        buffer_index: buf_idx,
+        left: rect.x + DROPDOWN_ITEM_PAD_H * s,
+        top: text_y,
+        bounds: rect,
+        color: text_color,
+    });
 }
 
 /// Separate OS window for the SSH session dialog with its own GPU context.
@@ -1533,10 +1440,8 @@ pub struct SshDialogWindow {
     viewport: Viewport,
     _cache: Cache,
 
-    rounded_rect_pipeline: RenderPipeline,
-    rounded_rect_uniform_buffer: wgpu::Buffer,
-    rounded_rect_bind_group: BindGroup,
-    uniform_aligned_size: usize,
+    rounded_rect: RoundedRectPipeline,
+    colors: crate::colors::ColorScheme,
 
     dialog: SshDialog,
     cursor_position: (f32, f32),
@@ -1594,15 +1499,7 @@ impl SshDialogWindow {
             .copied()
             .unwrap_or(caps.formats[0]);
 
-        let render_format = if surface_format.is_srgb() {
-            surface_format
-        } else {
-            match surface_format {
-                TextureFormat::Bgra8Unorm => TextureFormat::Bgra8UnormSrgb,
-                TextureFormat::Rgba8Unorm => TextureFormat::Rgba8UnormSrgb,
-                other => other,
-            }
-        };
+        let render_format = pick_srgb_format(surface_format);
 
         let view_formats = if render_format != surface_format {
             vec![render_format]
@@ -1633,88 +1530,8 @@ impl SshDialogWindow {
         let overlay_text_renderer =
             TextRenderer::new(&mut atlas, &device, MultisampleState::default(), None);
 
-        // Rounded rect pipeline
-        let uniform_alignment = device.limits().min_uniform_buffer_offset_alignment;
-        let uniform_size = std::mem::size_of::<RoundedRectUniforms>() as u32;
-        let aligned_size = align_up(uniform_size, uniform_alignment);
-
-        let rounded_rect_uniform_buffer = device.create_buffer(&BufferDescriptor {
-            label: Some("ssh dialog rounded rect uniforms"),
-            size: (aligned_size as usize * MAX_ROUNDED_RECTS) as u64,
-            usage: BufferUsages::UNIFORM | BufferUsages::COPY_DST,
-            mapped_at_creation: false,
-        });
-
-        let rounded_rect_bind_group_layout =
-            device.create_bind_group_layout(&BindGroupLayoutDescriptor {
-                label: Some("ssh dialog rr bind group layout"),
-                entries: &[BindGroupLayoutEntry {
-                    binding: 0,
-                    visibility: ShaderStages::FRAGMENT,
-                    ty: BindingType::Buffer {
-                        ty: BufferBindingType::Uniform,
-                        has_dynamic_offset: true,
-                        min_binding_size: wgpu::BufferSize::new(std::mem::size_of::<
-                            RoundedRectUniforms,
-                        >() as u64),
-                    },
-                    count: None,
-                }],
-            });
-
-        let rounded_rect_bind_group = device.create_bind_group(&BindGroupDescriptor {
-            label: Some("ssh dialog rr bind group"),
-            layout: &rounded_rect_bind_group_layout,
-            entries: &[BindGroupEntry {
-                binding: 0,
-                resource: BindingResource::Buffer(BufferBinding {
-                    buffer: &rounded_rect_uniform_buffer,
-                    offset: 0,
-                    size: wgpu::BufferSize::new(std::mem::size_of::<RoundedRectUniforms>() as u64),
-                }),
-            }],
-        });
-
-        let rounded_rect_shader = device.create_shader_module(ShaderModuleDescriptor {
-            label: Some("ssh dialog rounded rect shader"),
-            source: ShaderSource::Wgsl(ROUNDED_RECT_SHADER.into()),
-        });
-
-        let rounded_rect_pipeline_layout =
-            device.create_pipeline_layout(&PipelineLayoutDescriptor {
-                label: Some("ssh dialog rr pipeline layout"),
-                bind_group_layouts: &[&rounded_rect_bind_group_layout],
-                push_constant_ranges: &[],
-            });
-
-        let rounded_rect_pipeline = device.create_render_pipeline(&RenderPipelineDescriptor {
-            label: Some("ssh dialog rounded rect pipeline"),
-            layout: Some(&rounded_rect_pipeline_layout),
-            vertex: VertexState {
-                module: &rounded_rect_shader,
-                entry_point: Some("vs_main"),
-                buffers: &[],
-                compilation_options: Default::default(),
-            },
-            fragment: Some(FragmentState {
-                module: &rounded_rect_shader,
-                entry_point: Some("fs_main"),
-                targets: &[Some(ColorTargetState {
-                    format: render_format,
-                    blend: Some(BlendState::ALPHA_BLENDING),
-                    write_mask: ColorWrites::ALL,
-                })],
-                compilation_options: Default::default(),
-            }),
-            primitive: PrimitiveState {
-                topology: PrimitiveTopology::TriangleList,
-                ..Default::default()
-            },
-            depth_stencil: None,
-            multisample: MultisampleState::default(),
-            multiview: None,
-            cache: None,
-        });
+        let rounded_rect = RoundedRectPipeline::new(&device, render_format, MAX_ROUNDED_RECTS);
+        let colors = crate::colors::ColorScheme::load();
 
         let dialog = SshDialog::new(actual_scale, &mut font_system);
 
@@ -1736,10 +1553,8 @@ impl SshDialogWindow {
             overlay_text_renderer,
             viewport,
             _cache: cache,
-            rounded_rect_pipeline,
-            rounded_rect_uniform_buffer,
-            rounded_rect_bind_group,
-            uniform_aligned_size: aligned_size as usize,
+            rounded_rect,
+            colors,
             dialog,
             cursor_position: (0.0, 0.0),
             super_pressed: false,
@@ -1933,38 +1748,15 @@ impl SshDialogWindow {
         });
 
         let scale = self.window.scale_factor() as f32;
-        let aligned_size = self.uniform_aligned_size;
-
-        let draw = self.dialog.draw_commands(scale);
+        let draw = self.dialog.draw_commands(scale, &self.colors);
 
         // Upload rounded rect uniforms: base layer first, then overlay layer
-        let mut rr_index = 0;
-
-        let upload_rr = |rr_index: &mut usize, rq: &RoundedQuad| {
-            if *rr_index >= MAX_ROUNDED_RECTS {
-                log::warn!("ssh dialog exceeded max rounded rects");
-                return;
-            }
-            let uniforms =
-                RoundedRectUniforms::new(&rq.rect, rq.radius, rq.shadow_softness, rq.color);
-            self.queue.write_buffer(
-                &self.rounded_rect_uniform_buffer,
-                (*rr_index * aligned_size) as u64,
-                bytemuck::cast_slice(&[uniforms]),
-            );
-            *rr_index += 1;
-        };
-
-        for rq in &draw.rounded_quads {
-            upload_rr(&mut rr_index, rq);
-        }
-        let base_rr_count = rr_index;
-
-        for rq in &draw.overlay_rounded_quads {
-            upload_rr(&mut rr_index, rq);
-        }
-        let total_rr_count = rr_index;
-        let has_overlay = base_rr_count < total_rr_count;
+        let base_rr_count = self
+            .rounded_rect
+            .upload_quads(&self.queue, &draw.rounded_quads, 0);
+        let total_rr_count =
+            self.rounded_rect
+                .upload_quads(&self.queue, &draw.overlay_rounded_quads, base_rr_count);
 
         // Build text areas
         self.viewport.update(
@@ -1975,21 +1767,10 @@ impl SshDialogWindow {
             },
         );
 
-        // Base text areas
+        let bufs = &self.dialog.buffers;
+
         let mut text_areas: Vec<TextArea> = Vec::new();
-        for ta in &draw.text_areas {
-            if ta.buffer_index < self.dialog.buffers.len() {
-                text_areas.push(TextArea {
-                    buffer: &self.dialog.buffers[ta.buffer_index],
-                    left: ta.left,
-                    top: ta.top,
-                    scale,
-                    bounds: rect_to_text_bounds(&ta.bounds),
-                    default_color: ta.color,
-                    custom_glyphs: &[],
-                });
-            }
-        }
+        push_text_specs(&mut text_areas, &draw.text_areas, bufs, scale);
 
         if let Err(e) = self.text_renderer.prepare(
             &self.device,
@@ -2004,21 +1785,8 @@ impl SshDialogWindow {
             return;
         }
 
-        // Overlay text areas (dropdown popup)
         let mut overlay_areas: Vec<TextArea> = Vec::new();
-        for ta in &draw.overlay_text_areas {
-            if ta.buffer_index < self.dialog.buffers.len() {
-                overlay_areas.push(TextArea {
-                    buffer: &self.dialog.buffers[ta.buffer_index],
-                    left: ta.left,
-                    top: ta.top,
-                    scale,
-                    bounds: rect_to_text_bounds(&ta.bounds),
-                    default_color: ta.color,
-                    custom_glyphs: &[],
-                });
-            }
-        }
+        push_text_specs(&mut overlay_areas, &draw.overlay_text_areas, bufs, scale);
 
         if let Err(e) = self.overlay_text_renderer.prepare(
             &self.device,
@@ -2040,7 +1808,7 @@ impl SshDialogWindow {
             });
 
         {
-            let bg = hex_to_linear_f32(COL_DIALOG_BG);
+            let bg = hex_to_linear_f32(&self.colors.background);
             let mut pass = encoder.begin_render_pass(&RenderPassDescriptor {
                 label: Some("ssh dialog pass"),
                 color_attachments: &[Some(RenderPassColorAttachment {
@@ -2061,35 +1829,18 @@ impl SshDialogWindow {
             });
 
             // === Base layer ===
+            self.rounded_rect.draw_range(&mut pass, 0, base_rr_count);
 
-            // 1. Base rounded rects (form fields, buttons, etc.)
-            if base_rr_count > 0 {
-                pass.set_pipeline(&self.rounded_rect_pipeline);
-                for i in 0..base_rr_count {
-                    let offset = (i * aligned_size) as u32;
-                    pass.set_bind_group(0, &self.rounded_rect_bind_group, &[offset]);
-                    pass.draw(0..6, 0..1);
-                }
-            }
-
-            // 2. Base text (labels, field values)
+            // Base text (labels, field values)
             self.text_renderer
                 .render(&self.atlas, &self.viewport, &mut pass)
                 .expect("render ssh dialog text");
 
             // === Overlay layer (dropdown popup) ===
+            self.rounded_rect
+                .draw_range(&mut pass, base_rr_count, total_rr_count - base_rr_count);
 
-            // 3. Overlay rounded rects (shadow + border + fill + hover highlights)
-            if has_overlay {
-                pass.set_pipeline(&self.rounded_rect_pipeline);
-                for i in base_rr_count..total_rr_count {
-                    let offset = (i * aligned_size) as u32;
-                    pass.set_bind_group(0, &self.rounded_rect_bind_group, &[offset]);
-                    pass.draw(0..6, 0..1);
-                }
-            }
-
-            // 4. Overlay text (dropdown menu items)
+            // Overlay text (dropdown menu items)
             self.overlay_text_renderer
                 .render(&self.atlas, &self.viewport, &mut pass)
                 .expect("render ssh dialog overlay text");

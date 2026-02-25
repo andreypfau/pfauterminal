@@ -6,7 +6,7 @@ use glyphon::{Attrs, Buffer, Color as GlyphonColor, Family, FontSystem, Shaping}
 use winit::event::{ElementState, KeyEvent, MouseScrollDelta};
 use winit::keyboard::{Key, NamedKey};
 
-use crate::colors::ColorScheme;
+use crate::colors::{hex_to_glyphon_color, hex_to_linear_f32, ColorScheme};
 use crate::font::{self, CellMetrics};
 use crate::layout::Rect;
 use crate::ssh::SshConfig;
@@ -58,24 +58,21 @@ pub struct PanelDrawCommands {
     /// Cell background quads: (physical_rect, linear_color).
     pub bg_quads: Vec<BgQuad>,
     /// Per-cell text specs for building TextAreas.
-    pub text_cells: Vec<TextCellSpec>,
+    pub text_cells: Vec<TextSpec>,
 }
 
 pub struct BgQuad {
-    pub x: f32,
-    pub y: f32,
-    pub w: f32,
-    pub h: f32,
+    pub rect: Rect,
     pub color: [f32; 4],
 }
 
-/// Describes a single character cell for glyphon rendering.
-pub struct TextCellSpec {
+/// Shared text spec used by all UI components for glyphon rendering.
+pub struct TextSpec {
+    pub buffer_index: usize,
     pub left: f32,
     pub top: f32,
-    pub color: GlyphonColor,
-    pub buffer_index: usize,
     pub bounds: Rect,
+    pub color: GlyphonColor,
 }
 
 // --- Terminal panel ---
@@ -129,13 +126,11 @@ impl TerminalPanel {
         id: PanelId,
         cols: usize,
         rows: usize,
-        cell_width: u16,
-        cell_height: u16,
         event_proxy: EventProxy,
         ssh_config: SshConfig,
     ) -> Self {
         let size = TermSize::new(cols, rows);
-        let terminal = Terminal::new_ssh(size, cell_width, cell_height, event_proxy, ssh_config);
+        let terminal = Terminal::new_ssh(size, event_proxy, ssh_config);
         Self {
             id,
             terminal,
@@ -157,7 +152,7 @@ impl TerminalPanel {
 
         let rows = vp.rows;
         let cols = vp.cols;
-        let default_fg = colors.fg_glyphon();
+        let default_fg = hex_to_glyphon_color(&colors.foreground);
 
         let mut lines: Vec<Vec<CellInfo>> = (0..rows)
             .map(|_| {
@@ -363,7 +358,7 @@ impl TerminalPanel {
             None => {
                 return PanelDrawCommands {
                     island_rect: Rect::ZERO,
-                    island_color: colors.bg_linear_f32(),
+                    island_color: hex_to_linear_f32(&colors.background),
                     island_radius: 0.0,
                     island_stroke_color: [0.0; 4],
                     island_stroke_width: 0.0,
@@ -391,10 +386,12 @@ impl TerminalPanel {
             for (col, ci) in line.iter().enumerate() {
                 if !ci.is_default_bg {
                     bg_quads.push(BgQuad {
-                        x: content_x + col as f32 * pcw,
-                        y: content_y + row as f32 * pch,
-                        w: pcw,
-                        h: pch,
+                        rect: Rect {
+                            x: content_x + col as f32 * pcw,
+                            y: content_y + row as f32 * pch,
+                            width: pcw,
+                            height: pch,
+                        },
                         color: ci.bg,
                     });
                 }
@@ -404,10 +401,12 @@ impl TerminalPanel {
         // Cursor quad
         if let Some((cur_row, cur_col)) = cursor {
             bg_quads.push(BgQuad {
-                x: content_x + cur_col as f32 * pcw,
-                y: content_y + cur_row as f32 * pch,
-                w: pcw,
-                h: pch,
+                rect: Rect {
+                    x: content_x + cur_col as f32 * pcw,
+                    y: content_y + cur_row as f32 * pch,
+                    width: pcw,
+                    height: pch,
+                },
                 color: [0.8, 0.8, 0.8, 0.7],
             });
         }
@@ -433,14 +432,8 @@ impl TerminalPanel {
                 let cy = content_y + row as f32 * pch;
                 if let Some(rects) = block_char_rects(ci.c, cx, cy, pcw, pch) {
                     let color = glyphon_to_linear(ci.fg);
-                    for (rx, ry, rw, rh) in rects {
-                        bg_quads.push(BgQuad {
-                            x: rx,
-                            y: ry,
-                            w: rw,
-                            h: rh,
-                            color,
-                        });
+                    for r in rects {
+                        bg_quads.push(BgQuad { rect: r, color });
                     }
                     continue;
                 }
@@ -474,7 +467,7 @@ impl TerminalPanel {
                     idx
                 };
 
-                text_cells.push(TextCellSpec {
+                text_cells.push(TextSpec {
                     left: cx,
                     top: cy,
                     color: ci.fg,
@@ -486,9 +479,9 @@ impl TerminalPanel {
 
         PanelDrawCommands {
             island_rect,
-            island_color: colors.bg_linear_f32(),
+            island_color: hex_to_linear_f32(&colors.background),
             island_radius: ISLAND_RADIUS * scale,
-            island_stroke_color: colors.panel_stroke(),
+            island_stroke_color: hex_to_linear_f32(&colors.panel_stroke),
             island_stroke_width: ISLAND_STROKE_WIDTH * scale,
             bg_quads,
             text_cells,
@@ -516,75 +509,56 @@ fn glyphon_to_linear(c: GlyphonColor) -> [f32; 4] {
 }
 
 /// Return sub-rectangles for block-drawing characters (U+2580–U+259F).
-/// Each rect is (x, y, w, h) in physical pixels. Returns None for non-block chars.
-fn block_char_rects(
-    c: char,
-    cx: f32,
-    cy: f32,
-    cw: f32,
-    ch: f32,
-) -> Option<Vec<(f32, f32, f32, f32)>> {
+/// Returns None for non-block chars.
+fn block_char_rects(c: char, cx: f32, cy: f32, cw: f32, ch: f32) -> Option<Vec<Rect>> {
     let hw = cw / 2.0;
     let hh = ch / 2.0;
 
+    macro_rules! r {
+        ($x:expr, $y:expr, $w:expr, $h:expr) => {
+            Rect {
+                x: $x,
+                y: $y,
+                width: $w,
+                height: $h,
+            }
+        };
+    }
+
     match c {
         // Vertical fractional blocks (lower N/8)
-        '\u{2581}' => Some(vec![(cx, cy + ch * 7.0 / 8.0, cw, ch / 8.0)]),
-        '\u{2582}' => Some(vec![(cx, cy + ch * 6.0 / 8.0, cw, ch * 2.0 / 8.0)]),
-        '\u{2583}' => Some(vec![(cx, cy + ch * 5.0 / 8.0, cw, ch * 3.0 / 8.0)]),
-        '\u{2584}' => Some(vec![(cx, cy + hh, cw, hh)]), // ▄ lower half
-        '\u{2585}' => Some(vec![(cx, cy + ch * 3.0 / 8.0, cw, ch * 5.0 / 8.0)]),
-        '\u{2586}' => Some(vec![(cx, cy + ch * 2.0 / 8.0, cw, ch * 6.0 / 8.0)]),
-        '\u{2587}' => Some(vec![(cx, cy + ch / 8.0, cw, ch * 7.0 / 8.0)]),
-        '\u{2588}' => Some(vec![(cx, cy, cw, ch)]), // █ full block
+        '\u{2581}' => Some(vec![r!(cx, cy + ch * 7.0 / 8.0, cw, ch / 8.0)]),
+        '\u{2582}' => Some(vec![r!(cx, cy + ch * 6.0 / 8.0, cw, ch * 2.0 / 8.0)]),
+        '\u{2583}' => Some(vec![r!(cx, cy + ch * 5.0 / 8.0, cw, ch * 3.0 / 8.0)]),
+        '\u{2584}' => Some(vec![r!(cx, cy + hh, cw, hh)]),
+        '\u{2585}' => Some(vec![r!(cx, cy + ch * 3.0 / 8.0, cw, ch * 5.0 / 8.0)]),
+        '\u{2586}' => Some(vec![r!(cx, cy + ch * 2.0 / 8.0, cw, ch * 6.0 / 8.0)]),
+        '\u{2587}' => Some(vec![r!(cx, cy + ch / 8.0, cw, ch * 7.0 / 8.0)]),
+        '\u{2588}' => Some(vec![r!(cx, cy, cw, ch)]),
         // Horizontal fractional blocks (left N/8)
-        '\u{2589}' => Some(vec![(cx, cy, cw * 7.0 / 8.0, ch)]),
-        '\u{258A}' => Some(vec![(cx, cy, cw * 6.0 / 8.0, ch)]),
-        '\u{258B}' => Some(vec![(cx, cy, cw * 5.0 / 8.0, ch)]),
-        '\u{258C}' => Some(vec![(cx, cy, hw, ch)]), // ▌ left half
-        '\u{258D}' => Some(vec![(cx, cy, cw * 3.0 / 8.0, ch)]),
-        '\u{258E}' => Some(vec![(cx, cy, cw * 2.0 / 8.0, ch)]),
-        '\u{258F}' => Some(vec![(cx, cy, cw / 8.0, ch)]),
+        '\u{2589}' => Some(vec![r!(cx, cy, cw * 7.0 / 8.0, ch)]),
+        '\u{258A}' => Some(vec![r!(cx, cy, cw * 6.0 / 8.0, ch)]),
+        '\u{258B}' => Some(vec![r!(cx, cy, cw * 5.0 / 8.0, ch)]),
+        '\u{258C}' => Some(vec![r!(cx, cy, hw, ch)]),
+        '\u{258D}' => Some(vec![r!(cx, cy, cw * 3.0 / 8.0, ch)]),
+        '\u{258E}' => Some(vec![r!(cx, cy, cw * 2.0 / 8.0, ch)]),
+        '\u{258F}' => Some(vec![r!(cx, cy, cw / 8.0, ch)]),
         // Other halves
-        '\u{2580}' => Some(vec![(cx, cy, cw, hh)]), // ▀ upper half
-        '\u{2590}' => Some(vec![(cx + hw, cy, hw, ch)]), // ▐ right half
-        '\u{2594}' => Some(vec![(cx, cy, cw, ch / 8.0)]), // ▔ upper 1/8
-        '\u{2595}' => Some(vec![(cx + cw * 7.0 / 8.0, cy, cw / 8.0, ch)]), // ▕ right 1/8
+        '\u{2580}' => Some(vec![r!(cx, cy, cw, hh)]),
+        '\u{2590}' => Some(vec![r!(cx + hw, cy, hw, ch)]),
+        '\u{2594}' => Some(vec![r!(cx, cy, cw, ch / 8.0)]),
+        '\u{2595}' => Some(vec![r!(cx + cw * 7.0 / 8.0, cy, cw / 8.0, ch)]),
         // Quadrant elements
-        '\u{2596}' => Some(vec![(cx, cy + hh, hw, hh)]), // ▖ lower-left
-        '\u{2597}' => Some(vec![(cx + hw, cy + hh, hw, hh)]), // ▗ lower-right
-        '\u{2598}' => Some(vec![(cx, cy, hw, hh)]),      // ▘ upper-left
-        '\u{2599}' => Some(vec![
-            // ▙
-            (cx, cy, hw, hh),
-            (cx, cy + hh, cw, hh),
-        ]),
-        '\u{259A}' => Some(vec![
-            // ▚
-            (cx, cy, hw, hh),
-            (cx + hw, cy + hh, hw, hh),
-        ]),
-        '\u{259B}' => Some(vec![
-            // ▛
-            (cx, cy, cw, hh),
-            (cx, cy + hh, hw, hh),
-        ]),
-        '\u{259C}' => Some(vec![
-            // ▜
-            (cx, cy, cw, hh),
-            (cx + hw, cy + hh, hw, hh),
-        ]),
-        '\u{259D}' => Some(vec![(cx + hw, cy, hw, hh)]), // ▝ upper-right
-        '\u{259E}' => Some(vec![
-            // ▞
-            (cx + hw, cy, hw, hh),
-            (cx, cy + hh, hw, hh),
-        ]),
-        '\u{259F}' => Some(vec![
-            // ▟
-            (cx + hw, cy, hw, hh),
-            (cx, cy + hh, cw, hh),
-        ]),
+        '\u{2596}' => Some(vec![r!(cx, cy + hh, hw, hh)]),
+        '\u{2597}' => Some(vec![r!(cx + hw, cy + hh, hw, hh)]),
+        '\u{2598}' => Some(vec![r!(cx, cy, hw, hh)]),
+        '\u{2599}' => Some(vec![r!(cx, cy, hw, hh), r!(cx, cy + hh, cw, hh)]),
+        '\u{259A}' => Some(vec![r!(cx, cy, hw, hh), r!(cx + hw, cy + hh, hw, hh)]),
+        '\u{259B}' => Some(vec![r!(cx, cy, cw, hh), r!(cx, cy + hh, hw, hh)]),
+        '\u{259C}' => Some(vec![r!(cx, cy, cw, hh), r!(cx + hw, cy + hh, hw, hh)]),
+        '\u{259D}' => Some(vec![r!(cx + hw, cy, hw, hh)]),
+        '\u{259E}' => Some(vec![r!(cx + hw, cy, hw, hh), r!(cx, cy + hh, hw, hh)]),
+        '\u{259F}' => Some(vec![r!(cx + hw, cy, hw, hh), r!(cx, cy + hh, cw, hh)]),
         _ => None,
     }
 }

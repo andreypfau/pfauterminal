@@ -1,8 +1,8 @@
 use glyphon::{Attrs, Buffer, Family, FontSystem, Metrics, Shaping};
 
-use crate::colors::ColorScheme;
-use crate::layout::Rect;
-use crate::tab_bar::RoundedQuad;
+use crate::colors::{hex_to_glyphon_color, hex_to_linear_f32, ColorScheme};
+use crate::layout::{push_stroked_rounded_rect, Rect, RoundedQuad};
+use crate::terminal_panel::TextSpec;
 
 // Design constants (logical pixels, matching Pencil spec)
 const MENU_WIDTH: f32 = 200.0;
@@ -41,17 +41,9 @@ pub enum DropdownHit {
     None,
 }
 
-pub struct DropdownTextArea {
-    pub buffer_index: usize,
-    pub left: f32,
-    pub top: f32,
-    pub bounds: Rect,
-    pub is_hovered: bool,
-}
-
 pub struct DropdownDrawCommands {
     pub rounded_quads: Vec<RoundedQuad>,
-    pub text_areas: Vec<DropdownTextArea>,
+    pub text_areas: Vec<TextSpec>,
 }
 
 pub struct DropdownMenu {
@@ -239,33 +231,27 @@ impl DropdownMenu {
                 width: self.menu_rect.width,
                 height: self.menu_rect.height,
             },
-            color: colors.dropdown_shadow(),
+            color: hex_to_linear_f32(&colors.dropdown_shadow),
             radius,
             shadow_softness: shadow_spread,
         });
 
-        // 1. Border rect (outer)
-        rounded_quads.push(RoundedQuad {
-            rect: self.menu_rect,
-            color: colors.dropdown_border(),
+        // 1. Border + fill
+        push_stroked_rounded_rect(
+            &mut rounded_quads,
+            &self.menu_rect,
+            hex_to_linear_f32(&colors.dropdown_border),
+            hex_to_linear_f32(&colors.dropdown_bg),
             radius,
-            shadow_softness: 0.0,
-        });
-
-        // 2. Fill rect (inset by border)
-        rounded_quads.push(RoundedQuad {
-            rect: self.menu_rect.inset(border),
-            color: colors.dropdown_bg(),
-            radius: (radius - border).max(0.0),
-            shadow_softness: 0.0,
-        });
+            border,
+        );
 
         // 3. Hover highlight (if any)
         if let DropdownHover::Item(idx) = self.hover {
             if let Some(rect) = self.item_rects.get(idx) {
                 rounded_quads.push(RoundedQuad {
                     rect: *rect,
-                    color: colors.dropdown_item_hover(),
+                    color: hex_to_linear_f32(&colors.dropdown_item_hover),
                     radius: item_radius,
                     shadow_softness: 0.0,
                 });
@@ -278,13 +264,18 @@ impl DropdownMenu {
             let is_hovered = matches!(self.hover, DropdownHover::Item(idx) if idx == i);
             let text_left = rect.x + item_pad_h;
             let text_top = rect.y + (rect.height - line_h) / 2.0;
+            let color = if is_hovered {
+                hex_to_glyphon_color(&colors.dropdown_text_active)
+            } else {
+                hex_to_glyphon_color(&colors.dropdown_text)
+            };
 
-            text_areas.push(DropdownTextArea {
+            text_areas.push(TextSpec {
                 buffer_index: i,
                 left: text_left,
                 top: text_top,
                 bounds: *rect,
-                is_hovered,
+                color,
             });
         }
 

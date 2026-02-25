@@ -12,10 +12,9 @@ use crate::gpu::GpuContext;
 use crate::icons::IconManager;
 use crate::layout::Rect;
 use crate::ssh_dialog::{SshDialogWindow, SshResult};
-use crate::tab_bar::{TabBar, TabBarHit};
+use crate::tab_bar::{TabBar, TabBarHit, TabBarHover};
 use crate::terminal::{EventProxy, TerminalEvent};
 use crate::terminal_panel::{PanelId, TerminalPanel};
-use crate::workspace::Workspace;
 
 /// Padding between window edges and panel area (logical pixels).
 const PANEL_AREA_PADDING: f32 = 8.0;
@@ -26,7 +25,7 @@ pub struct App {
     icon_manager: IconManager,
     event_proxy_raw: EventLoopProxy<TerminalEvent>,
     colors: ColorScheme,
-    workspaces: Vec<Workspace>,
+    workspaces: Vec<TerminalPanel>,
     active_workspace: usize,
     tab_bar: TabBar,
     dropdown: DropdownMenu,
@@ -56,22 +55,29 @@ impl App {
         }
     }
 
+    /// Compute shared viewport params for a new panel.
+    fn new_panel_params(
+        &self,
+        gpu: &GpuContext,
+    ) -> (PanelId, crate::terminal_panel::PanelViewport, EventProxy) {
+        let panel_id = PanelId::next();
+        let event_proxy = EventProxy::new(self.event_proxy_raw.clone(), panel_id);
+        let scale = gpu.scale_factor;
+        let area = Self::panel_area_from_gpu(gpu);
+        let tab_h = TabBar::height(scale);
+        let vp = TerminalPanel::compute_viewport(&area, &gpu.cell, scale, tab_h);
+        (panel_id, vp, event_proxy)
+    }
+
     fn create_terminal_panel(
         &self,
         gpu: &GpuContext,
         shell: Option<String>,
         args: Vec<String>,
     ) -> TerminalPanel {
-        let panel_id = PanelId::next();
-        let event_proxy = EventProxy::new(self.event_proxy_raw.clone(), panel_id);
-
-        let scale = gpu.scale_factor;
-        let area = Self::panel_area_from_gpu(gpu);
-        let tab_h = TabBar::height(scale);
-        let vp = TerminalPanel::compute_viewport(&area, &gpu.cell, scale, tab_h);
-
-        let cell_w = (gpu.cell.width * scale) as u16;
-        let cell_h = (gpu.cell.height * scale) as u16;
+        let (panel_id, vp, event_proxy) = self.new_panel_params(gpu);
+        let cell_w = (gpu.cell.width * gpu.scale_factor) as u16;
+        let cell_h = (gpu.cell.height * gpu.scale_factor) as u16;
 
         TerminalPanel::new(
             panel_id,
@@ -103,8 +109,9 @@ impl App {
         let area = Self::panel_area_from_gpu(gpu);
         let tab_h = TabBar::height(scale);
 
-        if let Some(ws) = self.workspaces.get_mut(self.active_workspace) {
-            ws.compute_viewports(area, &cell, scale, tab_h);
+        if let Some(panel) = self.workspaces.get_mut(self.active_workspace) {
+            let viewport = TerminalPanel::compute_viewport(&area, &cell, scale, tab_h);
+            panel.set_viewport(viewport, &cell);
         }
     }
 
@@ -117,7 +124,7 @@ impl App {
         let titles: Vec<String> = self
             .workspaces
             .iter()
-            .map(|ws| ws.title().to_string())
+            .map(|p| p.title().to_string())
             .collect();
 
         self.tab_bar.update(
@@ -137,14 +144,13 @@ impl App {
         }
 
         let gpu = self.gpu.as_mut().unwrap();
-        let scale = gpu.scale_factor;
 
-        // Prepare render data from active workspace
-        let ws = &mut self.workspaces[self.active_workspace];
+        // Prepare render data from active panel
+        let panel = &mut self.workspaces[self.active_workspace];
 
-        let draw = ws.panel.prepare_render(&mut gpu.font_system, &gpu.colors);
+        let draw = panel.prepare_render(&mut gpu.font_system, &gpu.colors);
         let panel_draws = vec![draw];
-        let bufs = ws.panel.buffers();
+        let bufs = panel.buffers();
         let panel_buf_refs = vec![bufs];
 
         let dropdown_ref = if self.dropdown.is_open() {
@@ -160,7 +166,6 @@ impl App {
             dropdown_ref,
             &panel_draws,
             &panel_buf_refs,
-            scale,
             &self.icon_manager,
             screenshot.as_deref(),
         ) {
@@ -190,53 +195,40 @@ impl App {
         self.update_viewports();
         self.update_tab_bar();
         self.update_window_title();
+        self.request_redraw();
     }
 
     fn update_window_title(&self) {
         if let Some(w) = &self.window {
-            if let Some(ws) = self.workspaces.get(self.active_workspace) {
-                w.set_title(ws.title());
+            if let Some(panel) = self.workspaces.get(self.active_workspace) {
+                w.set_title(panel.title());
             }
         }
+    }
+
+    fn add_workspace(&mut self, panel: TerminalPanel) {
+        self.workspaces.push(panel);
+        self.active_workspace = self.workspaces.len() - 1;
+        self.sync_workspace_state();
     }
 
     fn new_workspace(&mut self, shell: Option<String>) {
         let gpu = self.gpu.as_ref().unwrap();
         let panel = self.create_terminal_panel(gpu, shell, Vec::new());
-        let ws = Workspace::new(panel);
-        self.workspaces.push(ws);
-        self.active_workspace = self.workspaces.len() - 1;
-        self.sync_workspace_state();
+        self.add_workspace(panel);
     }
 
     fn new_workspace_ssh(&mut self, result: SshResult) {
-        let ssh_config = result.to_ssh_config();
-
         let gpu = self.gpu.as_ref().unwrap();
-        let panel_id = PanelId::next();
-        let event_proxy = EventProxy::new(self.event_proxy_raw.clone(), panel_id);
-
-        let scale = gpu.scale_factor;
-        let area = Self::panel_area_from_gpu(gpu);
-        let tab_h = TabBar::height(scale);
-        let vp = TerminalPanel::compute_viewport(&area, &gpu.cell, scale, tab_h);
-
-        let cell_w = (gpu.cell.width * scale) as u16;
-        let cell_h = (gpu.cell.height * scale) as u16;
-
+        let (panel_id, vp, event_proxy) = self.new_panel_params(gpu);
         let panel = TerminalPanel::new_ssh(
             panel_id,
             vp.cols,
             vp.rows,
-            cell_w,
-            cell_h,
             event_proxy,
-            ssh_config,
+            result.to_ssh_config(),
         );
-        let ws = Workspace::new(panel);
-        self.workspaces.push(ws);
-        self.active_workspace = self.workspaces.len() - 1;
-        self.sync_workspace_state();
+        self.add_workspace(panel);
     }
 
     fn close_workspace(&mut self, idx: usize) {
@@ -333,28 +325,22 @@ impl ApplicationHandler<TerminalEvent> for App {
                 self.request_redraw();
             }
             TerminalEvent::Title(panel_id, title) => {
-                for ws in &mut self.workspaces {
-                    if ws.panel.id() == panel_id {
-                        ws.panel.set_title(title);
-                        break;
-                    }
+                if let Some(panel) = self.workspaces.iter_mut().find(|p| p.id() == panel_id) {
+                    panel.set_title(title);
                 }
-                self.update_tab_bar();
-                self.update_window_title();
-                self.request_redraw();
+                self.sync_workspace_state();
             }
             TerminalEvent::SshDialogClose(result) => {
                 self.ssh_dialog_window = None;
                 if let Some(result) = result {
                     if !result.host.is_empty() {
                         self.new_workspace_ssh(result);
-                        self.request_redraw();
                     }
                 }
             }
             TerminalEvent::Exit(panel_id) => {
                 log::info!("terminal {panel_id:?} exited");
-                self.workspaces.retain(|ws| ws.panel.id() != panel_id);
+                self.workspaces.retain(|p| p.id() != panel_id);
 
                 if self.workspaces.is_empty() {
                     event_loop.exit();
@@ -363,8 +349,7 @@ impl ApplicationHandler<TerminalEvent> for App {
                 if self.active_workspace >= self.workspaces.len() {
                     self.active_workspace = self.workspaces.len() - 1;
                 }
-                self.update_tab_bar();
-                self.request_redraw();
+                self.sync_workspace_state();
             }
         }
     }
@@ -416,9 +401,7 @@ impl ApplicationHandler<TerminalEvent> for App {
                 if let Some(gpu) = &mut self.gpu {
                     gpu.resize(new_size.width, new_size.height);
                 }
-                self.update_viewports();
-                self.update_tab_bar();
-                self.request_redraw();
+                self.sync_workspace_state();
             }
 
             WindowEvent::ScaleFactorChanged { scale_factor, .. } => {
@@ -426,8 +409,7 @@ impl ApplicationHandler<TerminalEvent> for App {
                 if let Some(gpu) = &mut self.gpu {
                     gpu.scale_factor = scale_factor as f32;
                 }
-                self.update_viewports();
-                self.update_tab_bar();
+                self.sync_workspace_state();
             }
 
             WindowEvent::RedrawRequested => {
@@ -455,7 +437,7 @@ impl ApplicationHandler<TerminalEvent> for App {
                 let hover = if cy >= pad && cy < pad + tab_h {
                     self.tab_bar.compute_hover(cx, cy)
                 } else {
-                    crate::tab_bar::TabBarHover::None
+                    TabBarHover::None
                 };
                 if self.tab_bar.set_hover(hover) {
                     self.request_redraw();
@@ -463,7 +445,7 @@ impl ApplicationHandler<TerminalEvent> for App {
             }
 
             WindowEvent::CursorLeft { .. } => {
-                if self.tab_bar.set_hover(crate::tab_bar::TabBarHover::None) {
+                if self.tab_bar.set_hover(TabBarHover::None) {
                     self.request_redraw();
                 }
             }
@@ -505,13 +487,11 @@ impl ApplicationHandler<TerminalEvent> for App {
                                 self.active_workspace = idx;
                                 self.tab_bar.set_active(idx);
                                 self.sync_workspace_state();
-                                self.request_redraw();
                             }
                         }
                         TabBarHit::CloseTab(idx) => {
                             if idx < self.workspaces.len() {
                                 self.close_workspace(idx);
-                                self.request_redraw();
                             }
                         }
                         TabBarHit::NewTab => {
@@ -531,10 +511,7 @@ impl ApplicationHandler<TerminalEvent> for App {
                 // Close dropdown on Escape
                 if self.dropdown.is_open() {
                     if event.state == ElementState::Pressed {
-                        if let winit::keyboard::PhysicalKey::Code(
-                            winit::keyboard::KeyCode::Escape,
-                        ) = event.physical_key
-                        {
+                        if let PhysicalKey::Code(KeyCode::Escape) = event.physical_key {
                             self.dropdown.close();
                             self.request_redraw();
                             return;
@@ -547,15 +524,12 @@ impl ApplicationHandler<TerminalEvent> for App {
                         PhysicalKey::Code(KeyCode::KeyV) => {
                             if let Ok(mut clip) = arboard::Clipboard::new() {
                                 if let Ok(text) = clip.get_text() {
-                                    if let Some(ws) = self.workspaces.get(self.active_workspace) {
-                                        ws.panel.write_to_pty(text.into_bytes());
+                                    if let Some(panel) = self.workspaces.get(self.active_workspace)
+                                    {
+                                        panel.write_to_pty(text.into_bytes());
                                     }
                                 }
                             }
-                            return;
-                        }
-                        PhysicalKey::Code(KeyCode::KeyC) => {
-                            // TODO: copy selection
                             return;
                         }
                         PhysicalKey::Code(KeyCode::KeyS) => {
@@ -569,8 +543,8 @@ impl ApplicationHandler<TerminalEvent> for App {
                     }
                 }
 
-                if let Some(ws) = self.workspaces.get_mut(self.active_workspace) {
-                    ws.panel.handle_key(&event);
+                if let Some(panel) = self.workspaces.get_mut(self.active_workspace) {
+                    panel.handle_key(&event);
                 }
             }
 
@@ -580,8 +554,8 @@ impl ApplicationHandler<TerminalEvent> for App {
                     .as_ref()
                     .map(|g| g.cell.height as f64)
                     .unwrap_or(16.0);
-                if let Some(ws) = self.workspaces.get_mut(self.active_workspace) {
-                    if ws.panel.handle_scroll(delta, cell_height) {
+                if let Some(panel) = self.workspaces.get_mut(self.active_workspace) {
+                    if panel.handle_scroll(delta, cell_height) {
                         self.request_redraw();
                     }
                 }
@@ -593,128 +567,112 @@ impl ApplicationHandler<TerminalEvent> for App {
 }
 
 /// Detect available shells on the system. Returns (display_label, full_path) pairs.
-#[cfg(not(windows))]
 fn detect_shells() -> Vec<(String, String)> {
     let mut shells = Vec::new();
     let mut seen = std::collections::HashSet::new();
-    detect_shells_unix(&mut shells, &mut seen);
-    if shells.is_empty() {
-        shells.push(("sh".to_string(), "/bin/sh".to_string()));
-    }
-    shells
-}
 
-/// Detect available shells on the system. Returns (display_label, full_path) pairs.
-#[cfg(windows)]
-fn detect_shells() -> Vec<(String, String)> {
-    let mut shells = Vec::new();
-    let mut seen = std::collections::HashSet::new();
-    detect_shells_windows(&mut shells, &mut seen);
-    if shells.is_empty() {
-        shells.push(("cmd".to_string(), "cmd.exe".to_string()));
-    }
-    shells
-}
+    #[cfg(not(windows))]
+    {
+        const COMMON_SHELLS: &[&str] = &["zsh", "bash", "fish", "nu", "pwsh"];
 
-#[cfg(not(windows))]
-fn detect_shells_unix(
-    shells: &mut Vec<(String, String)>,
-    seen: &mut std::collections::HashSet<String>,
-) {
-    // Only show commonly-used shells from /etc/shells
-    const COMMON_SHELLS: &[&str] = &["zsh", "bash", "fish", "nu", "pwsh"];
+        if let Ok(contents) = std::fs::read_to_string("/etc/shells") {
+            for line in contents.lines() {
+                let line = line.trim();
+                if line.is_empty() || line.starts_with('#') {
+                    continue;
+                }
+                let path = std::path::Path::new(line);
+                let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
+                if !COMMON_SHELLS.contains(&name) {
+                    continue;
+                }
+                if path.exists() && seen.insert(name.to_string()) {
+                    shells.push((name.to_string(), line.to_string()));
+                }
+            }
+        }
 
-    if let Ok(contents) = std::fs::read_to_string("/etc/shells") {
-        for line in contents.lines() {
-            let line = line.trim();
-            if line.is_empty() || line.starts_with('#') {
-                continue;
+        // Fallback: check well-known paths
+        if shells.is_empty() {
+            for path in &["/bin/zsh", "/bin/bash", "/bin/sh"] {
+                if std::path::Path::new(path).exists() {
+                    let name = std::path::Path::new(path)
+                        .file_name()
+                        .and_then(|n| n.to_str())
+                        .unwrap_or(path);
+                    if seen.insert(name.to_string()) {
+                        shells.push((name.to_string(), path.to_string()));
+                    }
+                }
             }
-            let path = std::path::Path::new(line);
-            let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
-            if !COMMON_SHELLS.contains(&name) {
-                continue;
-            }
-            if path.exists() && seen.insert(name.to_string()) {
-                shells.push((name.to_string(), line.to_string()));
-            }
+        }
+
+        if shells.is_empty() {
+            shells.push(("sh".to_string(), "/bin/sh".to_string()));
         }
     }
 
-    // Fallback: check well-known paths
-    if shells.is_empty() {
-        for path in &["/bin/zsh", "/bin/bash", "/bin/sh"] {
+    #[cfg(windows)]
+    {
+        // PowerShell 7+ (pwsh)
+        if let Ok(output) = std::process::Command::new("where").arg("pwsh").output() {
+            if output.status.success() {
+                if let Some(path) = String::from_utf8_lossy(&output.stdout).lines().next() {
+                    let path = path.trim();
+                    if seen.insert("pwsh".to_string()) {
+                        shells.push(("PowerShell".to_string(), path.to_string()));
+                    }
+                }
+            }
+        }
+
+        // Windows PowerShell (powershell.exe)
+        if let Some(sysroot) = std::env::var_os("SystemRoot") {
+            let ps_path = std::path::Path::new(&sysroot)
+                .join("System32")
+                .join("WindowsPowerShell")
+                .join("v1.0")
+                .join("powershell.exe");
+            if ps_path.exists() {
+                if let Some(p) = ps_path.to_str() {
+                    if seen.insert("powershell".to_string()) {
+                        shells.push(("Windows PowerShell".to_string(), p.to_string()));
+                    }
+                }
+            }
+        }
+
+        // cmd.exe
+        if let Some(sysroot) = std::env::var_os("SystemRoot") {
+            let cmd_path = std::path::Path::new(&sysroot)
+                .join("System32")
+                .join("cmd.exe");
+            if cmd_path.exists() {
+                if let Some(p) = cmd_path.to_str() {
+                    if seen.insert("cmd".to_string()) {
+                        shells.push(("Command Prompt".to_string(), p.to_string()));
+                    }
+                }
+            }
+        }
+
+        // Git Bash
+        for path in &[
+            "C:\\Program Files\\Git\\bin\\bash.exe",
+            "C:\\Program Files (x86)\\Git\\bin\\bash.exe",
+        ] {
             if std::path::Path::new(path).exists() {
-                let name = std::path::Path::new(path)
-                    .file_name()
-                    .and_then(|n| n.to_str())
-                    .unwrap_or(path);
-                if seen.insert(name.to_string()) {
-                    shells.push((name.to_string(), path.to_string()));
+                if seen.insert("git-bash".to_string()) {
+                    shells.push(("Git Bash".to_string(), path.to_string()));
+                    break;
                 }
             }
         }
-    }
-}
 
-#[cfg(windows)]
-fn detect_shells_windows(
-    shells: &mut Vec<(String, String)>,
-    seen: &mut std::collections::HashSet<String>,
-) {
-    // PowerShell 7+ (pwsh)
-    if let Ok(output) = std::process::Command::new("where").arg("pwsh").output() {
-        if output.status.success() {
-            if let Some(path) = String::from_utf8_lossy(&output.stdout).lines().next() {
-                let path = path.trim();
-                if seen.insert("pwsh".to_string()) {
-                    shells.push(("PowerShell".to_string(), path.to_string()));
-                }
-            }
+        if shells.is_empty() {
+            shells.push(("cmd".to_string(), "cmd.exe".to_string()));
         }
     }
 
-    // Windows PowerShell (powershell.exe) — always available on modern Windows
-    if let Some(sysroot) = std::env::var_os("SystemRoot") {
-        let ps_path = std::path::Path::new(&sysroot)
-            .join("System32")
-            .join("WindowsPowerShell")
-            .join("v1.0")
-            .join("powershell.exe");
-        if ps_path.exists() {
-            if let Some(p) = ps_path.to_str() {
-                if seen.insert("powershell".to_string()) {
-                    shells.push(("Windows PowerShell".to_string(), p.to_string()));
-                }
-            }
-        }
-    }
-
-    // cmd.exe
-    if let Some(sysroot) = std::env::var_os("SystemRoot") {
-        let cmd_path = std::path::Path::new(&sysroot)
-            .join("System32")
-            .join("cmd.exe");
-        if cmd_path.exists() {
-            if let Some(p) = cmd_path.to_str() {
-                if seen.insert("cmd".to_string()) {
-                    shells.push(("Command Prompt".to_string(), p.to_string()));
-                }
-            }
-        }
-    }
-
-    // Git Bash
-    let git_bash_paths = [
-        "C:\\Program Files\\Git\\bin\\bash.exe",
-        "C:\\Program Files (x86)\\Git\\bin\\bash.exe",
-    ];
-    for path in &git_bash_paths {
-        if std::path::Path::new(path).exists() {
-            if seen.insert("git-bash".to_string()) {
-                shells.push(("Git Bash".to_string(), path.to_string()));
-                break;
-            }
-        }
-    }
+    shells
 }

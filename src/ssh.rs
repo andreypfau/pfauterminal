@@ -33,7 +33,6 @@ pub enum SshAuth {
 pub enum SshMsg {
     Input(Cow<'static, [u8]>),
     Resize { cols: u16, rows: u16 },
-    Shutdown,
 }
 
 struct SshHandler;
@@ -219,7 +218,7 @@ async fn ssh_session(
                     Some(SshMsg::Resize { cols, rows }) => {
                         channel.window_change(cols as u32, rows as u32, 0, 0).await?;
                     }
-                    Some(SshMsg::Shutdown) | None => {
+                    None => {
                         break;
                     }
                 }

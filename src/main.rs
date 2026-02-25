@@ -10,7 +10,6 @@ mod ssh_dialog;
 mod tab_bar;
 mod terminal;
 mod terminal_panel;
-mod workspace;
 
 use winit::event_loop::EventLoop;
 

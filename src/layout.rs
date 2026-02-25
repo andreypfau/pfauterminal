@@ -34,3 +34,35 @@ impl Rect {
         }
     }
 }
+
+/// A filled rounded rectangle for SDF rendering.
+/// When `shadow_softness` > 0, renders as a soft shadow instead of a sharp rect.
+pub struct RoundedQuad {
+    pub rect: Rect,
+    pub color: [f32; 4],
+    pub radius: f32,
+    pub shadow_softness: f32,
+}
+
+/// Push a stroked (border + fill) rounded rect pair.
+pub fn push_stroked_rounded_rect(
+    quads: &mut Vec<RoundedQuad>,
+    rect: &Rect,
+    stroke_color: [f32; 4],
+    fill_color: [f32; 4],
+    radius: f32,
+    border: f32,
+) {
+    quads.push(RoundedQuad {
+        rect: *rect,
+        color: stroke_color,
+        radius,
+        shadow_softness: 0.0,
+    });
+    quads.push(RoundedQuad {
+        rect: rect.inset(border),
+        color: fill_color,
+        radius: (radius - border).max(0.0),
+        shadow_softness: 0.0,
+    });
+}
