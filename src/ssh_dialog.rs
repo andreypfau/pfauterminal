@@ -217,7 +217,7 @@ impl SshDialog {
         let username_label = Label::new("Username:", attrs, metrics, font_system);
         let auth_label = Label::new("Authentication type:", attrs, metrics, font_system);
         let password_label = Label::new("Password:", attrs, metrics, font_system);
-        let keypath_label = Label::new("Private key file:", semibold_attrs, metrics, font_system);
+        let keypath_label = Label::new("Private key file:", attrs, metrics, font_system);
         let passphrase_label = Label::new("Passphrase:", attrs, metrics, font_system);
         let auth_value_label = Label::new(
             initial_auth.display_text(),

@@ -189,6 +189,10 @@ pub struct TerminalPanel {
     char_buffers: Vec<Buffer>,
     char_key_map: HashMap<CharKey, usize>,
     title: String,
+    /// Sub-cell pixel offset for smooth trackpad scrolling (physical pixels).
+    scroll_pixel_offset: f32,
+    /// Raw pixel accumulator not yet committed as whole lines (physical pixels).
+    scroll_accumulator: f64,
 }
 
 impl TerminalPanel {
@@ -242,6 +246,8 @@ impl TerminalPanel {
             char_buffers: Vec::new(),
             char_key_map: HashMap::new(),
             title: String::from("Terminal"),
+            scroll_pixel_offset: 0.0,
+            scroll_accumulator: 0.0,
         }
     }
 
@@ -263,6 +269,8 @@ impl TerminalPanel {
             char_buffers: Vec::new(),
             char_key_map: HashMap::new(),
             title: String::from("SSH"),
+            scroll_pixel_offset: 0.0,
+            scroll_accumulator: 0.0,
         }
     }
 
@@ -335,6 +343,8 @@ impl TerminalPanel {
                 term.scroll_display(alacritty_terminal::grid::Scroll::Bottom);
             }
         }
+        self.scroll_pixel_offset = 0.0;
+        self.scroll_accumulator = 0.0;
 
         let mode = *self.term.lock().mode();
         let app_cursor = mode.contains(TermMode::APP_CURSOR);
@@ -424,17 +434,53 @@ impl TerminalPanel {
     }
 
     pub fn handle_scroll(&mut self, delta: MouseScrollDelta, cell_height: f64) -> bool {
-        let lines = match delta {
-            MouseScrollDelta::LineDelta(_, y) => y as i32,
-            MouseScrollDelta::PixelDelta(pos) => (pos.y / cell_height) as i32,
-        };
-        if lines != 0 {
-            let mut term = self.term.lock();
-            term.scroll_display(alacritty_terminal::grid::Scroll::Delta(lines));
-            true
-        } else {
-            false
+        match delta {
+            MouseScrollDelta::LineDelta(_, y) => {
+                let lines = y as i32;
+                if lines != 0 {
+                    let mut term = self.term.lock();
+                    term.scroll_display(alacritty_terminal::grid::Scroll::Delta(lines));
+                    self.scroll_pixel_offset = 0.0;
+                    self.scroll_accumulator = 0.0;
+                    true
+                } else {
+                    false
+                }
+            }
+            MouseScrollDelta::PixelDelta(pos) => {
+                self.scroll_accumulator += pos.y;
+                let mut term = self.term.lock();
+                let lines = (self.scroll_accumulator / cell_height) as i32;
+                if lines != 0 {
+                    let offset_before = term.grid().display_offset();
+                    term.scroll_display(alacritty_terminal::grid::Scroll::Delta(lines));
+                    let offset_after = term.grid().display_offset();
+                    let actual = offset_after as i32 - offset_before as i32;
+                    self.scroll_accumulator -= actual as f64 * cell_height;
+                    if actual != lines {
+                        // Scroll was clamped (hit top/bottom of scrollback)
+                        self.scroll_accumulator = 0.0;
+                    }
+                }
+                // Clamp at scroll boundaries
+                let offset = term.grid().display_offset();
+                if offset == 0 && self.scroll_accumulator < 0.0 {
+                    self.scroll_accumulator = 0.0;
+                }
+                let max_offset = term.grid().total_lines().saturating_sub(term.grid().screen_lines());
+                if offset >= max_offset && self.scroll_accumulator > 0.0 {
+                    self.scroll_accumulator = 0.0;
+                }
+                drop(term);
+                self.scroll_pixel_offset = self.scroll_accumulator as f32;
+                true
+            }
         }
+    }
+
+    /// Returns true if a smooth scroll animation is in progress.
+    pub fn is_smooth_scrolling(&self) -> bool {
+        self.scroll_pixel_offset != 0.0
     }
 
     pub fn draw(
@@ -458,7 +504,10 @@ impl TerminalPanel {
         let pch = vp.content_rect.height / rows as f32;
         let content_x = vp.content_rect.x;
         let content_y = vp.content_rect.y;
+        let content_clip = vp.content_rect;
+        let content_bottom = content_y + vp.content_rect.height;
         let island_rect = vp.rect;
+        let pixel_offset = self.scroll_pixel_offset;
 
         // Island background (stroke + fill)
         let island_radius = panel_theme.island_radius * scale;
@@ -483,13 +532,17 @@ impl TerminalPanel {
             let term = self.term.lock();
             let content = term.renderable_content();
             let display_offset = content.display_offset;
+            let cursor_point = content.cursor.point;
+
+            // display_iter provides screen_lines+1 rows: one extra above the
+            // viewport (viewport_line == -1). We render it when pixel_offset > 0
+            // to fill the gap at the top during smooth upward scroll.
+            let min_vline = if pixel_offset > 0.0 { -1 } else { 0 };
 
             for indexed in content.display_iter {
                 let viewport_line = indexed.point.line.0 + display_offset as i32;
-                if viewport_line < 0 { continue; }
-                let row = viewport_line as usize;
                 let col = indexed.point.column.0;
-                if row >= rows || col >= cols {
+                if viewport_line < min_vline || viewport_line >= rows as i32 || col >= cols {
                     continue;
                 }
 
@@ -502,16 +555,18 @@ impl TerminalPanel {
                     (cell.fg, cell.bg)
                 };
 
+                let cy = content_y + viewport_line as f32 * pch + pixel_offset;
+
                 if !colors.is_default_bg(bg_color) {
-                    ctx.flat_quad(
-                        Rect {
-                            x: content_x + col as f32 * pcw,
-                            y: content_y + row as f32 * pch,
-                            width: pcw,
-                            height: pch,
-                        },
-                        colors.to_rgba(bg_color),
-                    );
+                    let quad = Rect {
+                        x: content_x + col as f32 * pcw,
+                        y: cy,
+                        width: pcw,
+                        height: pch,
+                    };
+                    if let Some(clipped) = quad.clip_y(content_y, content_bottom) {
+                        ctx.flat_quad(clipped, colors.to_rgba(bg_color));
+                    }
                 }
 
                 let is_invisible = flags.intersects(
@@ -531,12 +586,13 @@ impl TerminalPanel {
                 };
 
                 let cx = content_x + col as f32 * pcw;
-                let cy = content_y + row as f32 * pch;
 
                 if let Some(rects) = block_char_rects(c, cx, cy, pcw, pch) {
                     let color = glyphon_to_linear(fg);
                     for r in rects {
-                        ctx.flat_quad(r, color);
+                        if let Some(clipped) = r.clip_y(content_y, content_bottom) {
+                            ctx.flat_quad(clipped, color);
+                        }
                     }
                     continue;
                 }
@@ -558,26 +614,115 @@ impl TerminalPanel {
                     top: cy,
                     color: fg,
                     buffer_index: buf_idx,
-                    bounds: island_rect,
+                    bounds: content_clip,
                 });
             }
 
             // Cursor quad
-            let cp = content.cursor.point;
-            let cur_viewport_line = cp.line.0 + display_offset as i32;
-            let cur_col = cp.column.0;
+            let cur_viewport_line = cursor_point.line.0 + display_offset as i32;
+            let cur_col = cursor_point.column.0;
             if cur_viewport_line >= 0 {
                 let cur_row = cur_viewport_line as usize;
                 if cur_row < rows && cur_col < cols {
-                    ctx.flat_quad(
-                        Rect {
-                            x: content_x + cur_col as f32 * pcw,
-                            y: content_y + cur_row as f32 * pch,
+                    let cursor_rect = Rect {
+                        x: content_x + cur_col as f32 * pcw,
+                        y: content_y + cur_row as f32 * pch + pixel_offset,
+                        width: pcw,
+                        height: pch,
+                    };
+                    if let Some(clipped) = cursor_rect.clip_y(content_y, content_bottom) {
+                        ctx.flat_quad(clipped, colors.cursor.to_linear_f32());
+                    }
+                }
+            }
+
+            // Extra bottom row: when content shifts up (scroll down), fill
+            // the gap at the bottom by reading one row past the viewport
+            // from the grid directly (display_iter doesn't include it).
+            if pixel_offset < -0.5 && display_offset > 0 {
+                use alacritty_terminal::index::{Column as GridColumn, Line as GridLine};
+
+                let grid = term.grid();
+                let grid_line = rows as i32 - display_offset as i32;
+                let y_base = content_y + rows as f32 * pch + pixel_offset;
+                let row_data = &grid[GridLine(grid_line)];
+
+                for col_idx in 0..cols {
+                    let cell = &row_data[GridColumn(col_idx)];
+                    let flags = cell.flags;
+
+                    let (fg_color, bg_color) = if flags.contains(Flags::INVERSE) {
+                        (cell.bg, cell.fg)
+                    } else {
+                        (cell.fg, cell.bg)
+                    };
+
+                    if !colors.is_default_bg(bg_color) {
+                        let quad = Rect {
+                            x: content_x + col_idx as f32 * pcw,
+                            y: y_base,
                             width: pcw,
                             height: pch,
-                        },
-                        colors.cursor.to_linear_f32(),
+                        };
+                        if let Some(clipped) = quad.clip_y(content_y, content_bottom) {
+                            ctx.flat_quad(clipped, colors.to_rgba(bg_color));
+                        }
+                    }
+
+                    let is_invisible = flags.intersects(
+                        Flags::WIDE_CHAR_SPACER
+                            | Flags::LEADING_WIDE_CHAR_SPACER
+                            | Flags::HIDDEN,
                     );
+                    let c = if is_invisible { ' ' } else { cell.c };
+                    if c == ' ' || c == '\0' {
+                        continue;
+                    }
+
+                    let dim = flags.contains(Flags::DIM);
+                    let fg = if dim {
+                        let base = colors.to_glyphon_fg(fg_color);
+                        GlyphonColor::rgba(
+                            base.r() / 2,
+                            base.g() / 2,
+                            base.b() / 2,
+                            base.a(),
+                        )
+                    } else {
+                        colors.to_glyphon_fg(fg_color)
+                    };
+
+                    let cx = content_x + col_idx as f32 * pcw;
+
+                    if let Some(rects) = block_char_rects(c, cx, y_base, pcw, pch) {
+                        let color = glyphon_to_linear(fg);
+                        for r in rects {
+                            if let Some(clipped) = r.clip_y(content_y, content_bottom) {
+                                ctx.flat_quad(clipped, color);
+                            }
+                        }
+                        continue;
+                    }
+
+                    let bold = flags.contains(Flags::BOLD);
+                    let italic = flags.contains(Flags::ITALIC);
+                    let key = CharKey { ch: c, bold, italic };
+                    let buf_idx = get_or_create_buffer(
+                        &mut self.char_buffers,
+                        &mut self.char_key_map,
+                        key,
+                        font_system,
+                        metrics,
+                        cell_metrics,
+                    );
+
+                    text_specs.push(TextSpec {
+                        left: cx,
+                        top: y_base,
+                        color: fg,
+                        buffer_index: buf_idx,
+                        bounds: content_clip,
+                    });
                 }
             }
         }

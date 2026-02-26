@@ -44,6 +44,23 @@ impl Rect {
         }
     }
 
+    /// Clip this rect vertically to the range `top..bottom`.
+    /// Returns `None` if fully outside.
+    pub fn clip_y(&self, top: f32, bottom: f32) -> Option<Rect> {
+        let y0 = self.y.max(top);
+        let y1 = (self.y + self.height).min(bottom);
+        if y0 >= y1 {
+            None
+        } else {
+            Some(Rect {
+                x: self.x,
+                y: y0,
+                width: self.width,
+                height: y1 - y0,
+            })
+        }
+    }
+
     /// Convert to glyphon `TextBounds`.
     pub fn to_text_bounds(&self) -> TextBounds {
         TextBounds {

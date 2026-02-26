@@ -13,7 +13,21 @@ pub struct CellMetrics {
 
 pub fn create_font_system() -> FontSystem {
     let mut font_system = FontSystem::new();
-    font_system.db_mut().load_font_data(FONT_DATA.to_vec());
+    let db = font_system.db_mut();
+    db.load_font_data(FONT_DATA.to_vec());
+    db.set_monospace_family(FONT_FAMILY);
+
+    // Remove emoji fonts so the fallback chain never picks colored emoji.
+    // Terminal text should be rendered as monochrome glyphs only.
+    let emoji_ids: Vec<_> = db
+        .faces()
+        .filter(|f| f.post_script_name.contains("Emoji"))
+        .map(|f| f.id)
+        .collect();
+    for id in emoji_ids {
+        db.remove_face(id);
+    }
+
     font_system
 }
 
@@ -21,9 +35,13 @@ pub fn metrics() -> Metrics {
     Metrics::new(FONT_SIZE, FONT_SIZE * LINE_HEIGHT)
 }
 
-/// Default text attributes using the configured font family.
+/// Default text attributes using the monospace family.
+///
+/// Uses `Family::Monospace` to leverage cosmic-text's monospace fallback,
+/// which tries all monospace system fonts (e.g. Menlo on macOS, Consolas on
+/// Windows) when a glyph is missing from the primary font.
 pub fn default_attrs() -> Attrs<'static> {
-    Attrs::new().family(Family::Name(FONT_FAMILY))
+    Attrs::new().family(Family::Monospace)
 }
 
 /// Set metrics, size, text, and shape a buffer in one call.

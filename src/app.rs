@@ -663,7 +663,7 @@ impl ApplicationHandler<TerminalEvent> for App {
                 let cell_height = self
                     .gpu
                     .as_ref()
-                    .map(|g| g.cell.height as f64)
+                    .map(|g| g.cell.height as f64 * g.scale_factor as f64)
                     .unwrap_or(16.0);
                 if let Some(panel) = self.tabs.get_mut(self.active_tab)
                     && panel.handle_scroll(delta, cell_height)
