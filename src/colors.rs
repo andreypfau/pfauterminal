@@ -150,8 +150,8 @@ pub struct ColorScheme {
 impl Default for ColorScheme {
     fn default() -> Self {
         Self {
-            background: HexColor::from_u32(0x1E1F22FF),
-            chrome: HexColor::from_u32(0x2B2D30FF),
+            background: HexColor::from_u32(0x191A1CFF),
+            chrome: HexColor::from_u32(0x25272AFF),
             foreground: HexColor::from_u32(0xBCBEC4FF),
             cursor: HexColor::from_u32(0xBCBEC4FF),
             black: HexColor::from_u32(0x000000FF),
@@ -176,7 +176,7 @@ impl Default for ColorScheme {
             tab_hover_bg: HexColor::from_u32(0x393B40FF),
             tab_hover_stroke: HexColor::from_u32(0x4E5157FF),
             tab_separator: HexColor::from_u32(0x393B40FF),
-            selection: HexColor::from_u32(0x264F78FF),
+            selection: HexColor::from_u32(0x214283FF),
             panel_stroke: HexColor::from_u32(0x3A3A3AFF),
             dropdown_bg: HexColor::from_u32(0x2B2D30FF),
             dropdown_border: HexColor::from_u32(0x43454AFF),
