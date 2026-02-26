@@ -7,6 +7,7 @@ use alacritty_terminal::event::{Event, EventListener, WindowSize};
 use alacritty_terminal::event_loop::{EventLoop, EventLoopSender, Msg};
 use alacritty_terminal::grid::Dimensions;
 use alacritty_terminal::sync::FairMutex;
+use alacritty_terminal::term::TermMode;
 use alacritty_terminal::tty;
 use alacritty_terminal::Term;
 use glyphon::{Buffer, Color as GlyphonColor, FontSystem, Shaping};
@@ -328,21 +329,38 @@ impl TerminalPanel {
             return false;
         }
 
+        let mode = *self.term.lock().mode();
+        let app_cursor = mode.contains(TermMode::APP_CURSOR);
+        // SS3 prefix for application cursor mode, CSI for normal mode
+        let cursor_prefix: &[u8] = if app_cursor { b"\x1bO" } else { b"\x1b[" };
+
         let bytes = match event.logical_key.as_ref() {
             Key::Named(NamedKey::Enter) => Some(b"\r".to_vec()),
             Key::Named(NamedKey::Backspace) => Some(b"\x7f".to_vec()),
             Key::Named(NamedKey::Tab) => Some(b"\t".to_vec()),
             Key::Named(NamedKey::Escape) => Some(b"\x1b".to_vec()),
-            Key::Named(NamedKey::ArrowUp) => Some(b"\x1b[A".to_vec()),
-            Key::Named(NamedKey::ArrowDown) => Some(b"\x1b[B".to_vec()),
-            Key::Named(NamedKey::ArrowRight) => Some(b"\x1b[C".to_vec()),
-            Key::Named(NamedKey::ArrowLeft) => Some(b"\x1b[D".to_vec()),
-            Key::Named(NamedKey::Home) => Some(b"\x1b[H".to_vec()),
-            Key::Named(NamedKey::End) => Some(b"\x1b[F".to_vec()),
+            Key::Named(NamedKey::ArrowUp) => Some([cursor_prefix, b"A"].concat()),
+            Key::Named(NamedKey::ArrowDown) => Some([cursor_prefix, b"B"].concat()),
+            Key::Named(NamedKey::ArrowRight) => Some([cursor_prefix, b"C"].concat()),
+            Key::Named(NamedKey::ArrowLeft) => Some([cursor_prefix, b"D"].concat()),
+            Key::Named(NamedKey::Home) => Some([cursor_prefix, b"H"].concat()),
+            Key::Named(NamedKey::End) => Some([cursor_prefix, b"F"].concat()),
             Key::Named(NamedKey::PageUp) => Some(b"\x1b[5~".to_vec()),
             Key::Named(NamedKey::PageDown) => Some(b"\x1b[6~".to_vec()),
             Key::Named(NamedKey::Delete) => Some(b"\x1b[3~".to_vec()),
             Key::Named(NamedKey::Insert) => Some(b"\x1b[2~".to_vec()),
+            Key::Named(NamedKey::F1) => Some(b"\x1bOP".to_vec()),
+            Key::Named(NamedKey::F2) => Some(b"\x1bOQ".to_vec()),
+            Key::Named(NamedKey::F3) => Some(b"\x1bOR".to_vec()),
+            Key::Named(NamedKey::F4) => Some(b"\x1bOS".to_vec()),
+            Key::Named(NamedKey::F5) => Some(b"\x1b[15~".to_vec()),
+            Key::Named(NamedKey::F6) => Some(b"\x1b[17~".to_vec()),
+            Key::Named(NamedKey::F7) => Some(b"\x1b[18~".to_vec()),
+            Key::Named(NamedKey::F8) => Some(b"\x1b[19~".to_vec()),
+            Key::Named(NamedKey::F9) => Some(b"\x1b[20~".to_vec()),
+            Key::Named(NamedKey::F10) => Some(b"\x1b[21~".to_vec()),
+            Key::Named(NamedKey::F11) => Some(b"\x1b[23~".to_vec()),
+            Key::Named(NamedKey::F12) => Some(b"\x1b[24~".to_vec()),
             Key::Character(c) => {
                 if c.len() == 1 {
                     let ch = c.chars().next().unwrap();
