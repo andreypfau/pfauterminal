@@ -9,7 +9,7 @@ use winit::window::{Window, WindowAttributes, WindowId};
 
 use crate::colors::ColorScheme;
 use crate::draw::DrawContext;
-use crate::dropdown::{DropdownElement, DropdownMenu, MenuAction, MenuItem};
+use crate::dropdown::{DropdownElement, DropdownMenu, MenuAction, MenuEntry};
 use crate::layout::Rect;
 use crate::theme::{DialogTheme, Theme};
 use crate::widgets::{Button, ButtonKind, Label, TextField};
@@ -79,6 +79,15 @@ pub struct SshResult {
     pub passphrase: String,
 }
 
+/// Pre-fill data for the SSH dialog from a saved session.
+pub struct SshPrefill {
+    pub host: String,
+    pub port: u16,
+    pub username: String,
+    pub auth_method: AuthMethod,
+    pub key_path: Option<String>,
+}
+
 impl SshResult {
     pub fn to_ssh_config(&self) -> crate::ssh::SshConfig {
         let port = self.port.parse::<u16>().unwrap_or(22);
@@ -103,20 +112,20 @@ impl SshResult {
     }
 }
 
-fn auth_menu_items() -> Vec<MenuItem> {
+fn auth_menu_items() -> Vec<MenuEntry> {
     vec![
-        MenuItem {
-            label: AuthMethod::Password.display_text().to_string(),
-            action: MenuAction::NewShell(String::new()),
-        },
-        MenuItem {
-            label: AuthMethod::Key.display_text().to_string(),
-            action: MenuAction::NewShell(String::new()),
-        },
-        MenuItem {
-            label: AuthMethod::Agent.display_text().to_string(),
-            action: MenuAction::NewShell(String::new()),
-        },
+        MenuEntry::item(
+            AuthMethod::Password.display_text(),
+            MenuAction::NewShell(String::new()),
+        ),
+        MenuEntry::item(
+            AuthMethod::Key.display_text(),
+            MenuAction::NewShell(String::new()),
+        ),
+        MenuEntry::item(
+            AuthMethod::Agent.display_text(),
+            MenuAction::NewShell(String::new()),
+        ),
     ]
 }
 
@@ -186,7 +195,12 @@ struct SshDialog {
 }
 
 impl SshDialog {
-    fn new(scale: f32, theme: &Theme, font_system: &mut FontSystem) -> Self {
+    fn new(
+        scale: f32,
+        theme: &Theme,
+        font_system: &mut FontSystem,
+        prefill: Option<&SshPrefill>,
+    ) -> Self {
         let t = &theme.dialog;
         let colors = &theme.colors;
         let metrics = Metrics::new(t.font_size, t.font_size * LINE_HEIGHT_MULT);
@@ -194,6 +208,8 @@ impl SshDialog {
         let semibold_attrs = attrs.weight(glyphon::Weight::SEMIBOLD);
         let char_width = crate::font::measure_cell(font_system).width;
         let label_color = colors.dropdown_text.to_glyphon();
+
+        let initial_auth = prefill.map(|p| p.auth_method).unwrap_or(AuthMethod::Agent);
 
         let title = Label::new("SSH Session", semibold_attrs, metrics, font_system);
         let host_label = Label::new("Host:", attrs, metrics, font_system);
@@ -204,7 +220,7 @@ impl SshDialog {
         let keypath_label = Label::new("Private key file:", semibold_attrs, metrics, font_system);
         let passphrase_label = Label::new("Passphrase:", attrs, metrics, font_system);
         let auth_value_label = Label::new(
-            AuthMethod::Agent.display_text(),
+            initial_auth.display_text(),
             attrs,
             metrics,
             font_system,
@@ -270,7 +286,7 @@ impl SshDialog {
             passphrase_field,
             cancel_button,
             ok_button,
-            auth_method: AuthMethod::Agent,
+            auth_method: initial_auth,
             focused_field: FocusedField::Host,
             auth_dropdown_rect: Rect::ZERO,
             browse_btn_rect: Rect::ZERO,
@@ -280,6 +296,25 @@ impl SshDialog {
             dialog_theme: t.clone(),
             label_color,
         };
+
+        if let Some(prefill) = prefill {
+            dialog.host_field.set_value(&prefill.host, font_system);
+            dialog
+                .port_field
+                .set_value(&prefill.port.to_string(), font_system);
+            dialog
+                .username_field
+                .set_value(&prefill.username, font_system);
+            if let Some(key_path) = &prefill.key_path {
+                dialog.keypath_field.set_value(key_path, font_system);
+            }
+            match initial_auth {
+                AuthMethod::Password => dialog.set_focus(FocusedField::Password),
+                AuthMethod::Key => dialog.set_focus(FocusedField::Passphrase),
+                AuthMethod::Agent => {} // host is already focused
+            }
+        }
+
         dialog.compute_layout(scale, font_system);
         dialog
     }
@@ -871,7 +906,11 @@ pub struct SshDialogWindow {
 }
 
 impl SshDialogWindow {
-    pub fn open(event_loop: &ActiveEventLoop, theme: &Theme) -> Self {
+    pub fn open(
+        event_loop: &ActiveEventLoop,
+        theme: &Theme,
+        prefill: Option<&SshPrefill>,
+    ) -> Self {
         let theme = theme.clone();
         let dialog_width = theme.dialog.width;
         let initial_h = 280.0;
@@ -888,10 +927,13 @@ impl SshDialogWindow {
         );
         let actual_scale = window.scale_factor() as f32;
 
-        let mut gpu =
-            crate::gpu::GpuSimple::new(window.clone(), theme.colors.clone(), theme.dialog.max_rounded_rects);
+        let mut gpu = crate::gpu::GpuSimple::new(
+            window.clone(),
+            theme.colors.clone(),
+            theme.dialog.max_rounded_rects,
+        );
 
-        let dialog = SshDialog::new(actual_scale, &theme, &mut gpu.font_system);
+        let dialog = SshDialog::new(actual_scale, &theme, &mut gpu.font_system, prefill);
 
         let dialog_h = dialog.compute_dialog_height();
         let _ =

@@ -94,6 +94,10 @@ pub struct DropdownTheme {
     pub anchor_gap: f32,
     pub shadow_spread: f32,
     pub shadow_offset_y: f32,
+    pub separator_height: f32,
+    pub icon_size: f32,
+    pub icon_gap: f32,
+    pub close_size: f32,
 }
 
 impl Default for DropdownTheme {
@@ -110,6 +114,10 @@ impl Default for DropdownTheme {
             anchor_gap: 4.0,
             shadow_spread: 20.0,
             shadow_offset_y: 4.0,
+            separator_height: 1.0,
+            icon_size: 13.0,
+            icon_gap: 8.0,
+            close_size: 11.0,
         }
     }
 }

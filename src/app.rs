@@ -7,11 +7,13 @@ use winit::keyboard::{KeyCode, PhysicalKey};
 use winit::window::{Window, WindowAttributes, WindowId};
 
 use crate::draw::DrawContext;
-use crate::dropdown::{DropdownElement, DropdownMenu, MenuAction, MenuItem};
+use crate::dropdown::{DropdownElement, DropdownMenu, MenuAction, MenuEntry};
 use crate::gpu::GpuContext;
+use crate::icons;
 use crate::icons::IconManager;
 use crate::layout::Rect;
-use crate::ssh_dialog::{SshDialogWindow, SshResult};
+use crate::saved_sessions::{now_unix, SavedAuthType, SavedSession, SavedSessions};
+use crate::ssh_dialog::{AuthMethod, SshDialogWindow, SshPrefill, SshResult};
 use crate::tab_bar::{TabBar, TabBarElement};
 use crate::terminal_panel::{EventProxy, PanelId, TermSize, TerminalEvent, TerminalPanel};
 use crate::theme::Theme;
@@ -27,6 +29,7 @@ pub struct App {
     tab_bar: TabBar,
     dropdown: DropdownMenu,
     ssh_dialog_window: Option<SshDialogWindow>,
+    saved_sessions: SavedSessions,
     cursor_position: (f32, f32),
     super_pressed: bool,
     screenshot_pending: Option<String>,
@@ -35,6 +38,7 @@ pub struct App {
 impl App {
     pub fn new(event_proxy_raw: EventLoopProxy<TerminalEvent>) -> Self {
         let theme = Theme::new();
+        let saved_sessions = SavedSessions::load();
         Self {
             window: None,
             gpu: None,
@@ -46,6 +50,7 @@ impl App {
             tab_bar: TabBar::new(),
             dropdown: DropdownMenu::new(),
             ssh_dialog_window: None,
+            saved_sessions,
             cursor_position: (0.0, 0.0),
             super_pressed: false,
             screenshot_pending: std::env::var("SCREENSHOT").ok().filter(|s| !s.is_empty()),
@@ -256,10 +261,14 @@ impl App {
     }
 
     fn new_tab_ssh(&mut self, result: SshResult) {
+        self.connect_ssh(result.to_ssh_config());
+    }
+
+    fn connect_ssh(&mut self, config: crate::ssh::SshConfig) {
         let gpu = self.gpu.as_ref().unwrap();
         let (panel_id, vp, event_proxy) = self.new_panel_params(gpu);
         let size = TermSize::new(vp.cols, vp.rows);
-        let panel = TerminalPanel::new_ssh(panel_id, size, event_proxy, result.to_ssh_config());
+        let panel = TerminalPanel::new_ssh(panel_id, size, event_proxy, config);
         self.add_tab(panel);
     }
 
@@ -281,30 +290,46 @@ impl App {
 
     fn open_new_tab_dropdown(&mut self) {
         let shells = detect_shells();
+        let saved = &self.saved_sessions.sessions;
 
         let gpu = self.gpu.as_mut().unwrap();
         let scale = gpu.scale_factor;
         let surface_w = gpu.surface_config.width as f32;
         let surface_h = gpu.surface_config.height as f32;
 
-        let mut items: Vec<MenuItem> = shells
+        let mut entries: Vec<MenuEntry> = shells
             .into_iter()
-            .map(|(label, path)| MenuItem {
-                label,
-                action: MenuAction::NewShell(path),
-            })
+            .map(|(label, path)| MenuEntry::item(&label, MenuAction::NewShell(path)))
             .collect();
 
-        items.push(MenuItem {
-            label: "SSH Session...".to_string(),
-            action: MenuAction::OpenSshDialog,
-        });
+        // Separator between shells and SSH section
+        entries.push(MenuEntry::Separator);
+
+        // Saved SSH sessions (sorted by last used)
+        for session in saved {
+            entries.push(MenuEntry::closeable_item_with_icon(
+                &session.display_label(),
+                MenuAction::ConnectSavedSession(session.key()),
+                icons::ICON_TERMINAL,
+            ));
+        }
+
+        // Separator before "New SSH Session..." (only if saved sessions exist)
+        if !saved.is_empty() {
+            entries.push(MenuEntry::Separator);
+        }
+
+        entries.push(MenuEntry::item_with_icon(
+            "New SSH Session...",
+            MenuAction::OpenSshDialog,
+            icons::ICON_ADD,
+        ));
 
         let anchor = self.tab_bar.plus_rect();
         self.dropdown.open(
-            items,
+            entries,
             anchor,
-            None,
+            Some(280.0),
             scale,
             surface_w,
             surface_h,
@@ -313,11 +338,31 @@ impl App {
         );
     }
 
-    fn open_ssh_dialog(&mut self, event_loop: &ActiveEventLoop) {
+    fn open_ssh_dialog(&mut self, event_loop: &ActiveEventLoop, prefill: Option<SshPrefill>) {
         if self.ssh_dialog_window.is_some() {
             return; // already open
         }
-        self.ssh_dialog_window = Some(SshDialogWindow::open(event_loop, &self.theme));
+        self.ssh_dialog_window =
+            Some(SshDialogWindow::open(event_loop, &self.theme, prefill.as_ref()));
+    }
+
+    fn save_ssh_session(&mut self, result: &SshResult) {
+        let saved = SavedSession {
+            host: result.host.clone(),
+            port: result.port.parse().unwrap_or(22),
+            username: result.username.clone(),
+            auth_type: match result.auth_method {
+                AuthMethod::Password => SavedAuthType::Password,
+                AuthMethod::Key => SavedAuthType::Key,
+                AuthMethod::Agent => SavedAuthType::Agent,
+            },
+            key_path: match result.auth_method {
+                AuthMethod::Key => Some(result.key_path.clone()),
+                _ => None,
+            },
+            last_used: now_unix(),
+        };
+        self.saved_sessions.upsert(saved);
     }
 
     fn execute_menu_action(&mut self, action: &MenuAction, event_loop: &ActiveEventLoop) {
@@ -326,7 +371,31 @@ impl App {
                 self.new_tab(Some(shell_path.clone()));
             }
             MenuAction::OpenSshDialog => {
-                self.open_ssh_dialog(event_loop);
+                self.open_ssh_dialog(event_loop, None);
+            }
+            MenuAction::ConnectSavedSession(key) => {
+                if let Some(session) = self.saved_sessions.find_by_key(key) {
+                    let config = crate::ssh::SshConfig {
+                        host: session.host.clone(),
+                        port: session.port,
+                        username: session.username.clone(),
+                        auth: match &session.auth_type {
+                            SavedAuthType::Password => {
+                                crate::ssh::SshAuth::Password(String::new())
+                            }
+                            SavedAuthType::Key => crate::ssh::SshAuth::Key {
+                                path: session
+                                    .key_path
+                                    .clone()
+                                    .unwrap_or_else(|| "~/.ssh/id_ed25519".to_string()),
+                                passphrase: None,
+                            },
+                            SavedAuthType::Agent => crate::ssh::SshAuth::Agent,
+                        },
+                    };
+                    self.saved_sessions.touch_by_key(key);
+                    self.connect_ssh(config);
+                }
             }
         }
     }
@@ -367,6 +436,7 @@ impl ApplicationHandler<TerminalEvent> for App {
                 if let Some(result) = result
                     && !result.host.is_empty()
                 {
+                    self.save_ssh_session(&result);
                     self.new_tab_ssh(result);
                 }
             }
@@ -489,14 +559,27 @@ impl ApplicationHandler<TerminalEvent> for App {
 
                 // Dropdown intercepts all clicks when open
                 if self.dropdown.is_open() {
-                    if let DropdownElement::Item(idx) = self.dropdown.hit_test(cx, cy) {
-                        let action = self.dropdown.action_for(idx).cloned();
-                        self.dropdown.close();
-                        if let Some(action) = action {
-                            self.execute_menu_action(&action, event_loop);
+                    match self.dropdown.hit_test(cx, cy) {
+                        DropdownElement::Item(idx) => {
+                            let action = self.dropdown.action_for(idx).cloned();
+                            self.dropdown.close();
+                            if let Some(action) = action {
+                                self.execute_menu_action(&action, event_loop);
+                            }
                         }
-                    } else if self.dropdown.is_outside(cx, cy) {
-                        self.dropdown.close();
+                        DropdownElement::CloseButton(idx) => {
+                            if let Some(MenuAction::ConnectSavedSession(key)) =
+                                self.dropdown.action_for(idx).cloned()
+                            {
+                                self.saved_sessions.remove_by_key(&key);
+                            }
+                            self.dropdown.close();
+                        }
+                        DropdownElement::None => {
+                            if self.dropdown.is_outside(cx, cy) {
+                                self.dropdown.close();
+                            }
+                        }
                     }
                     self.request_redraw();
                     return;

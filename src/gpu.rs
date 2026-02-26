@@ -514,8 +514,9 @@ pub struct GpuContext {
     quad_pipeline: RenderPipeline,
     quad_vertex_buffer: wgpu::Buffer,
 
-    // Cached carrier buffer for custom glyphs (icons) — avoids per-frame allocation
+    // Cached carrier buffers for custom glyphs (icons) — avoids per-frame allocation
     icon_carrier: Buffer,
+    overlay_icon_carrier: Buffer,
 }
 
 impl GpuContext {
@@ -588,9 +589,11 @@ impl GpuContext {
             mapped_at_creation: false,
         });
 
-        // Cached icon carrier buffer (empty, scale=1.0 so positions are physical px)
+        // Cached icon carrier buffers (empty, scale=1.0 so positions are physical px)
         let mut icon_carrier = Buffer::new(&mut text.font_system, Metrics::new(1.0, 1.0));
         icon_carrier.set_size(&mut text.font_system, Some(0.0), Some(0.0));
+        let mut overlay_icon_carrier = Buffer::new(&mut text.font_system, Metrics::new(1.0, 1.0));
+        overlay_icon_carrier.set_size(&mut text.font_system, Some(0.0), Some(0.0));
 
         Self {
             device: gpu.device,
@@ -611,6 +614,7 @@ impl GpuContext {
             quad_pipeline,
             quad_vertex_buffer,
             icon_carrier,
+            overlay_icon_carrier,
         }
     }
 
@@ -755,14 +759,32 @@ impl GpuContext {
             )
             .expect("prepare scene text");
 
-        // Overlay text (dropdown)
+        // Overlay text (dropdown) with icon support
         let mut overlay_areas: Vec<TextArea> = Vec::new();
+
+        if !overlay.custom_glyphs.is_empty() {
+            overlay_areas.push(TextArea {
+                buffer: &self.overlay_icon_carrier,
+                left: 0.0,
+                top: 0.0,
+                scale: 1.0,
+                bounds: TextBounds {
+                    left: 0,
+                    top: 0,
+                    right: w as i32,
+                    bottom: h as i32,
+                },
+                default_color: self.colors.foreground.to_glyphon(),
+                custom_glyphs: &overlay.custom_glyphs,
+            });
+        }
+
         for &(specs, bufs) in overlay_text {
             push_text_specs(&mut overlay_areas, specs, bufs, scale_factor);
         }
 
         self.overlay_text_renderer
-            .prepare(
+            .prepare_with_custom(
                 &self.device,
                 &self.queue,
                 &mut self.font_system,
@@ -770,6 +792,7 @@ impl GpuContext {
                 &self.viewport,
                 overlay_areas,
                 &mut self.swash_cache,
+                |req| icon_manager.rasterize(req),
             )
             .expect("prepare overlay text");
 
