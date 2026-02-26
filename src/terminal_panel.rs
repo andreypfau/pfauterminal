@@ -329,6 +329,13 @@ impl TerminalPanel {
             return false;
         }
 
+        {
+            let mut term = self.term.lock();
+            if term.grid().display_offset() != 0 {
+                term.scroll_display(alacritty_terminal::grid::Scroll::Bottom);
+            }
+        }
+
         let mode = *self.term.lock().mode();
         let app_cursor = mode.contains(TermMode::APP_CURSOR);
         // SS3 prefix for application cursor mode, CSI for normal mode
@@ -475,9 +482,12 @@ impl TerminalPanel {
 
             let term = self.term.lock();
             let content = term.renderable_content();
+            let display_offset = content.display_offset;
 
             for indexed in content.display_iter {
-                let row = indexed.point.line.0 as usize;
+                let viewport_line = indexed.point.line.0 + display_offset as i32;
+                if viewport_line < 0 { continue; }
+                let row = viewport_line as usize;
                 let col = indexed.point.column.0;
                 if row >= rows || col >= cols {
                     continue;
@@ -554,18 +564,21 @@ impl TerminalPanel {
 
             // Cursor quad
             let cp = content.cursor.point;
-            let cur_row = cp.line.0 as usize;
+            let cur_viewport_line = cp.line.0 + display_offset as i32;
             let cur_col = cp.column.0;
-            if cur_row < rows && cur_col < cols {
-                ctx.flat_quad(
-                    Rect {
-                        x: content_x + cur_col as f32 * pcw,
-                        y: content_y + cur_row as f32 * pch,
-                        width: pcw,
-                        height: pch,
-                    },
-                    colors.cursor.to_linear_f32(),
-                );
+            if cur_viewport_line >= 0 {
+                let cur_row = cur_viewport_line as usize;
+                if cur_row < rows && cur_col < cols {
+                    ctx.flat_quad(
+                        Rect {
+                            x: content_x + cur_col as f32 * pcw,
+                            y: content_y + cur_row as f32 * pch,
+                            width: pcw,
+                            height: pch,
+                        },
+                        colors.cursor.to_linear_f32(),
+                    );
+                }
             }
         }
     }
