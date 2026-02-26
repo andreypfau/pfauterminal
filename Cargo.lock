@@ -2878,7 +2878,6 @@ dependencies = [
  "serde",
  "serde_json",
  "tokio",
- "vte",
  "wgpu",
  "winit",
 ]

@@ -1,50 +1,18 @@
-use glyphon::{Attrs, Buffer, CustomGlyph, Family, FontSystem, Metrics, Shaping};
+use glyphon::{Buffer, FontSystem, Metrics, Shaping};
 
-use crate::colors::{hex_to_glyphon_color, hex_to_linear_f32, ColorScheme};
+use crate::draw::{centered_text, DrawContext};
+use crate::font;
+use crate::font::LINE_HEIGHT as TAB_LINE_HEIGHT;
 use crate::icons;
-use crate::layout::{push_stroked_rounded_rect, Rect, RoundedQuad};
-use crate::terminal_panel::{BgQuad, TextSpec};
-
-const TAB_BAR_HEIGHT: f32 = 36.0;
-const TAB_PADDING_H: f32 = 12.0;
-const TAB_PADDING_V: f32 = 5.0;
-const TAB_GAP: f32 = 4.0;
-const ICON_SIZE: f32 = 13.0;
-const ICON_GAP: f32 = 6.0;
-const CLOSE_SIZE: f32 = 11.0;
-const BORDER_WIDTH: f32 = 1.0;
-const SEPARATOR_HEIGHT: f32 = 1.0;
-const TAB_RADIUS: f32 = 6.0;
-const PLUS_SIZE: f32 = 22.0;
-const PLUS_ICON_SIZE: f32 = 12.0;
-const PLUS_RADIUS: f32 = 5.0;
-const TAB_FONT_SIZE: f32 = 11.0;
-const TAB_LINE_HEIGHT: f32 = 1.2;
+use crate::layout::{update_if_changed, Rect, TextSpec};
+use crate::theme::{TabBarTheme, Theme};
 
 #[derive(Debug, Clone, Copy, PartialEq)]
-pub enum TabBarHover {
+pub enum TabBarElement {
     None,
     Tab(usize),
     CloseButton(usize),
     PlusButton,
-}
-
-#[derive(Debug)]
-pub enum TabBarHit {
-    Tab(usize),
-    CloseTab(usize),
-    NewTab,
-    None,
-}
-
-/// Structured draw commands for the tab bar.
-pub struct TabBarDrawCommands {
-    /// Flat quads (separator line only)
-    pub flat_quads: Vec<BgQuad>,
-    /// Rounded rect fills (tab backgrounds, borders — rendered via SDF pipeline)
-    pub rounded_quads: Vec<RoundedQuad>,
-    pub custom_glyphs: Vec<CustomGlyph>,
-    pub text_areas: Vec<TextSpec>,
 }
 
 pub struct TabBar {
@@ -53,7 +21,7 @@ pub struct TabBar {
     close_rects: Vec<Rect>,
     plus_rect: Rect,
     active_tab: usize,
-    hover: TabBarHover,
+    hover: TabBarElement,
 }
 
 impl TabBar {
@@ -64,16 +32,12 @@ impl TabBar {
             close_rects: Vec::new(),
             plus_rect: Rect::ZERO,
             active_tab: 0,
-            hover: TabBarHover::None,
+            hover: TabBarElement::None,
         }
     }
 
-    pub fn height(scale_factor: f32) -> f32 {
-        TAB_BAR_HEIGHT * scale_factor
-    }
-
-    pub fn set_active(&mut self, idx: usize) {
-        self.active_tab = idx;
+    pub fn height(theme: &TabBarTheme, scale_factor: f32) -> f32 {
+        theme.height * scale_factor
     }
 
     pub fn update(
@@ -84,21 +48,20 @@ impl TabBar {
         y_offset: f32,
         scale_factor: f32,
         font_system: &mut FontSystem,
+        theme: &TabBarTheme,
     ) {
         self.active_tab = active;
 
-        let tab_metrics = Metrics::new(TAB_FONT_SIZE, TAB_FONT_SIZE * TAB_LINE_HEIGHT);
-        let pad_h = TAB_PADDING_H * scale_factor;
-        let pad_v = TAB_PADDING_V * scale_factor;
-        let gap = TAB_GAP * scale_factor;
-        let icon_size = ICON_SIZE * scale_factor;
-        let icon_gap = ICON_GAP * scale_factor;
-        let close_size = CLOSE_SIZE * scale_factor;
-        let bar_h = TAB_BAR_HEIGHT * scale_factor;
-        let plus_w = PLUS_SIZE * scale_factor;
+        let tab_metrics = Metrics::new(theme.font_size, theme.font_size * TAB_LINE_HEIGHT);
+        let pad_h = theme.tab_padding_h * scale_factor;
+        let pad_v = theme.tab_padding_v * scale_factor;
+        let gap = theme.tab_gap * scale_factor;
+        let icon_size = theme.icon_size * scale_factor;
+        let icon_gap = theme.icon_gap * scale_factor;
+        let close_size = theme.close_size * scale_factor;
+        let bar_h = theme.height * scale_factor;
+        let plus_w = theme.plus_size * scale_factor;
 
-        // Tab height = padding_v + max(icon, close, text_height) + padding_v
-        // Content height dominated by icon (13px > close 11px)
         let tab_h = pad_v * 2.0 + icon_size;
         let margin_top = y_offset + (bar_h - tab_h) / 2.0;
 
@@ -108,18 +71,13 @@ impl TabBar {
         }
         self.tab_buffers.truncate(titles.len());
 
-        // First pass: compute tab widths to determine total width for centering
+        // Compute tab widths
         let mut tab_widths = Vec::with_capacity(titles.len());
         for (i, title) in titles.iter().enumerate() {
             let buf = &mut self.tab_buffers[i];
             buf.set_metrics(font_system, tab_metrics);
             buf.set_size(font_system, Some(300.0), Some(tab_metrics.line_height));
-            buf.set_text(
-                font_system,
-                title,
-                Attrs::new().family(Family::Name("JetBrains Mono")),
-                Shaping::Basic,
-            );
+            buf.set_text(font_system, title, font::default_attrs(), Shaping::Basic);
             buf.shape_until_scroll(font_system, false);
 
             let text_width = buf
@@ -134,22 +92,18 @@ impl TabBar {
             tab_widths.push(tab_width);
         }
 
-        // Total width of all tabs + gaps + plus button
         let total_tabs_width: f32 = tab_widths.iter().sum();
         let total_gaps = if titles.is_empty() {
             0.0
         } else {
-            gap * titles.len() as f32 // gaps between tabs + gap before plus
+            gap * titles.len() as f32
         };
         let total_width = total_tabs_width + total_gaps + plus_w;
 
-        // Center horizontally within the panel area
-        // y_offset doubles as x_offset since panel_area_padding is uniform
         let panel_x = y_offset;
         let start_x = panel_x + (surface_width - total_width) / 2.0;
         let mut x = start_x.max(panel_x);
 
-        // Layout tabs
         self.tab_rects.clear();
         self.close_rects.clear();
 
@@ -173,7 +127,6 @@ impl TabBar {
             x += tab_width + gap;
         }
 
-        // Plus button (centered vertically in bar)
         let plus_y = y_offset + (bar_h - plus_w) / 2.0;
         self.plus_rect = Rect {
             x,
@@ -183,182 +136,125 @@ impl TabBar {
         };
     }
 
-    pub fn hit_test(&self, x: f32, y: f32) -> TabBarHit {
-        // Close buttons checked first with expanded hit area for easier targeting
+    pub fn hit_test(&self, x: f32, y: f32) -> TabBarElement {
         for (i, rect) in self.close_rects.iter().enumerate() {
             let is_active = i == self.active_tab;
-            let is_tab_hovered = matches!(self.hover, TabBarHover::Tab(idx) | TabBarHover::CloseButton(idx) if idx == i);
-            if (is_active || is_tab_hovered) && rect.contains_padded(x, y, 4.0) {
-                return TabBarHit::CloseTab(i);
+            let is_tab_hovered = matches!(self.hover, TabBarElement::Tab(idx) | TabBarElement::CloseButton(idx) if idx == i);
+            let pad = 4.0;
+            let hit = x >= rect.x - pad
+                && x < rect.x + rect.width + pad
+                && y >= rect.y - pad
+                && y < rect.y + rect.height + pad;
+            if (is_active || is_tab_hovered) && hit {
+                return TabBarElement::CloseButton(i);
             }
         }
         for (i, rect) in self.tab_rects.iter().enumerate() {
             if rect.contains(x, y) {
-                return TabBarHit::Tab(i);
+                return TabBarElement::Tab(i);
             }
         }
         if self.plus_rect.contains(x, y) {
-            return TabBarHit::NewTab;
+            return TabBarElement::PlusButton;
         }
-        TabBarHit::None
+        TabBarElement::None
     }
 
-    pub fn compute_hover(&self, x: f32, y: f32) -> TabBarHover {
-        match self.hit_test(x, y) {
-            TabBarHit::CloseTab(i) => TabBarHover::CloseButton(i),
-            TabBarHit::Tab(i) => TabBarHover::Tab(i),
-            TabBarHit::NewTab => TabBarHover::PlusButton,
-            TabBarHit::None => TabBarHover::None,
-        }
+    pub fn set_hover(&mut self, hover: TabBarElement) -> bool {
+        update_if_changed(&mut self.hover, hover)
     }
 
-    pub fn set_hover(&mut self, hover: TabBarHover) -> bool {
-        if self.hover != hover {
-            self.hover = hover;
-            true
-        } else {
-            false
-        }
-    }
-
-    pub fn draw_commands(
+    pub fn draw(
         &self,
-        colors: &ColorScheme,
+        ctx: &mut DrawContext,
+        text_specs: &mut Vec<TextSpec>,
+        theme: &Theme,
         scale_factor: f32,
         panel_x: f32,
         panel_y: f32,
         panel_width: f32,
-    ) -> TabBarDrawCommands {
-        let mut flat_quads = Vec::new();
-        let mut rounded_quads = Vec::new();
-        let mut custom_glyphs = Vec::new();
-        let mut text_areas = Vec::new();
+    ) {
+        let t = &theme.tab_bar;
+        let colors = &theme.colors;
 
-        let icon_size = ICON_SIZE * scale_factor;
-        let icon_gap = ICON_GAP * scale_factor;
-        let close_size = CLOSE_SIZE * scale_factor;
-        let pad_h = TAB_PADDING_H * scale_factor;
-        let border = BORDER_WIDTH * scale_factor;
-        let tab_bar_h = TAB_BAR_HEIGHT * scale_factor;
-        let radius = TAB_RADIUS * scale_factor;
-        let plus_icon_size = PLUS_ICON_SIZE * scale_factor;
-        let plus_radius = PLUS_RADIUS * scale_factor;
+        let icon_size = t.icon_size * scale_factor;
+        let icon_gap = t.icon_gap * scale_factor;
+        let close_size = t.close_size * scale_factor;
+        let pad_h = t.tab_padding_h * scale_factor;
+        let border = t.border_width * scale_factor;
+        let tab_bar_h = t.height * scale_factor;
+        let radius = t.tab_radius * scale_factor;
+        let plus_icon_size = t.plus_icon_size * scale_factor;
+        let plus_radius = t.plus_radius * scale_factor;
 
-        let active_fill = hex_to_linear_f32(&colors.tab_active_fill);
-        let active_stroke = hex_to_linear_f32(&colors.tab_active_stroke);
-        let hover_bg = hex_to_linear_f32(&colors.tab_hover_bg);
-        let hover_stroke = hex_to_linear_f32(&colors.tab_hover_stroke);
+        let active_fill = colors.tab_active_fill.to_linear_f32();
+        let active_stroke = colors.tab_active_stroke.to_linear_f32();
+        let hover_bg = colors.tab_hover_bg.to_linear_f32();
+        let hover_stroke = colors.tab_hover_stroke.to_linear_f32();
 
         for (i, rect) in self.tab_rects.iter().enumerate() {
             let is_active = i == self.active_tab;
-            let is_hovered = matches!(self.hover, TabBarHover::Tab(idx) | TabBarHover::CloseButton(idx) if idx == i);
+            let is_hovered = matches!(self.hover, TabBarElement::Tab(idx) | TabBarElement::CloseButton(idx) if idx == i);
 
             if is_active {
-                push_stroked_rounded_rect(
-                    &mut rounded_quads,
-                    rect,
-                    active_stroke,
-                    active_fill,
-                    radius,
-                    border,
-                );
+                ctx.stroked_rect(rect, active_stroke, active_fill, radius, border);
             } else if is_hovered {
-                push_stroked_rounded_rect(
-                    &mut rounded_quads,
-                    rect,
-                    hover_stroke,
-                    hover_bg,
-                    radius,
-                    border,
-                );
+                ctx.stroked_rect(rect, hover_stroke, hover_bg, radius, border);
             }
 
             // Terminal icon
             let icon_x = rect.x + pad_h;
             let icon_y = rect.y + (rect.height - icon_size) / 2.0;
-            custom_glyphs.push(icon_glyph(icons::ICON_TERMINAL, icon_x, icon_y, icon_size));
+            ctx.icon(icons::ICON_TERMINAL, icon_x, icon_y, icon_size);
 
-            // Tab label text area — vertically centered within the tab rect
+            // Tab label
             let text_left = icon_x + icon_size + icon_gap;
             let text_width =
                 rect.width - pad_h - icon_size - icon_gap - icon_gap - close_size - pad_h;
-            let line_h = TAB_FONT_SIZE * TAB_LINE_HEIGHT * scale_factor;
-            let text_top = rect.y + (rect.height - line_h) / 2.0;
+            let line_h = t.font_size * TAB_LINE_HEIGHT * scale_factor;
             let color = if is_active {
-                hex_to_glyphon_color(&colors.tab_active_text)
+                colors.tab_active_text.to_glyphon()
             } else {
-                hex_to_glyphon_color(&colors.foreground)
+                colors.foreground.to_glyphon()
             };
-            text_areas.push(TextSpec {
-                buffer_index: i,
-                left: text_left,
-                top: text_top,
-                bounds: Rect {
-                    x: text_left,
-                    y: rect.y,
-                    width: text_width,
-                    height: rect.height,
-                },
-                color,
-            });
+            let bounds = Rect {
+                x: text_left,
+                y: rect.y,
+                width: text_width,
+                height: rect.height,
+            };
+            text_specs.push(centered_text(i, text_left, &bounds, line_h, color));
 
-            // Close button icon (only on active or hovered tabs)
+            // Close button (only on active or hovered tabs)
             if is_active || is_hovered {
                 let close_rect = &self.close_rects[i];
-                let close_icon = if matches!(self.hover, TabBarHover::CloseButton(idx) if idx == i)
+                let close_icon = if matches!(self.hover, TabBarElement::CloseButton(idx) if idx == i)
                 {
                     icons::ICON_CLOSE_HOVERED
                 } else {
                     icons::ICON_CLOSE
                 };
-                custom_glyphs.push(icon_glyph(
-                    close_icon,
-                    close_rect.x,
-                    close_rect.y,
-                    close_size,
-                ));
+                ctx.icon(close_icon, close_rect.x, close_rect.y, close_size);
             }
         }
 
         // "+" button
-        let is_plus_hovered = matches!(self.hover, TabBarHover::PlusButton);
-        if is_plus_hovered {
-            // Hover: just a filled rounded rect, no stroke
-            rounded_quads.push(RoundedQuad {
-                rect: self.plus_rect,
-                color: hover_bg,
-                radius: plus_radius,
-                shadow_softness: 0.0,
-            });
+        if matches!(self.hover, TabBarElement::PlusButton) {
+            ctx.rounded_rect(self.plus_rect, hover_bg, plus_radius);
         }
 
-        // "+" icon centered in plus button
-        let plus_ix = self.plus_rect.x + (self.plus_rect.width - plus_icon_size) / 2.0;
-        let plus_iy = self.plus_rect.y + (self.plus_rect.height - plus_icon_size) / 2.0;
-        custom_glyphs.push(icon_glyph(
-            icons::ICON_ADD,
-            plus_ix,
-            plus_iy,
-            plus_icon_size,
-        ));
+        ctx.icon_centered(icons::ICON_ADD, &self.plus_rect, plus_icon_size);
 
-        // Separator line at bottom of tab bar area (inside panel)
-        flat_quads.push(BgQuad {
-            rect: Rect {
+        // Separator line
+        ctx.flat_quad(
+            Rect {
                 x: panel_x,
-                y: panel_y + tab_bar_h - SEPARATOR_HEIGHT * scale_factor,
+                y: panel_y + tab_bar_h - t.separator_height * scale_factor,
                 width: panel_width,
-                height: SEPARATOR_HEIGHT * scale_factor,
+                height: t.separator_height * scale_factor,
             },
-            color: hex_to_linear_f32(&colors.tab_separator),
-        });
-
-        TabBarDrawCommands {
-            flat_quads,
-            rounded_quads,
-            custom_glyphs,
-            text_areas,
-        }
+            colors.tab_separator.to_linear_f32(),
+        );
     }
 
     pub fn plus_rect(&self) -> Rect {
@@ -367,18 +263,5 @@ impl TabBar {
 
     pub fn tab_buffers(&self) -> &[Buffer] {
         &self.tab_buffers
-    }
-}
-
-fn icon_glyph(id: glyphon::CustomGlyphId, left: f32, top: f32, size: f32) -> CustomGlyph {
-    CustomGlyph {
-        id,
-        left,
-        top,
-        width: size,
-        height: size,
-        color: None,
-        snap_to_physical_pixel: true,
-        metadata: 0,
     }
 }

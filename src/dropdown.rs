@@ -1,21 +1,9 @@
-use glyphon::{Attrs, Buffer, Family, FontSystem, Metrics, Shaping};
+use glyphon::{Buffer, FontSystem, Metrics, Shaping};
 
-use crate::colors::{hex_to_glyphon_color, hex_to_linear_f32, ColorScheme};
-use crate::layout::{push_stroked_rounded_rect, Rect, RoundedQuad};
-use crate::terminal_panel::TextSpec;
-
-// Design constants (logical pixels, matching Pencil spec)
-const MENU_WIDTH: f32 = 200.0;
-const MENU_CORNER_RADIUS: f32 = 8.0;
-const MENU_PADDING: f32 = 6.0;
-const MENU_ITEM_HEIGHT: f32 = 32.0;
-const MENU_ITEM_PADDING_H: f32 = 12.0;
-const MENU_ITEM_RADIUS: f32 = 6.0;
-const MENU_BORDER_WIDTH: f32 = 1.0;
-const MENU_FONT_SIZE: f32 = 13.0;
-const MENU_ANCHOR_GAP: f32 = 4.0;
-const MENU_SHADOW_SPREAD: f32 = 20.0;
-const MENU_SHADOW_OFFSET_Y: f32 = 4.0;
+use crate::draw::DrawContext;
+use crate::font;
+use crate::layout::{update_if_changed, Rect, TextSpec};
+use crate::theme::{DropdownTheme, Theme};
 
 #[derive(Debug, Clone)]
 pub enum MenuAction {
@@ -29,21 +17,9 @@ pub struct MenuItem {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
-pub enum DropdownHover {
+pub enum DropdownElement {
     None,
     Item(usize),
-}
-
-#[derive(Debug)]
-pub enum DropdownHit {
-    Item(usize),
-    Outside,
-    None,
-}
-
-pub struct DropdownDrawCommands {
-    pub rounded_quads: Vec<RoundedQuad>,
-    pub text_areas: Vec<TextSpec>,
 }
 
 pub struct DropdownMenu {
@@ -51,7 +27,7 @@ pub struct DropdownMenu {
     item_buffers: Vec<Buffer>,
     item_rects: Vec<Rect>,
     menu_rect: Rect,
-    hover: DropdownHover,
+    hover: DropdownElement,
     visible: bool,
 }
 
@@ -62,7 +38,7 @@ impl DropdownMenu {
             item_buffers: Vec::new(),
             item_rects: Vec::new(),
             menu_rect: Rect::ZERO,
-            hover: DropdownHover::None,
+            hover: DropdownElement::None,
             visible: false,
         }
     }
@@ -71,26 +47,26 @@ impl DropdownMenu {
         &mut self,
         items: Vec<MenuItem>,
         anchor_rect: Rect,
+        width: Option<f32>,
         scale: f32,
         surface_width: f32,
         surface_height: f32,
         font_system: &mut FontSystem,
+        theme: &DropdownTheme,
     ) {
-        let menu_w = MENU_WIDTH * scale;
-        let padding = MENU_PADDING * scale;
-        let item_h = MENU_ITEM_HEIGHT * scale;
-        let item_pad_h = MENU_ITEM_PADDING_H * scale;
-        let border = MENU_BORDER_WIDTH * scale;
-        let gap = MENU_ANCHOR_GAP * scale;
+        let menu_w = width.unwrap_or(theme.width) * scale;
+        let padding = theme.padding * scale;
+        let item_h = theme.item_height * scale;
+        let item_pad_h = theme.item_padding_h * scale;
+        let border = theme.border_width * scale;
+        let gap = theme.anchor_gap * scale;
 
         let content_h = item_h * items.len() as f32;
         let menu_h = padding * 2.0 + content_h + border * 2.0;
 
-        // Position: centered below anchor, clamped to surface bounds
         let mut menu_x = anchor_rect.x + (anchor_rect.width - menu_w) / 2.0;
         let menu_y = anchor_rect.y + anchor_rect.height + gap;
 
-        // Clamp horizontally
         if menu_x + menu_w > surface_width {
             menu_x = surface_width - menu_w;
         }
@@ -98,7 +74,6 @@ impl DropdownMenu {
             menu_x = 0.0;
         }
 
-        // Clamp vertically (flip above anchor if needed)
         let final_y = if menu_y + menu_h > surface_height {
             (anchor_rect.y - gap - menu_h).max(0.0)
         } else {
@@ -112,7 +87,6 @@ impl DropdownMenu {
             height: menu_h,
         };
 
-        // Compute item rects (inside border + padding)
         let inner_x = menu_x + border + padding;
         let inner_y = final_y + border + padding;
         let inner_w = menu_w - 2.0 * (border + padding);
@@ -127,8 +101,7 @@ impl DropdownMenu {
             });
         }
 
-        // Shape text buffers
-        let metrics = Metrics::new(MENU_FONT_SIZE, MENU_FONT_SIZE * 1.2);
+        let metrics = Metrics::new(theme.font_size, theme.font_size * font::LINE_HEIGHT);
         while self.item_buffers.len() < items.len() {
             self.item_buffers.push(Buffer::new(font_system, metrics));
         }
@@ -142,146 +115,120 @@ impl DropdownMenu {
             buf.set_text(
                 font_system,
                 &item.label,
-                Attrs::new().family(Family::Name("JetBrains Mono")),
+                font::default_attrs(),
                 Shaping::Basic,
             );
             buf.shape_until_scroll(font_system, false);
         }
 
         self.items = items;
-        self.hover = DropdownHover::None;
+        self.hover = DropdownElement::None;
         self.visible = true;
     }
 
     pub fn close(&mut self) {
         self.visible = false;
-        self.hover = DropdownHover::None;
+        self.hover = DropdownElement::None;
     }
 
     pub fn is_open(&self) -> bool {
         self.visible
     }
 
-    pub fn compute_hover(&self, x: f32, y: f32) -> DropdownHover {
+    pub fn set_hover(&mut self, hover: DropdownElement) -> bool {
+        update_if_changed(&mut self.hover, hover)
+    }
+
+    pub fn hit_test(&self, x: f32, y: f32) -> DropdownElement {
         if !self.visible {
-            return DropdownHover::None;
+            return DropdownElement::None;
         }
         for (i, rect) in self.item_rects.iter().enumerate() {
             if rect.contains(x, y) {
-                return DropdownHover::Item(i);
+                return DropdownElement::Item(i);
             }
         }
-        DropdownHover::None
+        DropdownElement::None
     }
 
-    pub fn set_hover(&mut self, hover: DropdownHover) -> bool {
-        if self.hover != hover {
-            self.hover = hover;
-            true
-        } else {
-            false
-        }
-    }
-
-    pub fn hit_test(&self, x: f32, y: f32) -> DropdownHit {
-        if !self.visible {
-            return DropdownHit::None;
-        }
-
-        for (i, rect) in self.item_rects.iter().enumerate() {
-            if rect.contains(x, y) {
-                return DropdownHit::Item(i);
-            }
-        }
-
-        if self.menu_rect.contains(x, y) {
-            return DropdownHit::None;
-        }
-
-        DropdownHit::Outside
+    /// Returns true if the click is outside the menu bounds (should close).
+    pub fn is_outside(&self, x: f32, y: f32) -> bool {
+        self.visible && !self.menu_rect.contains(x, y)
     }
 
     pub fn action_for(&self, idx: usize) -> Option<&MenuAction> {
         self.items.get(idx).map(|item| &item.action)
     }
 
-    pub fn draw_commands(&self, colors: &ColorScheme, scale: f32) -> DropdownDrawCommands {
-        let mut rounded_quads = Vec::new();
-        let mut text_areas = Vec::new();
-
+    pub fn draw(
+        &self,
+        ctx: &mut DrawContext,
+        text_specs: &mut Vec<TextSpec>,
+        theme: &Theme,
+        scale: f32,
+    ) {
         if !self.visible {
-            return DropdownDrawCommands {
-                rounded_quads,
-                text_areas,
-            };
+            return;
         }
 
-        let radius = MENU_CORNER_RADIUS * scale;
-        let border = MENU_BORDER_WIDTH * scale;
-        let item_radius = MENU_ITEM_RADIUS * scale;
-        let item_pad_h = MENU_ITEM_PADDING_H * scale;
-        let shadow_spread = MENU_SHADOW_SPREAD * scale;
-        let shadow_offset_y = MENU_SHADOW_OFFSET_Y * scale;
+        let t = &theme.dropdown;
+        let colors = &theme.colors;
 
-        // 0. Drop shadow (soft SDF shadow behind the menu)
-        rounded_quads.push(RoundedQuad {
-            rect: Rect {
+        let radius = t.corner_radius * scale;
+        let border = t.border_width * scale;
+        let item_radius = t.item_radius * scale;
+        let item_pad_h = t.item_padding_h * scale;
+        let shadow_spread = t.shadow_spread * scale;
+        let shadow_offset_y = t.shadow_offset_y * scale;
+
+        // Drop shadow
+        ctx.shadow(
+            Rect {
                 x: self.menu_rect.x,
                 y: self.menu_rect.y + shadow_offset_y,
                 width: self.menu_rect.width,
                 height: self.menu_rect.height,
             },
-            color: hex_to_linear_f32(&colors.dropdown_shadow),
+            colors.dropdown_shadow.to_linear_f32(),
             radius,
-            shadow_softness: shadow_spread,
-        });
+            shadow_spread,
+        );
 
-        // 1. Border + fill
-        push_stroked_rounded_rect(
-            &mut rounded_quads,
+        // Border + fill
+        ctx.stroked_rect(
             &self.menu_rect,
-            hex_to_linear_f32(&colors.dropdown_border),
-            hex_to_linear_f32(&colors.dropdown_bg),
+            colors.dropdown_border.to_linear_f32(),
+            colors.dropdown_bg.to_linear_f32(),
             radius,
             border,
         );
 
-        // 3. Hover highlight (if any)
-        if let DropdownHover::Item(idx) = self.hover {
-            if let Some(rect) = self.item_rects.get(idx) {
-                rounded_quads.push(RoundedQuad {
-                    rect: *rect,
-                    color: hex_to_linear_f32(&colors.dropdown_item_hover),
-                    radius: item_radius,
-                    shadow_softness: 0.0,
-                });
-            }
+        // Hover highlight
+        if let DropdownElement::Item(idx) = self.hover
+            && let Some(rect) = self.item_rects.get(idx)
+        {
+            ctx.rounded_rect(*rect, colors.dropdown_item_hover.to_linear_f32(), item_radius);
         }
 
-        // 4. Text areas
-        let line_h = MENU_FONT_SIZE * 1.2 * scale;
+        // Text areas
+        let line_h = t.font_size * font::LINE_HEIGHT * scale;
         for (i, rect) in self.item_rects.iter().enumerate() {
-            let is_hovered = matches!(self.hover, DropdownHover::Item(idx) if idx == i);
+            let is_hovered = matches!(self.hover, DropdownElement::Item(idx) if idx == i);
             let text_left = rect.x + item_pad_h;
             let text_top = rect.y + (rect.height - line_h) / 2.0;
             let color = if is_hovered {
-                hex_to_glyphon_color(&colors.dropdown_text_active)
+                colors.dropdown_text_active.to_glyphon()
             } else {
-                hex_to_glyphon_color(&colors.dropdown_text)
+                colors.dropdown_text.to_glyphon()
             };
 
-            text_areas.push(TextSpec {
+            text_specs.push(TextSpec {
                 buffer_index: i,
                 left: text_left,
                 top: text_top,
                 bounds: *rect,
                 color,
             });
-        }
-
-        DropdownDrawCommands {
-            rounded_quads,
-            text_areas,
         }
     }
 

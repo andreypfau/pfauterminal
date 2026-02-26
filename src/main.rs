@@ -1,5 +1,6 @@
 mod app;
 mod colors;
+mod draw;
 mod dropdown;
 mod font;
 mod gpu;
@@ -8,13 +9,14 @@ mod layout;
 mod ssh;
 mod ssh_dialog;
 mod tab_bar;
-mod terminal;
 mod terminal_panel;
+mod theme;
+mod widgets;
 
 use winit::event_loop::EventLoop;
 
 use app::App;
-use terminal::TerminalEvent;
+use terminal_panel::TerminalEvent;
 
 fn main() {
     env_logger::init();

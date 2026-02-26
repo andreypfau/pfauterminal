@@ -6,38 +6,202 @@ use glyphon::{
 };
 use wgpu::*;
 
-use crate::colors::{hex_to_glyphon_color, ColorScheme};
-use crate::dropdown::DropdownMenu;
+use crate::colors::ColorScheme;
+use crate::draw::DrawContext;
 use crate::font::{self, CellMetrics};
 use crate::icons::IconManager;
-use crate::layout::{Rect, RoundedQuad};
-use crate::tab_bar::TabBar;
-use crate::terminal_panel::{BgQuad, PanelDrawCommands, TextSpec};
+use crate::layout::{BgQuad, Rect, RoundedQuad, TextSpec};
 
 /// Max rounded rects: panel islands + tab bar elements (borders, backgrounds)
 const MAX_ROUNDED_RECTS: usize = 64;
 
-/// Pick an sRGB render format from a surface format.
-/// On some Windows configurations the surface format is Bgra8Unorm (not sRGB),
-/// which causes shader outputs to skip the linear-to-sRGB conversion.
-pub fn pick_srgb_format(surface_format: TextureFormat) -> TextureFormat {
-    if surface_format.is_srgb() {
-        surface_format
-    } else {
-        match surface_format {
-            TextureFormat::Bgra8Unorm => TextureFormat::Bgra8UnormSrgb,
-            TextureFormat::Rgba8Unorm => TextureFormat::Rgba8UnormSrgb,
-            other => other,
-        }
+/// Pick an sRGB render format, fixing Bgra8Unorm/Rgba8Unorm on Windows.
+fn pick_srgb_format(fmt: TextureFormat) -> TextureFormat {
+    if fmt.is_srgb() {
+        return fmt;
+    }
+    match fmt {
+        TextureFormat::Bgra8Unorm => TextureFormat::Bgra8UnormSrgb,
+        TextureFormat::Rgba8Unorm => TextureFormat::Rgba8UnormSrgb,
+        other => other,
     }
 }
 
+fn align_up(value: u32, alignment: u32) -> u32 {
+    (value + alignment - 1) & !(alignment - 1)
+}
+
+/// Core wgpu primitives returned by GPU initialization.
+struct GpuInit {
+    device: Device,
+    queue: Queue,
+    surface: Surface<'static>,
+    surface_config: SurfaceConfiguration,
+    render_format: TextureFormat,
+}
+
+/// Initialize wgpu device, queue, surface, and configuration for a window.
+fn init_gpu(window: Arc<winit::window::Window>, texture_usages: TextureUsages) -> GpuInit {
+    let size = window.inner_size();
+
+    let instance = Instance::new(InstanceDescriptor {
+        backends: Backends::PRIMARY,
+        ..Default::default()
+    });
+
+    let surface = instance.create_surface(window).expect("create surface");
+
+    let adapter = pollster::block_on(instance.request_adapter(&RequestAdapterOptions {
+        compatible_surface: Some(&surface),
+        power_preference: PowerPreference::LowPower,
+        ..Default::default()
+    }))
+    .expect("no adapter");
+
+    let (device, queue) = pollster::block_on(adapter.request_device(
+        &DeviceDescriptor {
+            label: Some("gpu device"),
+            ..Default::default()
+        },
+        None,
+    ))
+    .expect("request device");
+
+    let caps = surface.get_capabilities(&adapter);
+    let surface_format = caps
+        .formats
+        .iter()
+        .find(|f| f.is_srgb())
+        .copied()
+        .unwrap_or(caps.formats[0]);
+
+    let render_format = pick_srgb_format(surface_format);
+
+    let view_formats = if render_format != surface_format {
+        vec![render_format]
+    } else {
+        vec![]
+    };
+
+    let surface_config = SurfaceConfiguration {
+        usage: texture_usages,
+        format: surface_format,
+        width: size.width.max(1),
+        height: size.height.max(1),
+        present_mode: PresentMode::Fifo,
+        desired_maximum_frame_latency: 2,
+        alpha_mode: caps.alpha_modes[0],
+        view_formats,
+    };
+    surface.configure(&device, &surface_config);
+
+    GpuInit {
+        device,
+        queue,
+        surface,
+        surface_config,
+        render_format,
+    }
+}
+
+struct TextResources {
+    font_system: FontSystem,
+    swash_cache: SwashCache,
+    atlas: TextAtlas,
+    text_renderer: TextRenderer,
+    overlay_text_renderer: TextRenderer,
+    viewport: Viewport,
+}
+
+fn init_text_resources(
+    device: &Device,
+    queue: &Queue,
+    render_format: TextureFormat,
+) -> TextResources {
+    let font_system = font::create_font_system();
+    let swash_cache = SwashCache::new();
+    let cache = Cache::new(device);
+    let viewport = Viewport::new(device, &cache);
+    let mut atlas = TextAtlas::new(device, queue, &cache, render_format);
+    let text_renderer = TextRenderer::new(&mut atlas, device, MultisampleState::default(), None);
+    let overlay_text_renderer =
+        TextRenderer::new(&mut atlas, device, MultisampleState::default(), None);
+
+    TextResources {
+        font_system,
+        swash_cache,
+        atlas,
+        text_renderer,
+        overlay_text_renderer,
+        viewport,
+    }
+}
+
+/// Begin a render pass that clears to the given color.
+fn begin_clear_pass<'a>(
+    encoder: &'a mut CommandEncoder,
+    view: &'a TextureView,
+    label: &'a str,
+    clear_color: wgpu::Color,
+) -> wgpu::RenderPass<'a> {
+    encoder.begin_render_pass(&RenderPassDescriptor {
+        label: Some(label),
+        color_attachments: &[Some(RenderPassColorAttachment {
+            view,
+            resolve_target: None,
+            ops: Operations {
+                load: LoadOp::Clear(clear_color),
+                store: StoreOp::Store,
+            },
+        })],
+        depth_stencil_attachment: None,
+        ..Default::default()
+    })
+}
+
+fn begin_frame(
+    surface: &Surface,
+    render_format: TextureFormat,
+) -> Result<(SurfaceTexture, TextureView), SurfaceError> {
+    let frame = surface.get_current_texture()?;
+    let view = frame.texture.create_view(&TextureViewDescriptor {
+        format: Some(render_format),
+        ..Default::default()
+    });
+    Ok((frame, view))
+}
+
+fn update_viewport(viewport: &mut Viewport, queue: &Queue, config: &SurfaceConfiguration) {
+    viewport.update(
+        queue,
+        Resolution {
+            width: config.width,
+            height: config.height,
+        },
+    );
+}
+
+fn finish_frame(
+    queue: &Queue,
+    atlas: &mut TextAtlas,
+    encoder: CommandEncoder,
+    frame: SurfaceTexture,
+) {
+    queue.submit(std::iter::once(encoder.finish()));
+    frame.present();
+    atlas.trim();
+}
+
+// ---------------------------------------------------------------------------
+// RoundedRectPipeline
+// ---------------------------------------------------------------------------
+
 /// Rounded rectangle SDF rendering pipeline with dynamic uniform buffer.
 pub struct RoundedRectPipeline {
-    pub pipeline: RenderPipeline,
-    pub uniform_buffer: wgpu::Buffer,
-    pub bind_group: BindGroup,
-    pub aligned_size: usize,
+    pipeline: RenderPipeline,
+    uniform_buffer: wgpu::Buffer,
+    bind_group: BindGroup,
+    aligned_size: usize,
 }
 
 impl RoundedRectPipeline {
@@ -130,8 +294,7 @@ impl RoundedRectPipeline {
         }
     }
 
-    /// Upload a single uniform at the given index.
-    pub fn upload_uniform(&self, queue: &Queue, index: usize, uniforms: RoundedRectUniforms) {
+    fn upload_uniform(&self, queue: &Queue, index: usize, uniforms: RoundedRectUniforms) {
         queue.write_buffer(
             &self.uniform_buffer,
             (index * self.aligned_size) as u64,
@@ -165,6 +328,10 @@ impl RoundedRectPipeline {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Uniform types
+// ---------------------------------------------------------------------------
+
 /// Background quad vertex.
 #[repr(C)]
 #[derive(Copy, Clone, bytemuck::Pod, bytemuck::Zeroable)]
@@ -192,12 +359,17 @@ impl RoundedRectUniforms {
     }
 }
 
-pub struct GpuContext {
+// ---------------------------------------------------------------------------
+// GpuSimple — lightweight GPU context for the SSH dialog window
+// ---------------------------------------------------------------------------
+
+/// Lightweight GPU context for simple windows (e.g. SSH dialog) that only need
+/// two-layer rendering (base + overlay) with rounded rects and text.
+pub struct GpuSimple {
     pub device: Device,
     pub queue: Queue,
     pub surface: Surface<'static>,
     pub surface_config: SurfaceConfiguration,
-    /// The format used for render target views (always sRGB for correct colors).
     render_format: TextureFormat,
 
     pub font_system: FontSystem,
@@ -206,7 +378,134 @@ pub struct GpuContext {
     text_renderer: TextRenderer,
     overlay_text_renderer: TextRenderer,
     viewport: Viewport,
-    _cache: Cache,
+    rounded_rect: RoundedRectPipeline,
+    pub colors: ColorScheme,
+}
+
+impl GpuSimple {
+    pub fn new(
+        window: Arc<winit::window::Window>,
+        colors: ColorScheme,
+        max_rounded_rects: usize,
+    ) -> Self {
+        let gpu = init_gpu(window, TextureUsages::RENDER_ATTACHMENT);
+        let text = init_text_resources(&gpu.device, &gpu.queue, gpu.render_format);
+        let rounded_rect =
+            RoundedRectPipeline::new(&gpu.device, gpu.render_format, max_rounded_rects);
+
+        Self {
+            device: gpu.device,
+            queue: gpu.queue,
+            surface: gpu.surface,
+            surface_config: gpu.surface_config,
+            render_format: gpu.render_format,
+            font_system: text.font_system,
+            swash_cache: text.swash_cache,
+            atlas: text.atlas,
+            text_renderer: text.text_renderer,
+            overlay_text_renderer: text.overlay_text_renderer,
+            viewport: text.viewport,
+            rounded_rect,
+            colors,
+        }
+    }
+
+    pub fn resize(&mut self, width: u32, height: u32) {
+        if width == 0 || height == 0 {
+            return;
+        }
+        self.surface_config.width = width;
+        self.surface_config.height = height;
+        self.surface.configure(&self.device, &self.surface_config);
+    }
+
+    /// Render a frame with two layers: base (rounded rects + text) then overlay (rounded rects + text).
+    pub fn render_simple(
+        &mut self,
+        clear_color: wgpu::Color,
+        base_quads: &[RoundedQuad],
+        overlay_quads: &[RoundedQuad],
+        base_text: Vec<TextArea>,
+        overlay_text: Vec<TextArea>,
+    ) -> Result<(), SurfaceError> {
+        let (frame, view) = begin_frame(&self.surface, self.render_format)?;
+
+        let base_rr_count = self.rounded_rect.upload_quads(&self.queue, base_quads, 0);
+        let total_rr_count =
+            self.rounded_rect
+                .upload_quads(&self.queue, overlay_quads, base_rr_count);
+
+        update_viewport(&mut self.viewport, &self.queue, &self.surface_config);
+
+        self.text_renderer
+            .prepare(
+                &self.device,
+                &self.queue,
+                &mut self.font_system,
+                &mut self.atlas,
+                &self.viewport,
+                base_text,
+                &mut self.swash_cache,
+            )
+            .expect("prepare base text");
+
+        self.overlay_text_renderer
+            .prepare(
+                &self.device,
+                &self.queue,
+                &mut self.font_system,
+                &mut self.atlas,
+                &self.viewport,
+                overlay_text,
+                &mut self.swash_cache,
+            )
+            .expect("prepare overlay text");
+
+        let mut encoder = self
+            .device
+            .create_command_encoder(&CommandEncoderDescriptor {
+                label: Some("render encoder"),
+            });
+
+        {
+            let mut pass = begin_clear_pass(&mut encoder, &view, "render pass", clear_color);
+
+            self.rounded_rect.draw_range(&mut pass, 0, base_rr_count);
+            self.text_renderer
+                .render(&self.atlas, &self.viewport, &mut pass)
+                .expect("render base text");
+
+            self.rounded_rect
+                .draw_range(&mut pass, base_rr_count, total_rr_count - base_rr_count);
+            self.overlay_text_renderer
+                .render(&self.atlas, &self.viewport, &mut pass)
+                .expect("render overlay text");
+        }
+
+        finish_frame(&self.queue, &mut self.atlas, encoder, frame);
+        Ok(())
+    }
+}
+
+// ---------------------------------------------------------------------------
+// GpuContext — full GPU context for the main terminal window
+// ---------------------------------------------------------------------------
+
+pub struct GpuContext {
+    pub device: Device,
+    pub queue: Queue,
+    pub surface: Surface<'static>,
+    pub surface_config: SurfaceConfiguration,
+    render_format: TextureFormat,
+
+    pub font_system: FontSystem,
+    swash_cache: SwashCache,
+    atlas: TextAtlas,
+    text_renderer: TextRenderer,
+    overlay_text_renderer: TextRenderer,
+    viewport: Viewport,
+    rounded_rect: RoundedRectPipeline,
+    pub colors: ColorScheme,
 
     pub cell: CellMetrics,
     pub scale_factor: f32,
@@ -215,153 +514,103 @@ pub struct GpuContext {
     quad_pipeline: RenderPipeline,
     quad_vertex_buffer: wgpu::Buffer,
 
-    rounded_rect: RoundedRectPipeline,
-
-    pub colors: ColorScheme,
+    // Cached carrier buffer for custom glyphs (icons) — avoids per-frame allocation
+    icon_carrier: Buffer,
 }
 
 impl GpuContext {
     pub fn new(window: Arc<winit::window::Window>, colors: ColorScheme) -> Self {
-        let size = window.inner_size();
         let scale_factor = window.scale_factor() as f32;
 
-        let instance = Instance::new(InstanceDescriptor {
-            backends: Backends::PRIMARY,
-            ..Default::default()
-        });
+        let gpu = init_gpu(
+            window,
+            TextureUsages::RENDER_ATTACHMENT | TextureUsages::COPY_SRC,
+        );
+        let mut text = init_text_resources(&gpu.device, &gpu.queue, gpu.render_format);
+        let rounded_rect =
+            RoundedRectPipeline::new(&gpu.device, gpu.render_format, MAX_ROUNDED_RECTS);
 
-        let surface = instance.create_surface(window).expect("create surface");
-
-        let adapter = pollster::block_on(instance.request_adapter(&RequestAdapterOptions {
-            compatible_surface: Some(&surface),
-            power_preference: PowerPreference::LowPower,
-            ..Default::default()
-        }))
-        .expect("no adapter");
-
-        let (device, queue) = pollster::block_on(adapter.request_device(
-            &DeviceDescriptor {
-                label: Some("terminal device"),
-                ..Default::default()
-            },
-            None,
-        ))
-        .expect("request device");
-
-        let caps = surface.get_capabilities(&adapter);
-        let surface_format = caps
-            .formats
-            .iter()
-            .find(|f| f.is_srgb())
-            .copied()
-            .unwrap_or(caps.formats[0]);
-
-        let render_format = pick_srgb_format(surface_format);
-
-        let view_formats = if render_format != surface_format {
-            vec![render_format]
-        } else {
-            vec![]
-        };
-
-        let surface_config = SurfaceConfiguration {
-            usage: TextureUsages::RENDER_ATTACHMENT | TextureUsages::COPY_SRC,
-            format: surface_format,
-            width: size.width.max(1),
-            height: size.height.max(1),
-            present_mode: PresentMode::Fifo,
-            desired_maximum_frame_latency: 2,
-            alpha_mode: caps.alpha_modes[0],
-            view_formats,
-        };
-        surface.configure(&device, &surface_config);
-
-        // glyphon setup — use render_format (sRGB) for atlas and pipelines
-        let mut font_system = font::create_font_system();
-        let swash_cache = SwashCache::new();
-        let cache = Cache::new(&device);
-        let viewport = Viewport::new(&device, &cache);
-        let mut atlas = TextAtlas::new(&device, &queue, &cache, render_format);
-        let text_renderer =
-            TextRenderer::new(&mut atlas, &device, MultisampleState::default(), None);
-        let overlay_text_renderer =
-            TextRenderer::new(&mut atlas, &device, MultisampleState::default(), None);
-
-        let cell = font::measure_cell(&mut font_system);
+        let cell = font::measure_cell(&mut text.font_system);
 
         // Quad pipeline
-        let quad_shader = device.create_shader_module(ShaderModuleDescriptor {
+        let quad_shader = gpu.device.create_shader_module(ShaderModuleDescriptor {
             label: Some("quad shader"),
             source: ShaderSource::Wgsl(QUAD_SHADER.into()),
         });
 
-        let quad_pipeline_layout = device.create_pipeline_layout(&PipelineLayoutDescriptor {
-            label: Some("quad pipeline layout"),
-            bind_group_layouts: &[],
-            push_constant_ranges: &[],
-        });
+        let quad_pipeline_layout = gpu
+            .device
+            .create_pipeline_layout(&PipelineLayoutDescriptor {
+                label: Some("quad pipeline layout"),
+                bind_group_layouts: &[],
+                push_constant_ranges: &[],
+            });
 
-        let quad_pipeline = device.create_render_pipeline(&RenderPipelineDescriptor {
-            label: Some("quad pipeline"),
-            layout: Some(&quad_pipeline_layout),
-            vertex: VertexState {
-                module: &quad_shader,
-                entry_point: Some("vs_main"),
-                buffers: &[VertexBufferLayout {
-                    array_stride: std::mem::size_of::<QuadVertex>() as BufferAddress,
-                    step_mode: VertexStepMode::Vertex,
-                    attributes: &vertex_attr_array![0 => Float32x2, 1 => Float32x4],
-                }],
-                compilation_options: Default::default(),
-            },
-            fragment: Some(FragmentState {
-                module: &quad_shader,
-                entry_point: Some("fs_main"),
-                targets: &[Some(ColorTargetState {
-                    format: render_format,
-                    blend: Some(BlendState::ALPHA_BLENDING),
-                    write_mask: ColorWrites::ALL,
-                })],
-                compilation_options: Default::default(),
-            }),
-            primitive: PrimitiveState {
-                topology: PrimitiveTopology::TriangleList,
-                ..Default::default()
-            },
-            depth_stencil: None,
-            multisample: MultisampleState::default(),
-            multiview: None,
-            cache: None,
-        });
+        let quad_pipeline = gpu
+            .device
+            .create_render_pipeline(&RenderPipelineDescriptor {
+                label: Some("quad pipeline"),
+                layout: Some(&quad_pipeline_layout),
+                vertex: VertexState {
+                    module: &quad_shader,
+                    entry_point: Some("vs_main"),
+                    buffers: &[VertexBufferLayout {
+                        array_stride: std::mem::size_of::<QuadVertex>() as BufferAddress,
+                        step_mode: VertexStepMode::Vertex,
+                        attributes: &vertex_attr_array![0 => Float32x2, 1 => Float32x4],
+                    }],
+                    compilation_options: Default::default(),
+                },
+                fragment: Some(FragmentState {
+                    module: &quad_shader,
+                    entry_point: Some("fs_main"),
+                    targets: &[Some(ColorTargetState {
+                        format: gpu.render_format,
+                        blend: Some(BlendState::ALPHA_BLENDING),
+                        write_mask: ColorWrites::ALL,
+                    })],
+                    compilation_options: Default::default(),
+                }),
+                primitive: PrimitiveState {
+                    topology: PrimitiveTopology::TriangleList,
+                    ..Default::default()
+                },
+                depth_stencil: None,
+                multisample: MultisampleState::default(),
+                multiview: None,
+                cache: None,
+            });
 
-        let quad_vertex_buffer = device.create_buffer(&BufferDescriptor {
+        let quad_vertex_buffer = gpu.device.create_buffer(&BufferDescriptor {
             label: Some("quad vertex buffer"),
             size: 2 * 1024 * 1024,
             usage: BufferUsages::VERTEX | BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
 
-        let rounded_rect = RoundedRectPipeline::new(&device, render_format, MAX_ROUNDED_RECTS);
+        // Cached icon carrier buffer (empty, scale=1.0 so positions are physical px)
+        let mut icon_carrier = Buffer::new(&mut text.font_system, Metrics::new(1.0, 1.0));
+        icon_carrier.set_size(&mut text.font_system, Some(0.0), Some(0.0));
 
         Self {
-            device,
-            queue,
-            surface,
-            surface_config,
-            render_format,
-            font_system,
-            swash_cache,
-            atlas,
-            text_renderer,
-            overlay_text_renderer,
-            viewport,
-            _cache: cache,
+            device: gpu.device,
+            queue: gpu.queue,
+            surface: gpu.surface,
+            surface_config: gpu.surface_config,
+            render_format: gpu.render_format,
+            font_system: text.font_system,
+            swash_cache: text.swash_cache,
+            atlas: text.atlas,
+            text_renderer: text.text_renderer,
+            overlay_text_renderer: text.overlay_text_renderer,
+            viewport: text.viewport,
+            rounded_rect,
+            colors,
             cell,
             scale_factor,
             quad_pipeline,
             quad_vertex_buffer,
-            rounded_rect,
-            colors,
+            icon_carrier,
         }
     }
 
@@ -423,99 +672,38 @@ impl GpuContext {
         self.surface.configure(&self.device, &self.surface_config);
     }
 
-    /// Render a complete frame with tab bar + multiple panel draw commands.
+    /// Render a complete frame with scene (panels + tab bar) and overlay (dropdown).
     /// If `screenshot_path` is Some, saves the rendered frame as a PNG.
     pub fn render_frame(
         &mut self,
-        tab_bar: &TabBar,
-        dropdown: Option<&DropdownMenu>,
-        panel_draws: &[PanelDrawCommands],
-        panel_buffers: &[&[Buffer]],
+        scene: &DrawContext,
+        overlay: &DrawContext,
+        scene_text: &[(&[TextSpec], &[Buffer])],
+        overlay_text: &[(&[TextSpec], &[Buffer])],
         icon_manager: &IconManager,
         screenshot_path: Option<&str>,
     ) -> Result<(), SurfaceError> {
         let scale_factor = self.scale_factor;
-        let frame = self.surface.get_current_texture()?;
-        let view = frame.texture.create_view(&TextureViewDescriptor {
-            format: Some(self.render_format),
-            ..Default::default()
-        });
+        let (frame, view) = begin_frame(&self.surface, self.render_format)?;
 
         let w = self.surface_config.width as f32;
         let h = self.surface_config.height as f32;
 
-        let rr = &self.rounded_rect;
-
-        // Get tab bar draw commands — use panel bounds for alignment
-        let panel_x = panel_draws.first().map(|d| d.island_rect.x).unwrap_or(0.0);
-        let panel_y = panel_draws.first().map(|d| d.island_rect.y).unwrap_or(0.0);
-        let panel_w = panel_draws
-            .first()
-            .map(|d| d.island_rect.width)
-            .unwrap_or(w);
-        let tab_draw = tab_bar.draw_commands(&self.colors, scale_factor, panel_x, panel_y, panel_w);
-
         // Upload rounded rect uniforms in two groups:
-        // Scene (panels + tab bar) — drawn before text
-        // Overlay (dropdown) — drawn after text, on top of everything
-        let mut rr_index = 0;
+        // Scene -- drawn before text
+        // Overlay -- drawn after text, on top of everything
+        let scene_rr_count = self
+            .rounded_rect
+            .upload_quads(&self.queue, &scene.rounded_quads, 0);
 
-        // Panel island backgrounds (stroke + fill per panel) — drawn first (behind)
-        for draw in panel_draws {
-            if draw.island_stroke_width > 0.0 && draw.island_stroke_color[3] > 0.0 {
-                rr.upload_uniform(
-                    &self.queue,
-                    rr_index,
-                    RoundedRectUniforms::new(
-                        &draw.island_rect,
-                        draw.island_radius,
-                        0.0,
-                        draw.island_stroke_color,
-                    ),
-                );
-                rr_index += 1;
-            }
-            let sw = draw.island_stroke_width;
-            let inset = draw.island_rect.inset(sw);
-            rr.upload_uniform(
-                &self.queue,
-                rr_index,
-                RoundedRectUniforms::new(
-                    &inset,
-                    (draw.island_radius - sw).max(0.0),
-                    0.0,
-                    draw.island_color,
-                ),
-            );
-            rr_index += 1;
-        }
+        let total_rounded_rects =
+            self.rounded_rect
+                .upload_quads(&self.queue, &overlay.rounded_quads, scene_rr_count);
 
-        // Tab bar rounded rects (tab backgrounds, borders)
-        rr_index = rr.upload_quads(&self.queue, &tab_draw.rounded_quads, rr_index);
-
-        let scene_rr_count = rr_index;
-
-        // Dropdown menu rounded rects (shadow + border + fill + hover) — overlay layer
-        let dropdown_draw = dropdown.map(|d| d.draw_commands(&self.colors, scale_factor));
-        if let Some(ref dd) = dropdown_draw {
-            rr_index = rr.upload_quads(&self.queue, &dd.rounded_quads, rr_index);
-        }
-
-        let total_rounded_rects = rr_index;
-
-        // Build all quad vertices (tab bar flat quads + all panel cell backgrounds)
+        // Build all quad vertices (scene flat quads: tab bar separator + cell backgrounds)
         let mut quad_verts: Vec<QuadVertex> = Vec::new();
-
-        // Tab bar flat quads (separator line)
-        for bq in &tab_draw.flat_quads {
+        for bq in &scene.flat_quads {
             push_quad(&mut quad_verts, bq, w, h);
-        }
-
-        // Panel cell background quads
-        for draw in panel_draws {
-            for bq in &draw.bg_quads {
-                push_quad(&mut quad_verts, bq, w, h);
-            }
         }
 
         let quad_vertex_count = quad_verts.len() as u32;
@@ -528,23 +716,14 @@ impl GpuContext {
         }
 
         // glyphon text
-        self.viewport.update(
-            &self.queue,
-            Resolution {
-                width: self.surface_config.width,
-                height: self.surface_config.height,
-            },
-        );
+        update_viewport(&mut self.viewport, &self.queue, &self.surface_config);
 
-        // Build scene TextAreas (tab bar + panels) — rendered before overlay
+        // Build scene TextAreas
         let mut text_areas: Vec<TextArea> = Vec::new();
 
-        // Carrier buffer for tab bar icons (empty buffer, scale=1.0 so positions are physical px)
-        let mut icon_carrier = Buffer::new(&mut self.font_system, Metrics::new(1.0, 1.0));
-        icon_carrier.set_size(&mut self.font_system, Some(0.0), Some(0.0));
-
+        // Icon carrier for custom glyphs (uses cached buffer)
         text_areas.push(TextArea {
-            buffer: &icon_carrier,
+            buffer: &self.icon_carrier,
             left: 0.0,
             top: 0.0,
             scale: 1.0,
@@ -554,26 +733,13 @@ impl GpuContext {
                 right: w as i32,
                 bottom: h as i32,
             },
-            default_color: hex_to_glyphon_color(&self.colors.foreground),
-            custom_glyphs: &tab_draw.custom_glyphs,
+            default_color: self.colors.foreground.to_glyphon(),
+            custom_glyphs: &scene.custom_glyphs,
         });
 
-        // Tab bar label text areas
-        let tab_buffers = tab_bar.tab_buffers();
-        push_text_specs(
-            &mut text_areas,
-            &tab_draw.text_areas,
-            tab_buffers,
-            scale_factor,
-        );
-
-        // Panel text — per-cell rendering
-        for (panel_idx, draw) in panel_draws.iter().enumerate() {
-            if panel_idx >= panel_buffers.len() {
-                break;
-            }
-            let bufs = panel_buffers[panel_idx];
-            push_text_specs(&mut text_areas, &draw.text_cells, bufs, scale_factor);
+        // Scene text areas (tab bar + panels)
+        for &(specs, bufs) in scene_text {
+            push_text_specs(&mut text_areas, specs, bufs, scale_factor);
         }
 
         self.text_renderer
@@ -589,11 +755,10 @@ impl GpuContext {
             )
             .expect("prepare scene text");
 
-        // Overlay text (dropdown + SSH dialog) — rendered after overlay rects paint over scene text
-        let dropdown_buffers = dropdown.map(|d| d.item_buffers());
+        // Overlay text (dropdown)
         let mut overlay_areas: Vec<TextArea> = Vec::new();
-        if let (Some(dd), Some(dd_bufs)) = (&dropdown_draw, dropdown_buffers) {
-            push_text_specs(&mut overlay_areas, &dd.text_areas, dd_bufs, scale_factor);
+        for &(specs, bufs) in overlay_text {
+            push_text_specs(&mut overlay_areas, specs, bufs, scale_factor);
         }
 
         self.overlay_text_renderer
@@ -616,73 +781,54 @@ impl GpuContext {
             });
 
         {
-            let mut pass = encoder.begin_render_pass(&RenderPassDescriptor {
-                label: Some("main pass"),
-                color_attachments: &[Some(RenderPassColorAttachment {
-                    view: &view,
-                    resolve_target: None,
-                    ops: Operations {
-                        load: LoadOp::Clear({
-                            let chrome = self.colors.chrome_wgpu();
-                            wgpu::Color {
-                                r: chrome[0],
-                                g: chrome[1],
-                                b: chrome[2],
-                                a: chrome[3],
-                            }
-                        }),
-                        store: StoreOp::Store,
-                    },
-                })],
-                depth_stencil_attachment: None,
-                ..Default::default()
-            });
+            let mut pass = begin_clear_pass(
+                &mut encoder,
+                &view,
+                "main pass",
+                self.colors.chrome.to_wgpu_color(),
+            );
 
             // === Scene layer ===
-
-            // 1. Scene rounded rects (panel islands + tab bar elements)
             self.rounded_rect.draw_range(&mut pass, 0, scene_rr_count);
 
-            // 2. Flat quads (tab bar separator + cell backgrounds + cursors)
             if quad_vertex_count > 0 {
                 pass.set_pipeline(&self.quad_pipeline);
                 pass.set_vertex_buffer(0, self.quad_vertex_buffer.slice(..));
                 pass.draw(0..quad_vertex_count, 0..1);
             }
 
-            // 3. Scene text + icons (tab labels + panel text)
             self.text_renderer
                 .render(&self.atlas, &self.viewport, &mut pass)
                 .expect("render scene text");
 
-            // === Overlay layer (dropdown) ===
-
-            // 4. Overlay rounded rects (shadow + border + fill + hover highlight)
+            // === Overlay layer ===
             self.rounded_rect.draw_range(
                 &mut pass,
                 scene_rr_count,
                 total_rounded_rects - scene_rr_count,
             );
 
-            // 5. Overlay text (dropdown menu items)
             self.overlay_text_renderer
                 .render(&self.atlas, &self.viewport, &mut pass)
                 .expect("render overlay text");
         }
 
-        self.queue.submit(std::iter::once(encoder.finish()));
-
         if let Some(path) = screenshot_path {
+            self.queue.submit(std::iter::once(encoder.finish()));
             self.capture_screenshot(path, &frame.texture);
+            frame.present();
+            self.atlas.trim();
+        } else {
+            finish_frame(&self.queue, &mut self.atlas, encoder, frame);
         }
-
-        frame.present();
-
-        self.atlas.trim();
 
         Ok(())
     }
 }
+
+// ---------------------------------------------------------------------------
+// Free functions
+// ---------------------------------------------------------------------------
 
 fn save_screenshot(path: &str, data: &[u8], width: u32, height: u32, padded_row: u32) {
     let file = std::fs::File::create(path).expect("create screenshot file");
@@ -728,7 +874,7 @@ pub fn push_text_specs<'a>(
                 left: spec.left,
                 top: spec.top,
                 scale,
-                bounds: rect_to_text_bounds(&spec.bounds),
+                bounds: spec.bounds.to_text_bounds(),
                 default_color: spec.color,
                 custom_glyphs: &[],
             });
@@ -736,56 +882,43 @@ pub fn push_text_specs<'a>(
     }
 }
 
-pub fn rect_to_text_bounds(r: &Rect) -> TextBounds {
-    TextBounds {
-        left: r.x as i32,
-        top: r.y as i32,
-        right: (r.x + r.width) as i32,
-        bottom: (r.y + r.height) as i32,
-    }
-}
-
 fn push_quad(verts: &mut Vec<QuadVertex>, bq: &BgQuad, surface_w: f32, surface_h: f32) {
-    let x0 = bq.rect.x;
-    let y0 = bq.rect.y;
-    let x1 = x0 + bq.rect.width;
-    let y1 = y0 + bq.rect.height;
-
-    let nx0 = (x0 / surface_w) * 2.0 - 1.0;
-    let ny0 = 1.0 - (y0 / surface_h) * 2.0;
-    let nx1 = (x1 / surface_w) * 2.0 - 1.0;
-    let ny1 = 1.0 - (y1 / surface_h) * 2.0;
-
+    let nx0 = (bq.rect.x / surface_w) * 2.0 - 1.0;
+    let ny0 = 1.0 - (bq.rect.y / surface_h) * 2.0;
+    let nx1 = ((bq.rect.x + bq.rect.width) / surface_w) * 2.0 - 1.0;
+    let ny1 = 1.0 - ((bq.rect.y + bq.rect.height) / surface_h) * 2.0;
     let c = bq.color;
-    verts.push(QuadVertex {
-        position: [nx0, ny0],
-        color: c,
-    });
-    verts.push(QuadVertex {
-        position: [nx1, ny0],
-        color: c,
-    });
-    verts.push(QuadVertex {
-        position: [nx0, ny1],
-        color: c,
-    });
-    verts.push(QuadVertex {
-        position: [nx0, ny1],
-        color: c,
-    });
-    verts.push(QuadVertex {
-        position: [nx1, ny0],
-        color: c,
-    });
-    verts.push(QuadVertex {
-        position: [nx1, ny1],
-        color: c,
-    });
+    verts.extend_from_slice(&[
+        QuadVertex {
+            position: [nx0, ny0],
+            color: c,
+        },
+        QuadVertex {
+            position: [nx1, ny0],
+            color: c,
+        },
+        QuadVertex {
+            position: [nx0, ny1],
+            color: c,
+        },
+        QuadVertex {
+            position: [nx0, ny1],
+            color: c,
+        },
+        QuadVertex {
+            position: [nx1, ny0],
+            color: c,
+        },
+        QuadVertex {
+            position: [nx1, ny1],
+            color: c,
+        },
+    ]);
 }
 
-pub fn align_up(value: u32, alignment: u32) -> u32 {
-    (value + alignment - 1) & !(alignment - 1)
-}
+// ---------------------------------------------------------------------------
+// Shaders
+// ---------------------------------------------------------------------------
 
 const QUAD_SHADER: &str = r#"
 struct VertexInput {
@@ -812,7 +945,7 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
 }
 "#;
 
-pub const ROUNDED_RECT_SHADER: &str = r#"
+const ROUNDED_RECT_SHADER: &str = r#"
 struct Uniforms {
     rect_bounds: vec4<f32>,
     params: vec4<f32>,

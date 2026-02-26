@@ -1,16 +1,38 @@
 use std::borrow::Cow;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 
-use glyphon::{Attrs, Buffer, Color as GlyphonColor, Family, FontSystem, Shaping};
+use alacritty_terminal::event::{Event, EventListener, WindowSize};
+use alacritty_terminal::event_loop::{EventLoop, EventLoopSender, Msg};
+use alacritty_terminal::grid::Dimensions;
+use alacritty_terminal::sync::FairMutex;
+use alacritty_terminal::tty;
+use alacritty_terminal::Term;
+use glyphon::{Buffer, Color as GlyphonColor, FontSystem, Shaping};
+use tokio::sync::mpsc;
 use winit::event::{ElementState, KeyEvent, MouseScrollDelta};
+use winit::event_loop::EventLoopProxy;
 use winit::keyboard::{Key, NamedKey};
 
-use crate::colors::{hex_to_glyphon_color, hex_to_linear_f32, ColorScheme};
+use crate::colors::ColorScheme;
+use crate::draw::DrawContext;
 use crate::font::{self, CellMetrics};
-use crate::layout::Rect;
-use crate::ssh::SshConfig;
-use crate::terminal::{EventProxy, TermSize, Terminal};
+use crate::layout::{Rect, TextSpec};
+use crate::ssh::{SshConfig, SshMsg};
+use crate::theme::PanelTheme;
+
+// --- Events ---
+
+/// Custom event sent from the terminal I/O thread to the winit event loop.
+#[derive(Debug)]
+pub enum TerminalEvent {
+    Wakeup,
+    Title(PanelId, String),
+    Exit(PanelId),
+    /// Deferred SSH dialog close — carries an optional result (None = cancelled).
+    SshDialogClose(Option<crate::ssh_dialog::SshResult>),
+}
 
 // --- Panel types ---
 
@@ -33,67 +55,136 @@ pub struct PanelViewport {
     pub scale_factor: f32,
 }
 
-/// Per-cell rendering info extracted from a panel.
-pub struct CellInfo {
-    pub c: char,
-    pub fg: GlyphonColor,
-    pub bg: [f32; 4],
-    pub is_default_bg: bool,
-    pub bold: bool,
-    pub italic: bool,
+// --- Terminal dimensions ---
+
+#[derive(Clone, Copy)]
+pub struct TermSize {
+    pub columns: usize,
+    pub screen_lines: usize,
 }
 
-/// Draw commands returned by a panel for the GPU to render.
-pub struct PanelDrawCommands {
-    /// Island background rect (physical px).
-    pub island_rect: Rect,
-    /// Island background color (linear sRGB).
-    pub island_color: [f32; 4],
-    /// Island corner radius (physical px).
-    pub island_radius: f32,
-    /// Island stroke color (linear sRGB). If alpha > 0, renders an inside stroke.
-    pub island_stroke_color: [f32; 4],
-    /// Island stroke width (physical px).
-    pub island_stroke_width: f32,
-    /// Cell background quads: (physical_rect, linear_color).
-    pub bg_quads: Vec<BgQuad>,
-    /// Per-cell text specs for building TextAreas.
-    pub text_cells: Vec<TextSpec>,
+impl TermSize {
+    pub fn new(columns: usize, screen_lines: usize) -> Self {
+        Self {
+            columns: columns.max(2),
+            screen_lines: screen_lines.max(2),
+        }
+    }
 }
 
-pub struct BgQuad {
-    pub rect: Rect,
-    pub color: [f32; 4],
+impl Dimensions for TermSize {
+    fn total_lines(&self) -> usize {
+        self.screen_lines
+    }
+    fn screen_lines(&self) -> usize {
+        self.screen_lines
+    }
+    fn columns(&self) -> usize {
+        self.columns
+    }
 }
 
-/// Shared text spec used by all UI components for glyphon rendering.
-pub struct TextSpec {
-    pub buffer_index: usize,
-    pub left: f32,
-    pub top: f32,
-    pub bounds: Rect,
-    pub color: GlyphonColor,
+// --- Event proxy (bridges alacritty events to winit) ---
+
+/// I/O backend: either a local PTY or an SSH channel.
+enum Backend {
+    Local(EventLoopSender),
+    Ssh(mpsc::UnboundedSender<SshMsg>),
+}
+
+impl Backend {
+    fn send_input(&self, data: Cow<'static, [u8]>) {
+        match self {
+            Backend::Local(ch) => {
+                let _ = ch.send(Msg::Input(data));
+            }
+            Backend::Ssh(tx) => {
+                let _ = tx.send(SshMsg::Input(data));
+            }
+        }
+    }
+
+    fn send_resize(&self, size: TermSize, cell_width: u16, cell_height: u16) {
+        match self {
+            Backend::Local(ch) => {
+                let _ = ch.send(Msg::Resize(WindowSize {
+                    num_lines: size.screen_lines as u16,
+                    num_cols: size.columns as u16,
+                    cell_width,
+                    cell_height,
+                }));
+            }
+            Backend::Ssh(tx) => {
+                let _ = tx.send(SshMsg::Resize {
+                    cols: size.columns as u16,
+                    rows: size.screen_lines as u16,
+                });
+            }
+        }
+    }
+}
+
+/// Bridges alacritty's EventListener to winit's EventLoopProxy.
+#[derive(Clone)]
+pub struct EventProxy {
+    proxy: EventLoopProxy<TerminalEvent>,
+    panel_id: PanelId,
+    backend: Arc<Mutex<Option<Backend>>>,
+}
+
+impl EventProxy {
+    pub fn new(proxy: EventLoopProxy<TerminalEvent>, panel_id: PanelId) -> Self {
+        Self {
+            proxy,
+            panel_id,
+            backend: Arc::new(Mutex::new(None)),
+        }
+    }
+
+    fn set_backend(&self, backend: Backend) {
+        if let Ok(mut guard) = self.backend.lock() {
+            *guard = Some(backend);
+        }
+    }
+}
+
+impl EventListener for EventProxy {
+    fn send_event(&self, event: Event) {
+        let _ = match event {
+            Event::Wakeup => self.proxy.send_event(TerminalEvent::Wakeup),
+            Event::Title(t) => self
+                .proxy
+                .send_event(TerminalEvent::Title(self.panel_id, t)),
+            Event::Exit | Event::ChildExit(_) => {
+                self.proxy.send_event(TerminalEvent::Exit(self.panel_id))
+            }
+            Event::PtyWrite(text) => {
+                if let Ok(guard) = self.backend.lock()
+                    && let Some(backend) = guard.as_ref()
+                {
+                    backend.send_input(Cow::Owned(text.into_bytes()));
+                }
+                Ok(())
+            }
+            _ => Ok(()),
+        };
+    }
 }
 
 // --- Terminal panel ---
 
-/// Padding between panel edge and cell grid (logical pixels).
-const ISLAND_PADDING: f32 = 16.0;
-/// Corner radius of the island (logical pixels).
-const ISLAND_RADIUS: f32 = 10.0;
-/// Island stroke width (logical pixels).
-const ISLAND_STROKE_WIDTH: f32 = 0.5;
-
-/// Key for the per-character buffer pool: (char, bold, italic).
-/// Color is NOT part of the key — it's applied via TextArea::default_color.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-struct CharKey(char, bool, bool);
+struct CharKey {
+    ch: char,
+    bold: bool,
+    italic: bool,
+}
 
 pub struct TerminalPanel {
     id: PanelId,
-    terminal: Terminal,
+    term: Arc<FairMutex<Term<EventProxy>>>,
+    backend: Backend,
     viewport: Option<PanelViewport>,
-    /// Pool of single-character Buffers, indexed by CharKey.
     char_buffers: Vec<Buffer>,
     char_key_map: HashMap<CharKey, usize>,
     title: String,
@@ -102,19 +193,50 @@ pub struct TerminalPanel {
 impl TerminalPanel {
     pub fn new(
         id: PanelId,
-        cols: usize,
-        rows: usize,
-        cell_width: u16,
-        cell_height: u16,
+        size: TermSize,
+        cell_px: (u16, u16),
         event_proxy: EventProxy,
         shell: Option<String>,
         args: Vec<String>,
     ) -> Self {
-        let size = TermSize::new(cols, rows);
-        let terminal = Terminal::new(size, cell_width, cell_height, event_proxy, shell, args);
+        let config = alacritty_terminal::term::Config::default();
+        let term = Term::new(config, &size, event_proxy.clone());
+        let term = Arc::new(FairMutex::new(term));
+
+        let pty_config = tty::Options {
+            shell: shell.map(|program| tty::Shell::new(program, args)),
+            working_directory: None,
+            drain_on_exit: true,
+            env: {
+                let mut env = std::collections::HashMap::new();
+                env.insert("TERM".into(), "xterm-256color".into());
+                env.insert("COLORTERM".into(), "truecolor".into());
+                env
+            },
+            #[cfg(target_os = "windows")]
+            escape_args: false,
+        };
+
+        let window_size = WindowSize {
+            num_lines: size.screen_lines as u16,
+            num_cols: size.columns as u16,
+            cell_width: cell_px.0,
+            cell_height: cell_px.1,
+        };
+
+        let pty = tty::new(&pty_config, window_size, 0).expect("failed to create PTY");
+        let event_loop = EventLoop::new(term.clone(), event_proxy.clone(), pty, false, false)
+            .expect("failed to create event loop");
+        let channel = event_loop.channel();
+
+        event_proxy.set_backend(Backend::Local(channel.clone()));
+
+        event_loop.spawn();
+
         Self {
             id,
-            terminal,
+            term,
+            backend: Backend::Local(channel),
             viewport: None,
             char_buffers: Vec::new(),
             char_key_map: HashMap::new(),
@@ -124,16 +246,18 @@ impl TerminalPanel {
 
     pub fn new_ssh(
         id: PanelId,
-        cols: usize,
-        rows: usize,
+        size: TermSize,
         event_proxy: EventProxy,
         ssh_config: SshConfig,
     ) -> Self {
-        let size = TermSize::new(cols, rows);
-        let terminal = Terminal::new_ssh(size, event_proxy, ssh_config);
+        let (term, sender) = crate::ssh::spawn_ssh_thread(ssh_config, size, event_proxy.clone());
+
+        event_proxy.set_backend(Backend::Ssh(sender.clone()));
+
         Self {
             id,
-            terminal,
+            term,
+            backend: Backend::Ssh(sender),
             viewport: None,
             char_buffers: Vec::new(),
             char_key_map: HashMap::new(),
@@ -141,100 +265,14 @@ impl TerminalPanel {
         }
     }
 
-    fn extract_cells(&self, colors: &ColorScheme) -> (Vec<Vec<CellInfo>>, Option<(usize, usize)>) {
-        let vp = match &self.viewport {
-            Some(vp) => vp,
-            None => return (Vec::new(), None),
-        };
-
-        let term = self.terminal.term.lock();
-        let content = term.renderable_content();
-
-        let rows = vp.rows;
-        let cols = vp.cols;
-        let default_fg = hex_to_glyphon_color(&colors.foreground);
-
-        let mut lines: Vec<Vec<CellInfo>> = (0..rows)
-            .map(|_| {
-                (0..cols)
-                    .map(|_| CellInfo {
-                        c: ' ',
-                        fg: default_fg,
-                        bg: [0.0; 4],
-                        is_default_bg: true,
-                        bold: false,
-                        italic: false,
-                    })
-                    .collect()
-            })
-            .collect();
-
-        for indexed in content.display_iter {
-            let row = indexed.point.line.0 as usize;
-            let col = indexed.point.column.0;
-            if row < rows && col < cols {
-                use alacritty_terminal::term::cell::Flags;
-
-                let cell = &*indexed;
-                let flags = cell.flags;
-
-                // Spacers and hidden cells should render as empty (background only).
-                let is_invisible = flags.intersects(
-                    Flags::WIDE_CHAR_SPACER | Flags::LEADING_WIDE_CHAR_SPACER | Flags::HIDDEN,
-                );
-
-                let bold = flags.contains(Flags::BOLD);
-                let italic = flags.contains(Flags::ITALIC);
-                let dim = flags.contains(Flags::DIM);
-
-                let (fg_color, bg_color) = if flags.contains(Flags::INVERSE) {
-                    (cell.bg, cell.fg)
-                } else {
-                    (cell.fg, cell.bg)
-                };
-
-                let c = if is_invisible { ' ' } else { cell.c };
-
-                let fg = if dim {
-                    let base = colors.to_glyphon_fg(fg_color);
-                    GlyphonColor::rgba(base.r() / 2, base.g() / 2, base.b() / 2, base.a())
-                } else {
-                    colors.to_glyphon_fg(fg_color)
-                };
-
-                lines[row][col] = CellInfo {
-                    c,
-                    fg,
-                    bg: colors.to_rgba(bg_color),
-                    is_default_bg: colors.is_default_bg(bg_color),
-                    bold,
-                    italic,
-                };
-            }
-        }
-
-        let cursor = {
-            let cp = content.cursor.point;
-            let row = cp.line.0 as usize;
-            let col = cp.column.0;
-            if row < rows && col < cols {
-                Some((row, col))
-            } else {
-                None
-            }
-        };
-
-        (lines, cursor)
-    }
-
-    /// Compute a full PanelViewport for the given rect, cell metrics, scale, and tab bar inset.
     pub fn compute_viewport(
         rect: &Rect,
         cell: &CellMetrics,
         scale_factor: f32,
         tab_bar_height: f32,
+        panel_theme: &PanelTheme,
     ) -> PanelViewport {
-        let p = ISLAND_PADDING * scale_factor;
+        let p = panel_theme.island_padding * scale_factor;
         let content = Rect {
             x: rect.x + p,
             y: rect.y + tab_bar_height + p,
@@ -267,16 +305,17 @@ impl TerminalPanel {
     }
 
     pub fn set_viewport(&mut self, viewport: PanelViewport, cell: &CellMetrics) {
-        let old_cols = self.viewport.as_ref().map(|v| v.cols);
-        let old_rows = self.viewport.as_ref().map(|v| v.rows);
+        let dims_changed = self
+            .viewport
+            .as_ref()
+            .is_none_or(|v| v.cols != viewport.cols || v.rows != viewport.rows);
 
-        let cell_w = (cell.width * viewport.scale_factor) as u16;
-        let cell_h = (cell.height * viewport.scale_factor) as u16;
-
-        if old_cols != Some(viewport.cols) || old_rows != Some(viewport.rows) {
+        if dims_changed {
+            let cell_w = (cell.width * viewport.scale_factor) as u16;
+            let cell_h = (cell.height * viewport.scale_factor) as u16;
             let size = TermSize::new(viewport.cols, viewport.rows);
-            self.terminal.resize(size, cell_w, cell_h);
-            // Clear buffer pool on resize since cell metrics change
+            self.backend.send_resize(size, cell_w, cell_h);
+            self.term.lock().resize(size);
             self.char_buffers.clear();
             self.char_key_map.clear();
         }
@@ -289,7 +328,7 @@ impl TerminalPanel {
             return false;
         }
 
-        let bytes: Option<Vec<u8>> = match event.logical_key.as_ref() {
+        let bytes = match event.logical_key.as_ref() {
             Key::Named(NamedKey::Enter) => Some(b"\r".to_vec()),
             Key::Named(NamedKey::Backspace) => Some(b"\x7f".to_vec()),
             Key::Named(NamedKey::Tab) => Some(b"\t".to_vec()),
@@ -320,16 +359,14 @@ impl TerminalPanel {
         };
 
         if let Some(b) = bytes {
-            self.terminal.write(b);
+            self.backend.send_input(Cow::Owned(b));
             true
-        } else if let Some(t) = &event.text {
-            let s: String = t.to_string();
-            if !s.is_empty() {
-                self.terminal.write(Cow::Owned(s.into_bytes()));
-                true
-            } else {
-                false
-            }
+        } else if let Some(t) = &event.text
+            && !t.is_empty()
+        {
+            self.backend
+                .send_input(Cow::Owned(t.to_string().into_bytes()));
+            true
         } else {
             false
         }
@@ -341,150 +378,151 @@ impl TerminalPanel {
             MouseScrollDelta::PixelDelta(pos) => (pos.y / cell_height) as i32,
         };
         if lines != 0 {
-            self.terminal.scroll(lines);
+            let mut term = self.term.lock();
+            term.scroll_display(alacritty_terminal::grid::Scroll::Delta(lines));
             true
         } else {
             false
         }
     }
 
-    pub fn prepare_render(
+    pub fn draw(
         &mut self,
+        ctx: &mut DrawContext,
+        text_specs: &mut Vec<TextSpec>,
         font_system: &mut FontSystem,
         colors: &ColorScheme,
-    ) -> PanelDrawCommands {
+        cell_metrics: &CellMetrics,
+        panel_theme: &PanelTheme,
+    ) {
         let vp = match &self.viewport {
             Some(vp) => vp,
-            None => {
-                return PanelDrawCommands {
-                    island_rect: Rect::ZERO,
-                    island_color: hex_to_linear_f32(&colors.background),
-                    island_radius: 0.0,
-                    island_stroke_color: [0.0; 4],
-                    island_stroke_width: 0.0,
-                    bg_quads: Vec::new(),
-                    text_cells: Vec::new(),
-                };
-            }
+            None => return,
         };
 
         let scale = vp.scale_factor;
-        let pcw = vp.content_rect.width / vp.cols as f32;
-        let pch = vp.content_rect.height / vp.rows as f32;
-
-        // Island rect is the full viewport rect (panel area handles spacing)
-        let island_rect = vp.rect;
-
-        let (lines, cursor) = self.extract_cells(colors);
-
-        // Build background quads
-        let mut bg_quads = Vec::new();
+        let rows = vp.rows;
+        let cols = vp.cols;
+        let pcw = vp.content_rect.width / cols as f32;
+        let pch = vp.content_rect.height / rows as f32;
         let content_x = vp.content_rect.x;
         let content_y = vp.content_rect.y;
+        let island_rect = vp.rect;
 
-        for (row, line) in lines.iter().enumerate() {
-            for (col, ci) in line.iter().enumerate() {
-                if !ci.is_default_bg {
-                    bg_quads.push(BgQuad {
-                        rect: Rect {
+        // Island background (stroke + fill)
+        let island_radius = panel_theme.island_radius * scale;
+        let island_stroke = panel_theme.island_stroke_width * scale;
+        if island_stroke > 0.0 {
+            ctx.stroked_rect(
+                &island_rect,
+                colors.panel_stroke.to_linear_f32(),
+                colors.background.to_linear_f32(),
+                island_radius,
+                island_stroke,
+            );
+        } else {
+            ctx.rounded_rect(island_rect, colors.background.to_linear_f32(), island_radius);
+        }
+
+        let metrics = font::metrics();
+
+        {
+            use alacritty_terminal::term::cell::Flags;
+
+            let term = self.term.lock();
+            let content = term.renderable_content();
+
+            for indexed in content.display_iter {
+                let row = indexed.point.line.0 as usize;
+                let col = indexed.point.column.0;
+                if row >= rows || col >= cols {
+                    continue;
+                }
+
+                let cell = &*indexed;
+                let flags = cell.flags;
+
+                let (fg_color, bg_color) = if flags.contains(Flags::INVERSE) {
+                    (cell.bg, cell.fg)
+                } else {
+                    (cell.fg, cell.bg)
+                };
+
+                if !colors.is_default_bg(bg_color) {
+                    ctx.flat_quad(
+                        Rect {
                             x: content_x + col as f32 * pcw,
                             y: content_y + row as f32 * pch,
                             width: pcw,
                             height: pch,
                         },
-                        color: ci.bg,
-                    });
-                }
-            }
-        }
-
-        // Cursor quad
-        if let Some((cur_row, cur_col)) = cursor {
-            bg_quads.push(BgQuad {
-                rect: Rect {
-                    x: content_x + cur_col as f32 * pcw,
-                    y: content_y + cur_row as f32 * pch,
-                    width: pcw,
-                    height: pch,
-                },
-                color: [0.8, 0.8, 0.8, 0.7],
-            });
-        }
-
-        // Per-cell text rendering: each visible character gets its own Buffer
-        // positioned at its exact grid position. This bypasses cosmic_text's
-        // paragraph layout engine, guaranteeing correct terminal grid positioning.
-        //
-        // Block-drawing characters (U+2580–U+259F) are rendered as colored quads
-        // instead of text glyphs to guarantee seamless tiling with no gaps.
-        let metrics = font::metrics();
-        let cell_metrics = font::measure_cell(font_system);
-        let mut text_cells = Vec::new();
-
-        for (row, line) in lines.iter().enumerate() {
-            for (col, ci) in line.iter().enumerate() {
-                if ci.c == ' ' || ci.c == '\0' {
-                    continue;
-                }
-
-                // Block-drawing characters → colored quads
-                let cx = content_x + col as f32 * pcw;
-                let cy = content_y + row as f32 * pch;
-                if let Some(rects) = block_char_rects(ci.c, cx, cy, pcw, pch) {
-                    let color = glyphon_to_linear(ci.fg);
-                    for r in rects {
-                        bg_quads.push(BgQuad { rect: r, color });
-                    }
-                    continue;
-                }
-
-                let key = CharKey(ci.c, ci.bold, ci.italic);
-                let buf_idx = if let Some(&idx) = self.char_key_map.get(&key) {
-                    idx
-                } else {
-                    // Create a new single-character buffer
-                    let mut buf = Buffer::new(font_system, metrics);
-                    // Buffer is slightly wider than one cell to avoid clipping
-                    buf.set_size(
-                        font_system,
-                        Some(cell_metrics.width * 2.0),
-                        Some(cell_metrics.height),
+                        colors.to_rgba(bg_color),
                     );
-                    let mut attrs = Attrs::new().family(Family::Name("JetBrains Mono"));
-                    if ci.bold {
-                        attrs = attrs.weight(glyphon::Weight::BOLD);
-                    }
-                    if ci.italic {
-                        attrs = attrs.style(glyphon::Style::Italic);
-                    }
-                    let text = ci.c.to_string();
-                    buf.set_text(font_system, &text, attrs, Shaping::Advanced);
-                    buf.shape_until_scroll(font_system, false);
+                }
 
-                    let idx = self.char_buffers.len();
-                    self.char_buffers.push(buf);
-                    self.char_key_map.insert(key, idx);
-                    idx
+                let is_invisible = flags.intersects(
+                    Flags::WIDE_CHAR_SPACER | Flags::LEADING_WIDE_CHAR_SPACER | Flags::HIDDEN,
+                );
+                let c = if is_invisible { ' ' } else { cell.c };
+                if c == ' ' || c == '\0' {
+                    continue;
+                }
+
+                let dim = flags.contains(Flags::DIM);
+                let fg = if dim {
+                    let base = colors.to_glyphon_fg(fg_color);
+                    GlyphonColor::rgba(base.r() / 2, base.g() / 2, base.b() / 2, base.a())
+                } else {
+                    colors.to_glyphon_fg(fg_color)
                 };
 
-                text_cells.push(TextSpec {
+                let cx = content_x + col as f32 * pcw;
+                let cy = content_y + row as f32 * pch;
+
+                if let Some(rects) = block_char_rects(c, cx, cy, pcw, pch) {
+                    let color = glyphon_to_linear(fg);
+                    for r in rects {
+                        ctx.flat_quad(r, color);
+                    }
+                    continue;
+                }
+
+                let bold = flags.contains(Flags::BOLD);
+                let italic = flags.contains(Flags::ITALIC);
+                let key = CharKey { ch: c, bold, italic };
+                let buf_idx = get_or_create_buffer(
+                    &mut self.char_buffers,
+                    &mut self.char_key_map,
+                    key,
+                    font_system,
+                    metrics,
+                    cell_metrics,
+                );
+
+                text_specs.push(TextSpec {
                     left: cx,
                     top: cy,
-                    color: ci.fg,
+                    color: fg,
                     buffer_index: buf_idx,
                     bounds: island_rect,
                 });
             }
-        }
 
-        PanelDrawCommands {
-            island_rect,
-            island_color: hex_to_linear_f32(&colors.background),
-            island_radius: ISLAND_RADIUS * scale,
-            island_stroke_color: hex_to_linear_f32(&colors.panel_stroke),
-            island_stroke_width: ISLAND_STROKE_WIDTH * scale,
-            bg_quads,
-            text_cells,
+            // Cursor quad
+            let cp = content.cursor.point;
+            let cur_row = cp.line.0 as usize;
+            let cur_col = cp.column.0;
+            if cur_row < rows && cur_col < cols {
+                ctx.flat_quad(
+                    Rect {
+                        x: content_x + cur_col as f32 * pcw,
+                        y: content_y + cur_row as f32 * pch,
+                        width: pcw,
+                        height: pch,
+                    },
+                    colors.cursor.to_linear_f32(),
+                );
+            }
         }
     }
 
@@ -493,72 +531,81 @@ impl TerminalPanel {
     }
 
     pub fn write_to_pty(&self, data: Vec<u8>) {
-        self.terminal.write(Cow::Owned(data));
+        self.backend.send_input(Cow::Owned(data));
     }
+}
+
+fn get_or_create_buffer(
+    char_buffers: &mut Vec<Buffer>,
+    char_key_map: &mut HashMap<CharKey, usize>,
+    key: CharKey,
+    font_system: &mut FontSystem,
+    metrics: glyphon::Metrics,
+    cell_metrics: &CellMetrics,
+) -> usize {
+    if let Some(&idx) = char_key_map.get(&key) {
+        return idx;
+    }
+    let mut buf = Buffer::new(font_system, metrics);
+    buf.set_size(
+        font_system,
+        Some(cell_metrics.width * 2.0),
+        Some(cell_metrics.height),
+    );
+    let mut attrs = font::default_attrs();
+    if key.bold {
+        attrs = attrs.weight(glyphon::Weight::BOLD);
+    }
+    if key.italic {
+        attrs = attrs.style(glyphon::Style::Italic);
+    }
+    buf.set_text(font_system, &key.ch.to_string(), attrs, Shaping::Advanced);
+    buf.shape_until_scroll(font_system, false);
+    let idx = char_buffers.len();
+    char_buffers.push(buf);
+    char_key_map.insert(key, idx);
+    idx
 }
 
 /// Convert a GlyphonColor (sRGB u8) to linear f32 RGBA for GPU quads.
 fn glyphon_to_linear(c: GlyphonColor) -> [f32; 4] {
-    use crate::colors::srgb_to_linear;
-    [
-        srgb_to_linear(c.r() as f32 / 255.0),
-        srgb_to_linear(c.g() as f32 / 255.0),
-        srgb_to_linear(c.b() as f32 / 255.0),
-        c.a() as f32 / 255.0,
-    ]
+    crate::colors::rgba_u8_to_linear(c.r(), c.g(), c.b(), c.a())
 }
 
-/// Return sub-rectangles for block-drawing characters (U+2580–U+259F).
-/// Returns None for non-block chars.
+/// Return sub-rectangles for block-drawing characters (U+2580-U+259F).
 fn block_char_rects(c: char, cx: f32, cy: f32, cw: f32, ch: f32) -> Option<Vec<Rect>> {
+    let u = c as u32;
     let hw = cw / 2.0;
     let hh = ch / 2.0;
+    let r = |x, y, w, h| Rect { x, y, width: w, height: h };
 
-    macro_rules! r {
-        ($x:expr, $y:expr, $w:expr, $h:expr) => {
-            Rect {
-                x: $x,
-                y: $y,
-                width: $w,
-                height: $h,
-            }
-        };
-    }
-
-    match c {
-        // Vertical fractional blocks (lower N/8)
-        '\u{2581}' => Some(vec![r!(cx, cy + ch * 7.0 / 8.0, cw, ch / 8.0)]),
-        '\u{2582}' => Some(vec![r!(cx, cy + ch * 6.0 / 8.0, cw, ch * 2.0 / 8.0)]),
-        '\u{2583}' => Some(vec![r!(cx, cy + ch * 5.0 / 8.0, cw, ch * 3.0 / 8.0)]),
-        '\u{2584}' => Some(vec![r!(cx, cy + hh, cw, hh)]),
-        '\u{2585}' => Some(vec![r!(cx, cy + ch * 3.0 / 8.0, cw, ch * 5.0 / 8.0)]),
-        '\u{2586}' => Some(vec![r!(cx, cy + ch * 2.0 / 8.0, cw, ch * 6.0 / 8.0)]),
-        '\u{2587}' => Some(vec![r!(cx, cy + ch / 8.0, cw, ch * 7.0 / 8.0)]),
-        '\u{2588}' => Some(vec![r!(cx, cy, cw, ch)]),
-        // Horizontal fractional blocks (left N/8)
-        '\u{2589}' => Some(vec![r!(cx, cy, cw * 7.0 / 8.0, ch)]),
-        '\u{258A}' => Some(vec![r!(cx, cy, cw * 6.0 / 8.0, ch)]),
-        '\u{258B}' => Some(vec![r!(cx, cy, cw * 5.0 / 8.0, ch)]),
-        '\u{258C}' => Some(vec![r!(cx, cy, hw, ch)]),
-        '\u{258D}' => Some(vec![r!(cx, cy, cw * 3.0 / 8.0, ch)]),
-        '\u{258E}' => Some(vec![r!(cx, cy, cw * 2.0 / 8.0, ch)]),
-        '\u{258F}' => Some(vec![r!(cx, cy, cw / 8.0, ch)]),
-        // Other halves
-        '\u{2580}' => Some(vec![r!(cx, cy, cw, hh)]),
-        '\u{2590}' => Some(vec![r!(cx + hw, cy, hw, ch)]),
-        '\u{2594}' => Some(vec![r!(cx, cy, cw, ch / 8.0)]),
-        '\u{2595}' => Some(vec![r!(cx + cw * 7.0 / 8.0, cy, cw / 8.0, ch)]),
-        // Quadrant elements
-        '\u{2596}' => Some(vec![r!(cx, cy + hh, hw, hh)]),
-        '\u{2597}' => Some(vec![r!(cx + hw, cy + hh, hw, hh)]),
-        '\u{2598}' => Some(vec![r!(cx, cy, hw, hh)]),
-        '\u{2599}' => Some(vec![r!(cx, cy, hw, hh), r!(cx, cy + hh, cw, hh)]),
-        '\u{259A}' => Some(vec![r!(cx, cy, hw, hh), r!(cx + hw, cy + hh, hw, hh)]),
-        '\u{259B}' => Some(vec![r!(cx, cy, cw, hh), r!(cx, cy + hh, hw, hh)]),
-        '\u{259C}' => Some(vec![r!(cx, cy, cw, hh), r!(cx + hw, cy + hh, hw, hh)]),
-        '\u{259D}' => Some(vec![r!(cx + hw, cy, hw, hh)]),
-        '\u{259E}' => Some(vec![r!(cx + hw, cy, hw, hh), r!(cx, cy + hh, hw, hh)]),
-        '\u{259F}' => Some(vec![r!(cx + hw, cy, hw, hh), r!(cx, cy + hh, cw, hh)]),
+    match u {
+        // Lower N/8 blocks: U+2581 (1/8) .. U+2588 (full)
+        0x2581..=0x2588 => {
+            let n = (u - 0x2580) as f32 / 8.0;
+            Some(vec![r(cx, cy + ch * (1.0 - n), cw, ch * n)])
+        }
+        // Left N/8 blocks: U+2589 (7/8) .. U+258F (1/8)
+        0x2589..=0x258F => {
+            let n = (0x2590 - u) as f32 / 8.0;
+            Some(vec![r(cx, cy, cw * n, ch)])
+        }
+        // Special halves and eighths
+        0x2580 => Some(vec![r(cx, cy, cw, hh)]),             // upper half
+        0x2590 => Some(vec![r(cx + hw, cy, hw, ch)]),         // right half
+        0x2594 => Some(vec![r(cx, cy, cw, ch / 8.0)]),        // upper 1/8
+        0x2595 => Some(vec![r(cx + cw * 7.0 / 8.0, cy, cw / 8.0, ch)]), // right 1/8
+        // Quadrant characters: U+2596-U+259F — bitmask: TL=1, TR=2, BL=4, BR=8
+        0x2596..=0x259F => {
+            const QUAD_BITS: [u8; 10] = [4, 8, 1, 13, 9, 7, 11, 2, 6, 14];
+            let bits = QUAD_BITS[(u - 0x2596) as usize];
+            let mut rects = Vec::with_capacity(4);
+            if bits & 1 != 0 { rects.push(r(cx, cy, hw, hh)); }
+            if bits & 2 != 0 { rects.push(r(cx + hw, cy, hw, hh)); }
+            if bits & 4 != 0 { rects.push(r(cx, cy + hh, hw, hh)); }
+            if bits & 8 != 0 { rects.push(r(cx + hw, cy + hh, hw, hh)); }
+            Some(rects)
+        }
         _ => None,
     }
 }

@@ -3,11 +3,11 @@ use std::sync::Arc;
 
 use alacritty_terminal::sync::FairMutex;
 use alacritty_terminal::term::Config;
+use alacritty_terminal::vte::ansi;
 use alacritty_terminal::Term;
-use russh::keys::ssh_key;
 use tokio::sync::mpsc;
 
-use crate::terminal::{EventProxy, TermSize};
+use crate::terminal_panel::{EventProxy, TermSize};
 
 /// SSH connection configuration.
 #[derive(Debug, Clone)]
@@ -21,11 +21,8 @@ pub struct SshConfig {
 /// SSH authentication method.
 #[derive(Debug, Clone)]
 pub enum SshAuth {
-    /// Password authentication.
     Password(String),
-    /// Public key authentication with an optional passphrase.
     Key { path: String, passphrase: Option<String> },
-    /// Try keys from the SSH agent, then fall back to default key files.
     Agent,
 }
 
@@ -43,24 +40,19 @@ impl russh::client::Handler for SshHandler {
 
     async fn check_server_key(
         &mut self,
-        _server_public_key: &ssh_key::PublicKey,
+        _server_public_key: &russh::keys::ssh_key::PublicKey,
     ) -> Result<bool, Self::Error> {
-        // Phase 1: TOFU — accept all host keys.
-        Ok(true)
+        Ok(true) // TOFU — accept all host keys
     }
 }
 
-/// Spawn an OS thread that runs a single-threaded tokio runtime for the SSH session.
-///
-/// Returns `(term, sender)` — the `term` is shared with the rendering pipeline,
-/// and `sender` is used by `Terminal` to forward input/resize/shutdown.
+/// Spawn an OS thread running a tokio runtime for the SSH session.
 pub fn spawn_ssh_thread(
     config: SshConfig,
     size: TermSize,
     event_proxy: EventProxy,
 ) -> (Arc<FairMutex<Term<EventProxy>>>, mpsc::UnboundedSender<SshMsg>) {
-    let term_config = Config::default();
-    let term = Term::new(term_config, &size, event_proxy.clone());
+    let term = Term::new(Config::default(), &size, event_proxy.clone());
     let term = Arc::new(FairMutex::new(term));
     let (tx, rx) = mpsc::unbounded_channel();
 
@@ -86,6 +78,13 @@ pub fn spawn_ssh_thread(
     (term, tx)
 }
 
+/// Write a message to the terminal emulator (for displaying errors to the user).
+fn write_to_term(term: &FairMutex<Term<EventProxy>>, msg: &str) {
+    let mut parser = ansi::Processor::<ansi::StdSyncHandler>::new();
+    let mut t = term.lock();
+    parser.advance(&mut *t, msg.as_bytes());
+}
+
 async fn ssh_session(
     config: SshConfig,
     term: Arc<FairMutex<Term<EventProxy>>>,
@@ -102,9 +101,8 @@ async fn ssh_session(
 
     let mut session = russh::client::connect(russh_config, &addr, SshHandler)
         .await
-        .map_err(|e| {
+        .inspect_err(|_| {
             event_proxy.send_event(Event::Exit);
-            e
         })?;
 
     // Authenticate
@@ -116,80 +114,48 @@ async fn ssh_session(
         }
         SshAuth::Key { path, passphrase } => {
             let key_path = shellexpand_path(path);
-            let key_pair = if let Some(pp) = passphrase {
-                russh_keys::load_secret_key(&key_path, Some(pp))?
-            } else {
-                russh_keys::load_secret_key(&key_path, None)?
-            };
+            let key_pair = russh_keys::load_secret_key(&key_path, passphrase.as_deref())?;
             session
                 .authenticate_publickey(&config.username, Arc::new(key_pair))
                 .await?
         }
         SshAuth::Agent => {
-            let authenticated = try_agent_auth(&mut session, &config.username).await;
-            if authenticated {
-                true
-            } else {
-                // Fall back to default key files
-                try_default_keys(&mut session, &config.username).await
-            }
+            try_agent_auth(&mut session, &config.username).await
+                || try_default_keys(&mut session, &config.username).await
         }
     };
 
     if !authenticated {
         log::error!("SSH authentication failed for {}@{}", config.username, config.host);
-        // Write error to terminal so user sees it
-        let msg = format!("\r\nAuthentication failed for {}@{}\r\n", config.username, config.host);
-        {
-            let mut parser = vte::ansi::Processor::<vte::ansi::StdSyncHandler>::new();
-            let mut t = term.lock();
-            parser.advance(&mut *t, msg.as_bytes());
-        }
+        write_to_term(&term, &format!(
+            "\r\nAuthentication failed for {}@{}\r\n",
+            config.username, config.host
+        ));
         event_proxy.send_event(Event::Exit);
         return Ok(());
     }
 
-    // Open a session channel
+    // Open channel, request PTY and shell
     let mut channel = session.channel_open_session().await?;
-
-    // Request a PTY
     channel
-        .request_pty(
-            false,
-            "xterm-256color",
-            cols as u32,
-            rows as u32,
-            0,
-            0,
-            &[],
-        )
+        .request_pty(false, "xterm-256color", cols as u32, rows as u32, 0, 0, &[])
         .await?;
-
-    // Request shell
     channel.request_shell(false).await?;
 
-    // Set title
     event_proxy.send_event(Event::Title(format!(
         "{}@{}",
         config.username, config.host
     )));
 
     // Main I/O loop
-    let mut parser = vte::ansi::Processor::<vte::ansi::StdSyncHandler>::new();
+    let mut parser = ansi::Processor::<ansi::StdSyncHandler>::new();
 
     loop {
         tokio::select! {
-            // Data from SSH server → terminal
             msg = channel.wait() => {
                 match msg {
-                    Some(russh::ChannelMsg::Data { data }) => {
-                        {
-                            let mut t = term.lock();
-                            parser.advance(&mut *t, &data);
-                        }
-                        event_proxy.send_event(Event::Wakeup);
-                    }
-                    Some(russh::ChannelMsg::ExtendedData { data, .. }) => {
+                    Some(russh::ChannelMsg::Data { data }
+                        | russh::ChannelMsg::ExtendedData { data, .. }) => {
                         {
                             let mut t = term.lock();
                             parser.advance(&mut *t, &data);
@@ -198,18 +164,11 @@ async fn ssh_session(
                     }
                     Some(russh::ChannelMsg::ExitStatus { .. })
                     | Some(russh::ChannelMsg::ExitSignal { .. })
-                    | Some(russh::ChannelMsg::Eof) => {
-                        // Channel closed
-                        break;
-                    }
-                    None => {
-                        // Channel stream ended
-                        break;
-                    }
+                    | Some(russh::ChannelMsg::Eof)
+                    | None => break,
                     _ => {}
                 }
             }
-            // Input from UI → SSH channel
             msg = rx.recv() => {
                 match msg {
                     Some(SshMsg::Input(data)) => {
@@ -218,15 +177,12 @@ async fn ssh_session(
                     Some(SshMsg::Resize { cols, rows }) => {
                         channel.window_change(cols as u32, rows as u32, 0, 0).await?;
                     }
-                    None => {
-                        break;
-                    }
+                    None => break,
                 }
             }
         }
     }
 
-    // Clean shutdown
     let _ = channel.eof().await;
     let _ = channel.close().await;
     event_proxy.send_event(Event::Exit);
@@ -240,9 +196,11 @@ async fn try_agent_auth(
     #[cfg(unix)]
     {
         use russh_keys::agent::client::AgentClient;
-        if let Ok(stream) = tokio::net::UnixStream::connect(
-            std::env::var("SSH_AUTH_SOCK").unwrap_or_default(),
-        ).await {
+        let sock = match std::env::var("SSH_AUTH_SOCK") {
+            Ok(s) if !s.is_empty() => s,
+            _ => return false,
+        };
+        if let Ok(stream) = tokio::net::UnixStream::connect(&sock).await {
             let mut agent = AgentClient::connect(stream);
             if let Ok(identities) = agent.request_identities().await {
                 for identity in identities {
@@ -263,33 +221,27 @@ async fn try_default_keys(
     session: &mut russh::client::Handle<SshHandler>,
     username: &str,
 ) -> bool {
-    let ssh_dir = dirs::home_dir()
-        .map(|h| h.join(".ssh"))
-        .unwrap_or_default();
+    let Some(ssh_dir) = dirs::home_dir().map(|h| h.join(".ssh")) else {
+        return false;
+    };
 
-    let key_names = ["id_ed25519", "id_rsa", "id_ecdsa"];
-
-    for name in &key_names {
+    for name in &["id_ed25519", "id_rsa", "id_ecdsa"] {
         let path = ssh_dir.join(name);
         if !path.exists() {
             continue;
         }
-        match russh_keys::load_secret_key(&path, None) {
-            Ok(key) => {
-                match session
-                    .authenticate_publickey(username, Arc::new(key))
-                    .await
-                {
-                    Ok(true) => return true,
-                    Ok(false) => continue,
-                    Err(e) => {
-                        log::debug!("key auth failed for {}: {e}", path.display());
-                        continue;
-                    }
-                }
-            }
+        let key = match russh_keys::load_secret_key(&path, None) {
+            Ok(k) => k,
             Err(e) => {
                 log::debug!("failed to load key {}: {e}", path.display());
+                continue;
+            }
+        };
+        match session.authenticate_publickey(username, Arc::new(key)).await {
+            Ok(true) => return true,
+            Ok(false) => continue,
+            Err(e) => {
+                log::debug!("key auth failed for {}: {e}", path.display());
                 continue;
             }
         }
@@ -297,12 +249,11 @@ async fn try_default_keys(
     false
 }
 
-/// Expand `~` in paths.
 fn shellexpand_path(path: &str) -> std::path::PathBuf {
-    if let Some(rest) = path.strip_prefix("~/") {
-        if let Some(home) = dirs::home_dir() {
-            return home.join(rest);
-        }
+    if let Some(rest) = path.strip_prefix("~/")
+        && let Some(home) = dirs::home_dir()
+    {
+        return home.join(rest);
     }
     std::path::PathBuf::from(path)
 }

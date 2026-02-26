@@ -6,27 +6,24 @@ use winit::event_loop::{ActiveEventLoop, EventLoopProxy};
 use winit::keyboard::{KeyCode, PhysicalKey};
 use winit::window::{Window, WindowAttributes, WindowId};
 
-use crate::colors::ColorScheme;
-use crate::dropdown::{DropdownHit, DropdownMenu, MenuAction, MenuItem};
+use crate::draw::DrawContext;
+use crate::dropdown::{DropdownElement, DropdownMenu, MenuAction, MenuItem};
 use crate::gpu::GpuContext;
 use crate::icons::IconManager;
 use crate::layout::Rect;
 use crate::ssh_dialog::{SshDialogWindow, SshResult};
-use crate::tab_bar::{TabBar, TabBarHit, TabBarHover};
-use crate::terminal::{EventProxy, TerminalEvent};
-use crate::terminal_panel::{PanelId, TerminalPanel};
-
-/// Padding between window edges and panel area (logical pixels).
-const PANEL_AREA_PADDING: f32 = 8.0;
+use crate::tab_bar::{TabBar, TabBarElement};
+use crate::terminal_panel::{EventProxy, PanelId, TermSize, TerminalEvent, TerminalPanel};
+use crate::theme::Theme;
 
 pub struct App {
     window: Option<Arc<Window>>,
     gpu: Option<GpuContext>,
     icon_manager: IconManager,
     event_proxy_raw: EventLoopProxy<TerminalEvent>,
-    colors: ColorScheme,
-    workspaces: Vec<TerminalPanel>,
-    active_workspace: usize,
+    theme: Theme,
+    tabs: Vec<TerminalPanel>,
+    active_tab: usize,
     tab_bar: TabBar,
     dropdown: DropdownMenu,
     ssh_dialog_window: Option<SshDialogWindow>,
@@ -37,15 +34,15 @@ pub struct App {
 
 impl App {
     pub fn new(event_proxy_raw: EventLoopProxy<TerminalEvent>) -> Self {
-        let colors = ColorScheme::load();
+        let theme = Theme::new();
         Self {
             window: None,
             gpu: None,
             icon_manager: IconManager::new(),
             event_proxy_raw,
-            colors,
-            workspaces: Vec::new(),
-            active_workspace: 0,
+            theme,
+            tabs: Vec::new(),
+            active_tab: 0,
             tab_bar: TabBar::new(),
             dropdown: DropdownMenu::new(),
             ssh_dialog_window: None,
@@ -63,9 +60,9 @@ impl App {
         let panel_id = PanelId::next();
         let event_proxy = EventProxy::new(self.event_proxy_raw.clone(), panel_id);
         let scale = gpu.scale_factor;
-        let area = Self::panel_area_from_gpu(gpu);
-        let tab_h = TabBar::height(scale);
-        let vp = TerminalPanel::compute_viewport(&area, &gpu.cell, scale, tab_h);
+        let area = self.panel_area(gpu);
+        let tab_h = TabBar::height(&self.theme.tab_bar, scale);
+        let vp = TerminalPanel::compute_viewport(&area, &gpu.cell, scale, tab_h, &self.theme.panel);
         (panel_id, vp, event_proxy)
     }
 
@@ -76,24 +73,16 @@ impl App {
         args: Vec<String>,
     ) -> TerminalPanel {
         let (panel_id, vp, event_proxy) = self.new_panel_params(gpu);
-        let cell_w = (gpu.cell.width * gpu.scale_factor) as u16;
-        let cell_h = (gpu.cell.height * gpu.scale_factor) as u16;
-
-        TerminalPanel::new(
-            panel_id,
-            vp.cols,
-            vp.rows,
-            cell_w,
-            cell_h,
-            event_proxy,
-            shell,
-            args,
-        )
+        let cell_px = (
+            (gpu.cell.width * gpu.scale_factor) as u16,
+            (gpu.cell.height * gpu.scale_factor) as u16,
+        );
+        TerminalPanel::new(panel_id, TermSize::new(vp.cols, vp.rows), cell_px, event_proxy, shell, args)
     }
 
-    fn panel_area_from_gpu(gpu: &GpuContext) -> Rect {
+    fn panel_area(&self, gpu: &GpuContext) -> Rect {
         let scale = gpu.scale_factor;
-        let pad = PANEL_AREA_PADDING * scale;
+        let pad = self.theme.general.panel_area_padding * scale;
         Rect {
             x: pad,
             y: pad,
@@ -104,13 +93,13 @@ impl App {
 
     fn update_viewports(&mut self) {
         let gpu = self.gpu.as_ref().unwrap();
-        let cell = gpu.cell.clone();
+        let cell = gpu.cell;
         let scale = gpu.scale_factor;
-        let area = Self::panel_area_from_gpu(gpu);
-        let tab_h = TabBar::height(scale);
+        let area = self.panel_area(gpu);
+        let tab_h = TabBar::height(&self.theme.tab_bar, scale);
 
-        if let Some(panel) = self.workspaces.get_mut(self.active_workspace) {
-            let viewport = TerminalPanel::compute_viewport(&area, &cell, scale, tab_h);
+        if let Some(panel) = self.tabs.get_mut(self.active_tab) {
+            let viewport = TerminalPanel::compute_viewport(&area, &cell, scale, tab_h, &self.theme.panel);
             panel.set_viewport(viewport, &cell);
         }
     }
@@ -118,54 +107,96 @@ impl App {
     fn update_tab_bar(&mut self) {
         let gpu = self.gpu.as_mut().unwrap();
         let scale = gpu.scale_factor;
-        let pad = PANEL_AREA_PADDING * scale;
+        let pad = self.theme.general.panel_area_padding * scale;
         let panel_width = gpu.surface_config.width as f32 - 2.0 * pad;
 
         let titles: Vec<String> = self
-            .workspaces
+            .tabs
             .iter()
             .map(|p| p.title().to_string())
             .collect();
 
         self.tab_bar.update(
             &titles,
-            self.active_workspace,
+            self.active_tab,
             panel_width,
             pad,
             scale,
             &mut gpu.font_system,
+            &self.theme.tab_bar,
         );
     }
 
     /// Returns true if a screenshot was captured (signals auto-exit).
     fn redraw(&mut self) -> bool {
-        if self.gpu.is_none() || self.workspaces.is_empty() {
+        if self.gpu.is_none() || self.tabs.is_empty() {
             return false;
         }
 
         let gpu = self.gpu.as_mut().unwrap();
+        let scale = gpu.scale_factor;
+        let cell = gpu.cell;
+        let colors = gpu.colors.clone();
+        let theme = &self.theme;
 
-        // Prepare render data from active panel
-        let panel = &mut self.workspaces[self.active_workspace];
+        // Scene: panels + tab bar
+        let mut scene = DrawContext::new();
+        let mut scene_tab_text = Vec::new();
+        let mut scene_panel_text = Vec::new();
 
-        let draw = panel.prepare_render(&mut gpu.font_system, &gpu.colors);
-        let panel_draws = vec![draw];
-        let bufs = panel.buffers();
-        let panel_buf_refs = vec![bufs];
+        // Panel rendering
+        let panel = &mut self.tabs[self.active_tab];
+        panel.draw(
+            &mut scene,
+            &mut scene_panel_text,
+            &mut gpu.font_system,
+            &colors,
+            &cell,
+            &theme.panel,
+        );
+        let panel_bufs = panel.buffers();
 
-        let dropdown_ref = if self.dropdown.is_open() {
-            Some(&self.dropdown)
-        } else {
-            None
+        // Tab bar rendering
+        let area = Rect {
+            x: theme.general.panel_area_padding * scale,
+            y: theme.general.panel_area_padding * scale,
+            width: gpu.surface_config.width as f32 - 2.0 * theme.general.panel_area_padding * scale,
+            height: gpu.surface_config.height as f32 - 2.0 * theme.general.panel_area_padding * scale,
         };
+        self.tab_bar.draw(
+            &mut scene,
+            &mut scene_tab_text,
+            theme,
+            scale,
+            area.x,
+            area.y,
+            area.width,
+        );
+        let tab_bufs = self.tab_bar.tab_buffers();
+
+        // Overlay: dropdown
+        let mut overlay = DrawContext::new();
+        let mut overlay_dd_text = Vec::new();
+        if self.dropdown.is_open() {
+            self.dropdown.draw(&mut overlay, &mut overlay_dd_text, theme, scale);
+        }
+        let dd_bufs = self.dropdown.item_buffers();
+
+        let scene_text: Vec<(&[crate::layout::TextSpec], &[glyphon::Buffer])> = vec![
+            (&scene_tab_text, tab_bufs),
+            (&scene_panel_text, panel_bufs),
+        ];
+        let overlay_text: Vec<(&[crate::layout::TextSpec], &[glyphon::Buffer])> = vec![
+            (&overlay_dd_text, dd_bufs),
+        ];
 
         let screenshot = self.screenshot_pending.take();
         let took_screenshot = screenshot.is_some();
         match gpu.render_frame(
-            &self.tab_bar,
-            dropdown_ref,
-            &panel_draws,
-            &panel_buf_refs,
+            &scene,
+            &overlay,
+            &scene_text,
+            &overlay_text,
             &self.icon_manager,
             screenshot.as_deref(),
         ) {
@@ -191,7 +222,13 @@ impl App {
         }
     }
 
-    fn sync_workspace_state(&mut self) {
+    fn clamp_active_tab(&mut self) {
+        if self.active_tab >= self.tabs.len() {
+            self.active_tab = self.tabs.len().saturating_sub(1);
+        }
+    }
+
+    fn sync_tab_state(&mut self) {
         self.update_viewports();
         self.update_tab_bar();
         self.update_window_title();
@@ -199,54 +236,47 @@ impl App {
     }
 
     fn update_window_title(&self) {
-        if let Some(w) = &self.window {
-            if let Some(panel) = self.workspaces.get(self.active_workspace) {
-                w.set_title(panel.title());
-            }
+        if let Some(w) = &self.window
+            && let Some(panel) = self.tabs.get(self.active_tab)
+        {
+            w.set_title(panel.title());
         }
     }
 
-    fn add_workspace(&mut self, panel: TerminalPanel) {
-        self.workspaces.push(panel);
-        self.active_workspace = self.workspaces.len() - 1;
-        self.sync_workspace_state();
+    fn add_tab(&mut self, panel: TerminalPanel) {
+        self.tabs.push(panel);
+        self.active_tab = self.tabs.len() - 1;
+        self.sync_tab_state();
     }
 
-    fn new_workspace(&mut self, shell: Option<String>) {
+    fn new_tab(&mut self, shell: Option<String>) {
         let gpu = self.gpu.as_ref().unwrap();
         let panel = self.create_terminal_panel(gpu, shell, Vec::new());
-        self.add_workspace(panel);
+        self.add_tab(panel);
     }
 
-    fn new_workspace_ssh(&mut self, result: SshResult) {
+    fn new_tab_ssh(&mut self, result: SshResult) {
         let gpu = self.gpu.as_ref().unwrap();
         let (panel_id, vp, event_proxy) = self.new_panel_params(gpu);
-        let panel = TerminalPanel::new_ssh(
-            panel_id,
-            vp.cols,
-            vp.rows,
-            event_proxy,
-            result.to_ssh_config(),
-        );
-        self.add_workspace(panel);
+        let size = TermSize::new(vp.cols, vp.rows);
+        let panel = TerminalPanel::new_ssh(panel_id, size, event_proxy, result.to_ssh_config());
+        self.add_tab(panel);
     }
 
-    fn close_workspace(&mut self, idx: usize) {
-        if idx >= self.workspaces.len() {
+    fn close_tab(&mut self, idx: usize) {
+        if idx >= self.tabs.len() {
             return;
         }
-        self.workspaces.remove(idx);
+        self.tabs.remove(idx);
 
-        if self.workspaces.is_empty() {
+        if self.tabs.is_empty() {
             // Last tab closed — open a fresh one instead of exiting
-            self.new_workspace(None);
+            self.new_tab(None);
             return;
         }
 
-        if self.active_workspace >= self.workspaces.len() {
-            self.active_workspace = self.workspaces.len() - 1;
-        }
-        self.sync_workspace_state();
+        self.clamp_active_tab();
+        self.sync_tab_state();
     }
 
     fn open_new_tab_dropdown(&mut self) {
@@ -274,10 +304,12 @@ impl App {
         self.dropdown.open(
             items,
             anchor,
+            None,
             scale,
             surface_w,
             surface_h,
             &mut gpu.font_system,
+            &self.theme.dropdown,
         );
     }
 
@@ -285,13 +317,13 @@ impl App {
         if self.ssh_dialog_window.is_some() {
             return; // already open
         }
-        self.ssh_dialog_window = Some(SshDialogWindow::open(event_loop));
+        self.ssh_dialog_window = Some(SshDialogWindow::open(event_loop, &self.theme));
     }
 
     fn execute_menu_action(&mut self, action: &MenuAction, event_loop: &ActiveEventLoop) {
         match action {
             MenuAction::NewShell(shell_path) => {
-                self.new_workspace(Some(shell_path.clone()));
+                self.new_tab(Some(shell_path.clone()));
             }
             MenuAction::OpenSshDialog => {
                 self.open_ssh_dialog(event_loop);
@@ -311,12 +343,12 @@ impl ApplicationHandler<TerminalEvent> for App {
             .with_inner_size(winit::dpi::LogicalSize::new(800, 600));
 
         let window = Arc::new(event_loop.create_window(attrs).expect("create window"));
-        let gpu = GpuContext::new(window.clone(), self.colors.clone());
+        let gpu = GpuContext::new(window.clone(), self.theme.colors.clone());
 
         self.window = Some(window);
         self.gpu = Some(gpu);
 
-        self.new_workspace(None);
+        self.new_tab(None);
     }
 
     fn user_event(&mut self, event_loop: &ActiveEventLoop, event: TerminalEvent) {
@@ -325,31 +357,29 @@ impl ApplicationHandler<TerminalEvent> for App {
                 self.request_redraw();
             }
             TerminalEvent::Title(panel_id, title) => {
-                if let Some(panel) = self.workspaces.iter_mut().find(|p| p.id() == panel_id) {
+                if let Some(panel) = self.tabs.iter_mut().find(|p| p.id() == panel_id) {
                     panel.set_title(title);
                 }
-                self.sync_workspace_state();
+                self.sync_tab_state();
             }
             TerminalEvent::SshDialogClose(result) => {
                 self.ssh_dialog_window = None;
-                if let Some(result) = result {
-                    if !result.host.is_empty() {
-                        self.new_workspace_ssh(result);
-                    }
+                if let Some(result) = result
+                    && !result.host.is_empty()
+                {
+                    self.new_tab_ssh(result);
                 }
             }
             TerminalEvent::Exit(panel_id) => {
                 log::info!("terminal {panel_id:?} exited");
-                self.workspaces.retain(|p| p.id() != panel_id);
+                self.tabs.retain(|p| p.id() != panel_id);
 
-                if self.workspaces.is_empty() {
+                if self.tabs.is_empty() {
                     event_loop.exit();
                     return;
                 }
-                if self.active_workspace >= self.workspaces.len() {
-                    self.active_workspace = self.workspaces.len() - 1;
-                }
-                self.sync_workspace_state();
+                self.clamp_active_tab();
+                self.sync_tab_state();
             }
         }
     }
@@ -361,34 +391,34 @@ impl ApplicationHandler<TerminalEvent> for App {
         event: WindowEvent,
     ) {
         // Route events to SSH dialog window if it matches
-        if let Some(dialog_win) = &mut self.ssh_dialog_window {
-            if window_id == dialog_win.window_id() {
-                match dialog_win.handle_event(event) {
-                    Ok(None) => {} // continue
-                    Ok(Some(result)) => {
-                        // Defer close — dropping the window inside its own event
-                        // handler (e.g. key_down) crashes on macOS because the
-                        // NSView is deallocated while Objective-C still holds it.
-                        let _ = self
-                            .event_proxy_raw
-                            .send_event(TerminalEvent::SshDialogClose(Some(result)));
-                    }
-                    Err(()) => {
-                        // Defer cancel
-                        let _ = self
-                            .event_proxy_raw
-                            .send_event(TerminalEvent::SshDialogClose(None));
-                    }
+        if let Some(dialog_win) = &mut self.ssh_dialog_window
+            && window_id == dialog_win.window_id()
+        {
+            match dialog_win.handle_event(event) {
+                Ok(None) => {} // continue
+                Ok(Some(result)) => {
+                    // Defer close — dropping the window inside its own event
+                    // handler (e.g. key_down) crashes on macOS because the
+                    // NSView is deallocated while Objective-C still holds it.
+                    let _ = self
+                        .event_proxy_raw
+                        .send_event(TerminalEvent::SshDialogClose(Some(result)));
                 }
-                return;
+                Err(()) => {
+                    // Defer cancel
+                    let _ = self
+                        .event_proxy_raw
+                        .send_event(TerminalEvent::SshDialogClose(None));
+                }
             }
+            return;
         }
 
         // Ignore events for unknown windows (stale events from recently closed dialog)
-        if let Some(main_window) = &self.window {
-            if window_id != main_window.id() {
-                return;
-            }
+        if let Some(main_window) = &self.window
+            && window_id != main_window.id()
+        {
+            return;
         }
 
         match event {
@@ -401,7 +431,7 @@ impl ApplicationHandler<TerminalEvent> for App {
                 if let Some(gpu) = &mut self.gpu {
                     gpu.resize(new_size.width, new_size.height);
                 }
-                self.sync_workspace_state();
+                self.sync_tab_state();
             }
 
             WindowEvent::ScaleFactorChanged { scale_factor, .. } => {
@@ -409,7 +439,7 @@ impl ApplicationHandler<TerminalEvent> for App {
                 if let Some(gpu) = &mut self.gpu {
                     gpu.scale_factor = scale_factor as f32;
                 }
-                self.sync_workspace_state();
+                self.sync_tab_state();
             }
 
             WindowEvent::RedrawRequested => {
@@ -423,7 +453,7 @@ impl ApplicationHandler<TerminalEvent> for App {
 
                 // Dropdown hover takes priority when open
                 if self.dropdown.is_open() {
-                    let hover = self.dropdown.compute_hover(cx, cy);
+                    let hover = self.dropdown.hit_test(cx, cy);
                     if self.dropdown.set_hover(hover) {
                         self.request_redraw();
                     }
@@ -432,12 +462,12 @@ impl ApplicationHandler<TerminalEvent> for App {
 
                 // Update tab bar hover state
                 let scale = self.gpu.as_ref().map(|g| g.scale_factor).unwrap_or(1.0);
-                let pad = PANEL_AREA_PADDING * scale;
-                let tab_h = TabBar::height(scale);
+                let pad = self.theme.general.panel_area_padding * scale;
+                let tab_h = TabBar::height(&self.theme.tab_bar, scale);
                 let hover = if cy >= pad && cy < pad + tab_h {
-                    self.tab_bar.compute_hover(cx, cy)
+                    self.tab_bar.hit_test(cx, cy)
                 } else {
-                    TabBarHover::None
+                    TabBarElement::None
                 };
                 if self.tab_bar.set_hover(hover) {
                     self.request_redraw();
@@ -445,7 +475,7 @@ impl ApplicationHandler<TerminalEvent> for App {
             }
 
             WindowEvent::CursorLeft { .. } => {
-                if self.tab_bar.set_hover(TabBarHover::None) {
+                if self.tab_bar.set_hover(TabBarElement::None) {
                     self.request_redraw();
                 }
             }
@@ -459,46 +489,41 @@ impl ApplicationHandler<TerminalEvent> for App {
 
                 // Dropdown intercepts all clicks when open
                 if self.dropdown.is_open() {
-                    match self.dropdown.hit_test(cx, cy) {
-                        DropdownHit::Item(idx) => {
-                            let action = self.dropdown.action_for(idx).cloned();
-                            self.dropdown.close();
-                            if let Some(action) = action {
-                                self.execute_menu_action(&action, event_loop);
-                            }
+                    if let DropdownElement::Item(idx) = self.dropdown.hit_test(cx, cy) {
+                        let action = self.dropdown.action_for(idx).cloned();
+                        self.dropdown.close();
+                        if let Some(action) = action {
+                            self.execute_menu_action(&action, event_loop);
                         }
-                        DropdownHit::Outside => {
-                            self.dropdown.close();
-                        }
-                        DropdownHit::None => {}
+                    } else if self.dropdown.is_outside(cx, cy) {
+                        self.dropdown.close();
                     }
                     self.request_redraw();
                     return;
                 }
 
                 let scale = self.gpu.as_ref().map(|g| g.scale_factor).unwrap_or(1.0);
-                let pad = PANEL_AREA_PADDING * scale;
-                let tab_h = TabBar::height(scale);
+                let pad = self.theme.general.panel_area_padding * scale;
+                let tab_h = TabBar::height(&self.theme.tab_bar, scale);
 
                 if cy >= pad && cy < pad + tab_h {
                     match self.tab_bar.hit_test(cx, cy) {
-                        TabBarHit::Tab(idx) => {
-                            if idx < self.workspaces.len() {
-                                self.active_workspace = idx;
-                                self.tab_bar.set_active(idx);
-                                self.sync_workspace_state();
+                        TabBarElement::Tab(idx) => {
+                            if idx < self.tabs.len() {
+                                self.active_tab = idx;
+                                self.sync_tab_state();
                             }
                         }
-                        TabBarHit::CloseTab(idx) => {
-                            if idx < self.workspaces.len() {
-                                self.close_workspace(idx);
+                        TabBarElement::CloseButton(idx) => {
+                            if idx < self.tabs.len() {
+                                self.close_tab(idx);
                             }
                         }
-                        TabBarHit::NewTab => {
+                        TabBarElement::PlusButton => {
                             self.open_new_tab_dropdown();
                             self.request_redraw();
                         }
-                        TabBarHit::None => {}
+                        TabBarElement::None => {}
                     }
                 }
             }
@@ -509,26 +534,23 @@ impl ApplicationHandler<TerminalEvent> for App {
 
             WindowEvent::KeyboardInput { event, .. } => {
                 // Close dropdown on Escape
-                if self.dropdown.is_open() {
-                    if event.state == ElementState::Pressed {
-                        if let PhysicalKey::Code(KeyCode::Escape) = event.physical_key {
-                            self.dropdown.close();
-                            self.request_redraw();
-                            return;
-                        }
-                    }
+                if self.dropdown.is_open()
+                    && event.state == ElementState::Pressed
+                    && matches!(event.physical_key, PhysicalKey::Code(KeyCode::Escape))
+                {
+                    self.dropdown.close();
+                    self.request_redraw();
+                    return;
                 }
 
                 if event.state == ElementState::Pressed && self.super_pressed {
                     match event.physical_key {
                         PhysicalKey::Code(KeyCode::KeyV) => {
-                            if let Ok(mut clip) = arboard::Clipboard::new() {
-                                if let Ok(text) = clip.get_text() {
-                                    if let Some(panel) = self.workspaces.get(self.active_workspace)
-                                    {
-                                        panel.write_to_pty(text.into_bytes());
-                                    }
-                                }
+                            if let Ok(mut clip) = arboard::Clipboard::new()
+                                && let Ok(text) = clip.get_text()
+                                && let Some(panel) = self.tabs.get(self.active_tab)
+                            {
+                                panel.write_to_pty(text.into_bytes());
                             }
                             return;
                         }
@@ -543,7 +565,7 @@ impl ApplicationHandler<TerminalEvent> for App {
                     }
                 }
 
-                if let Some(panel) = self.workspaces.get_mut(self.active_workspace) {
+                if let Some(panel) = self.tabs.get_mut(self.active_tab) {
                     panel.handle_key(&event);
                 }
             }
@@ -554,10 +576,10 @@ impl ApplicationHandler<TerminalEvent> for App {
                     .as_ref()
                     .map(|g| g.cell.height as f64)
                     .unwrap_or(16.0);
-                if let Some(panel) = self.workspaces.get_mut(self.active_workspace) {
-                    if panel.handle_scroll(delta, cell_height) {
-                        self.request_redraw();
-                    }
+                if let Some(panel) = self.tabs.get_mut(self.active_tab)
+                    && panel.handle_scroll(delta, cell_height)
+                {
+                    self.request_redraw();
                 }
             }
 
@@ -573,8 +595,17 @@ fn detect_shells() -> Vec<(String, String)> {
 
     #[cfg(not(windows))]
     {
-        const COMMON_SHELLS: &[&str] = &["zsh", "bash", "fish", "nu", "pwsh"];
+        // (shell_name, candidate_paths) — checked in order, first existing path wins
+        const SHELLS: &[(&str, &[&str])] = &[
+            ("zsh", &["/bin/zsh", "/usr/bin/zsh", "/usr/local/bin/zsh"]),
+            ("bash", &["/bin/bash", "/usr/bin/bash", "/usr/local/bin/bash"]),
+            ("fish", &["/usr/bin/fish", "/usr/local/bin/fish"]),
+            ("nu", &["/usr/bin/nu", "/usr/local/bin/nu"]),
+            ("pwsh", &["/usr/bin/pwsh", "/usr/local/bin/pwsh"]),
+            ("sh", &["/bin/sh"]),
+        ];
 
+        // Prefer paths from /etc/shells if available
         if let Ok(contents) = std::fs::read_to_string("/etc/shells") {
             for line in contents.lines() {
                 let line = line.trim();
@@ -583,25 +614,26 @@ fn detect_shells() -> Vec<(String, String)> {
                 }
                 let path = std::path::Path::new(line);
                 let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
-                if !COMMON_SHELLS.contains(&name) {
-                    continue;
-                }
-                if path.exists() && seen.insert(name.to_string()) {
+                if SHELLS.iter().any(|(n, _)| *n == name)
+                    && path.exists()
+                    && seen.insert(name.to_string())
+                {
                     shells.push((name.to_string(), line.to_string()));
                 }
             }
         }
 
-        // Fallback: check well-known paths
+        // Fallback: check candidate paths directly
         if shells.is_empty() {
-            for path in &["/bin/zsh", "/bin/bash", "/bin/sh"] {
-                if std::path::Path::new(path).exists() {
-                    let name = std::path::Path::new(path)
-                        .file_name()
-                        .and_then(|n| n.to_str())
-                        .unwrap_or(path);
-                    if seen.insert(name.to_string()) {
+            for (name, candidates) in SHELLS {
+                if seen.contains(*name) {
+                    continue;
+                }
+                for path in *candidates {
+                    if std::path::Path::new(path).exists() {
+                        seen.insert(name.to_string());
                         shells.push((name.to_string(), path.to_string()));
+                        break;
                     }
                 }
             }
@@ -614,7 +646,7 @@ fn detect_shells() -> Vec<(String, String)> {
 
     #[cfg(windows)]
     {
-        // PowerShell 7+ (pwsh)
+        // PowerShell 7+ (pwsh) — found via PATH
         if let Ok(output) = std::process::Command::new("where").arg("pwsh").output() {
             if output.status.success() {
                 if let Some(path) = String::from_utf8_lossy(&output.stdout).lines().next() {
@@ -626,31 +658,31 @@ fn detect_shells() -> Vec<(String, String)> {
             }
         }
 
-        // Windows PowerShell (powershell.exe)
+        // SystemRoot-based shells
         if let Some(sysroot) = std::env::var_os("SystemRoot") {
-            let ps_path = std::path::Path::new(&sysroot)
-                .join("System32")
-                .join("WindowsPowerShell")
-                .join("v1.0")
-                .join("powershell.exe");
-            if ps_path.exists() {
-                if let Some(p) = ps_path.to_str() {
-                    if seen.insert("powershell".to_string()) {
-                        shells.push(("Windows PowerShell".to_string(), p.to_string()));
-                    }
-                }
-            }
-        }
-
-        // cmd.exe
-        if let Some(sysroot) = std::env::var_os("SystemRoot") {
-            let cmd_path = std::path::Path::new(&sysroot)
-                .join("System32")
-                .join("cmd.exe");
-            if cmd_path.exists() {
-                if let Some(p) = cmd_path.to_str() {
-                    if seen.insert("cmd".to_string()) {
-                        shells.push(("Command Prompt".to_string(), p.to_string()));
+            let sysroot = std::path::Path::new(&sysroot);
+            let candidates: &[(&str, &str, std::path::PathBuf)] = &[
+                (
+                    "powershell",
+                    "Windows PowerShell",
+                    sysroot
+                        .join("System32")
+                        .join("WindowsPowerShell")
+                        .join("v1.0")
+                        .join("powershell.exe"),
+                ),
+                (
+                    "cmd",
+                    "Command Prompt",
+                    sysroot.join("System32").join("cmd.exe"),
+                ),
+            ];
+            for (key, label, path) in candidates {
+                if path.exists() {
+                    if let Some(p) = path.to_str() {
+                        if seen.insert(key.to_string()) {
+                            shells.push((label.to_string(), p.to_string()));
+                        }
                     }
                 }
             }
