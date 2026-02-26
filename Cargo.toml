@@ -24,6 +24,12 @@ dirs = "6"
 async-trait = "0.1"
 rfd = "0.15"
 
+[target.'cfg(target_os = "macos")'.dependencies]
+objc = "0.2"
+
+[target.'cfg(target_os = "windows")'.dependencies]
+windows = { version = "0.61", features = ["Win32_UI_WindowsAndMessaging"] }
+
 [profile.release]
 strip = true
 lto = true

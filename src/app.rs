@@ -429,6 +429,9 @@ impl ApplicationHandler<TerminalEvent> for App {
         self.window = Some(window);
         self.gpu = Some(gpu);
 
+        // Set up native menu bar after winit initialization
+        crate::menu::setup_native_menu();
+
         self.new_tab(None);
     }
 

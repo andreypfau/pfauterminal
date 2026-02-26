@@ -6,6 +6,7 @@ mod font;
 mod gpu;
 mod icons;
 mod layout;
+mod menu;
 mod saved_sessions;
 mod ssh;
 mod ssh_dialog;
