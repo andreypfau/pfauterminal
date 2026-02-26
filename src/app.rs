@@ -32,6 +32,8 @@ pub struct App {
     saved_sessions: SavedSessions,
     cursor_position: (f32, f32),
     super_pressed: bool,
+    ctrl_pressed: bool,
+    alt_pressed: bool,
     screenshot_pending: Option<String>,
 }
 
@@ -53,6 +55,8 @@ impl App {
             saved_sessions,
             cursor_position: (0.0, 0.0),
             super_pressed: false,
+            ctrl_pressed: false,
+            alt_pressed: false,
             screenshot_pending: std::env::var("SCREENSHOT").ok().filter(|s| !s.is_empty()),
         }
     }
@@ -613,6 +617,8 @@ impl ApplicationHandler<TerminalEvent> for App {
 
             WindowEvent::ModifiersChanged(new_modifiers) => {
                 self.super_pressed = new_modifiers.state().super_key();
+                self.ctrl_pressed = new_modifiers.state().control_key();
+                self.alt_pressed = new_modifiers.state().alt_key();
             }
 
             WindowEvent::KeyboardInput { event, .. } => {
@@ -649,7 +655,7 @@ impl ApplicationHandler<TerminalEvent> for App {
                 }
 
                 if let Some(panel) = self.tabs.get_mut(self.active_tab) {
-                    panel.handle_key(&event);
+                    panel.handle_key(&event, self.ctrl_pressed, self.alt_pressed);
                 }
             }
 

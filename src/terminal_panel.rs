@@ -324,7 +324,7 @@ impl TerminalPanel {
         self.viewport = Some(viewport);
     }
 
-    pub fn handle_key(&mut self, event: &KeyEvent) -> bool {
+    pub fn handle_key(&mut self, event: &KeyEvent, ctrl: bool, alt: bool) -> bool {
         if event.state != ElementState::Pressed {
             return false;
         }
@@ -333,6 +333,44 @@ impl TerminalPanel {
         let app_cursor = mode.contains(TermMode::APP_CURSOR);
         // SS3 prefix for application cursor mode, CSI for normal mode
         let cursor_prefix: &[u8] = if app_cursor { b"\x1bO" } else { b"\x1b[" };
+
+        // Handle Ctrl+key → control characters (0x00–0x1F)
+        if ctrl {
+            let ctrl_byte = match event.logical_key.as_ref() {
+                Key::Character(c) if c.len() == 1 => {
+                    let ch = c.chars().next().unwrap();
+                    match ch {
+                        'a'..='z' => Some(ch as u8 - b'a' + 1),
+                        'A'..='Z' => Some(ch as u8 - b'A' + 1),
+                        '@' | ' ' => Some(0x00),
+                        '[' => Some(0x1B),
+                        '\\' => Some(0x1C),
+                        ']' => Some(0x1D),
+                        '^' | '~' => Some(0x1E),
+                        '_' | '/' => Some(0x1F),
+                        _ => None,
+                    }
+                }
+                _ => None,
+            };
+            if let Some(b) = ctrl_byte {
+                let data = if alt { vec![0x1B, b] } else { vec![b] };
+                self.backend.send_input(Cow::Owned(data));
+                return true;
+            }
+        }
+
+        // Handle Alt+key → ESC prefix + key
+        if alt {
+            if let Some(t) = &event.text
+                && !t.is_empty()
+            {
+                let mut data = vec![0x1B];
+                data.extend_from_slice(t.as_bytes());
+                self.backend.send_input(Cow::Owned(data));
+                return true;
+            }
+        }
 
         let bytes = match event.logical_key.as_ref() {
             Key::Named(NamedKey::Enter) => Some(b"\r".to_vec()),
@@ -361,18 +399,6 @@ impl TerminalPanel {
             Key::Named(NamedKey::F10) => Some(b"\x1b[21~".to_vec()),
             Key::Named(NamedKey::F11) => Some(b"\x1b[23~".to_vec()),
             Key::Named(NamedKey::F12) => Some(b"\x1b[24~".to_vec()),
-            Key::Character(c) => {
-                if c.len() == 1 {
-                    let ch = c.chars().next().unwrap();
-                    if ch.is_ascii_lowercase() && event.text.is_none() {
-                        Some(vec![ch as u8 - b'a' + 1])
-                    } else {
-                        None
-                    }
-                } else {
-                    None
-                }
-            }
             _ => None,
         };
 
