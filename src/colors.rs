@@ -124,6 +124,9 @@ pub struct ColorScheme {
     pub tab_hover_stroke: HexColor,
     pub tab_separator: HexColor,
 
+    // Selection
+    pub selection: HexColor,
+
     // Panel colors
     pub panel_stroke: HexColor,
 
@@ -173,6 +176,7 @@ impl Default for ColorScheme {
             tab_hover_bg: HexColor::from_u32(0x393B40FF),
             tab_hover_stroke: HexColor::from_u32(0x4E5157FF),
             tab_separator: HexColor::from_u32(0x393B40FF),
+            selection: HexColor::from_u32(0x264F78FF),
             panel_stroke: HexColor::from_u32(0x3A3A3AFF),
             dropdown_bg: HexColor::from_u32(0x2B2D30FF),
             dropdown_border: HexColor::from_u32(0x43454AFF),

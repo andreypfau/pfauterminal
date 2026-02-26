@@ -6,15 +6,17 @@ use std::sync::{Arc, Mutex};
 use alacritty_terminal::event::{Event, EventListener, WindowSize};
 use alacritty_terminal::event_loop::{EventLoop, EventLoopSender, Msg};
 use alacritty_terminal::grid::Dimensions;
+use alacritty_terminal::index::{Column, Line, Point, Side};
+use alacritty_terminal::selection::{Selection, SelectionType};
 use alacritty_terminal::sync::FairMutex;
-use alacritty_terminal::term::TermMode;
+use alacritty_terminal::term::{self, TermMode};
 use alacritty_terminal::tty;
 use alacritty_terminal::Term;
 use glyphon::{Buffer, Color as GlyphonColor, FontSystem, Shaping};
 use tokio::sync::mpsc;
 use winit::event::{ElementState, KeyEvent, MouseScrollDelta};
 use winit::event_loop::EventLoopProxy;
-use winit::keyboard::{Key, NamedKey};
+use winit::keyboard::{Key, KeyCode, NamedKey, PhysicalKey};
 
 use crate::colors::ColorScheme;
 use crate::draw::DrawContext;
@@ -193,6 +195,11 @@ pub struct TerminalPanel {
     scroll_pixel_offset: f32,
     /// Raw pixel accumulator not yet committed as whole lines (physical pixels).
     scroll_accumulator: f64,
+    /// Our own copy of the selection, kept in sync manually.
+    /// alacritty_terminal's internal processing can clear `term.selection`
+    /// at any time (line clears, scrolling, etc.), so we maintain our own
+    /// copy and re-apply it before each use.
+    active_selection: Option<Selection>,
 }
 
 impl TerminalPanel {
@@ -248,6 +255,7 @@ impl TerminalPanel {
             title: String::from("Terminal"),
             scroll_pixel_offset: 0.0,
             scroll_accumulator: 0.0,
+            active_selection: None,
         }
     }
 
@@ -271,6 +279,7 @@ impl TerminalPanel {
             title: String::from("SSH"),
             scroll_pixel_offset: 0.0,
             scroll_accumulator: 0.0,
+            active_selection: None,
         }
     }
 
@@ -337,8 +346,28 @@ impl TerminalPanel {
             return false;
         }
 
+        // Don't clear selection for modifier-only keys (Cmd, Ctrl, Alt, Shift).
+        let is_modifier = matches!(
+            event.physical_key,
+            PhysicalKey::Code(
+                KeyCode::SuperLeft
+                    | KeyCode::SuperRight
+                    | KeyCode::ControlLeft
+                    | KeyCode::ControlRight
+                    | KeyCode::AltLeft
+                    | KeyCode::AltRight
+                    | KeyCode::ShiftLeft
+                    | KeyCode::ShiftRight
+            )
+        );
+        if is_modifier {
+            return false;
+        }
+
+        self.active_selection = None;
         {
             let mut term = self.term.lock();
+            term.selection = None;
             if term.grid().display_offset() != 0 {
                 term.scroll_display(alacritty_terminal::grid::Scroll::Bottom);
             }
@@ -483,6 +512,76 @@ impl TerminalPanel {
         self.scroll_pixel_offset != 0.0
     }
 
+    /// Map physical-pixel coordinates to a grid Point + Side.
+    /// Returns None if the position is outside the content area.
+    pub fn pixel_to_point(&self, px: f32, py: f32) -> Option<(Point, Side)> {
+        let vp = self.viewport.as_ref()?;
+        let cr = &vp.content_rect;
+
+        if px < cr.x || px >= cr.x + cr.width || py < cr.y || py >= cr.y + cr.height {
+            return None;
+        }
+
+        let pcw = cr.width / vp.cols as f32;
+        let pch = cr.height / vp.rows as f32;
+
+        let rel_x = px - cr.x;
+        let rel_y = py - cr.y - self.scroll_pixel_offset;
+
+        let col = (rel_x / pcw).floor().clamp(0.0, (vp.cols - 1) as f32) as usize;
+        let row = (rel_y / pch).floor().clamp(0.0, (vp.rows - 1) as f32) as usize;
+
+        let side = if (rel_x - col as f32 * pcw) < pcw / 2.0 {
+            Side::Left
+        } else {
+            Side::Right
+        };
+
+        let term = self.term.lock();
+        let display_offset = term.grid().display_offset();
+        let point = term::viewport_to_point(display_offset, Point::new(row, Column(col)));
+        Some((point, side))
+    }
+
+    /// Returns true if the pixel position is inside the terminal content area.
+    pub fn is_in_content_area(&self, px: f32, py: f32) -> bool {
+        self.viewport.as_ref().is_some_and(|vp| {
+            let cr = &vp.content_rect;
+            px >= cr.x && px < cr.x + cr.width && py >= cr.y && py < cr.y + cr.height
+        })
+    }
+
+    pub fn start_selection(&mut self, ty: SelectionType, point: Point, side: Side) {
+        let sel = Selection::new(ty, point, side);
+        self.active_selection = Some(sel.clone());
+        self.term.lock().selection = Some(sel);
+    }
+
+    pub fn update_selection(&mut self, point: Point, side: Side) {
+        if let Some(ref mut sel) = self.active_selection {
+            sel.update(point, side);
+            self.term.lock().selection = Some(sel.clone());
+        }
+    }
+
+    pub fn clear_selection(&mut self) {
+        self.active_selection = None;
+        self.term.lock().selection = None;
+    }
+
+    pub fn selection_to_string(&self) -> Option<String> {
+        // Re-apply our selection since terminal output may have cleared it.
+        let mut term = self.term.lock();
+        if let Some(sel) = &self.active_selection {
+            term.selection = Some(sel.clone());
+        }
+        term.selection_to_string()
+    }
+
+    pub fn has_selection(&self) -> bool {
+        self.active_selection.is_some()
+    }
+
     pub fn draw(
         &mut self,
         ctx: &mut DrawContext,
@@ -529,10 +628,16 @@ impl TerminalPanel {
         {
             use alacritty_terminal::term::cell::Flags;
 
-            let term = self.term.lock();
+            let mut term = self.term.lock();
+            // Re-apply our selection — terminal output may have cleared it.
+            if let Some(sel) = &self.active_selection {
+                term.selection = Some(sel.clone());
+            }
             let content = term.renderable_content();
             let display_offset = content.display_offset;
             let cursor_point = content.cursor.point;
+            let selection_range = content.selection;
+            let selection_color = colors.selection.to_linear_f32();
 
             // display_iter provides screen_lines+1 rows: one extra above the
             // viewport (viewport_line == -1). We render it when pixel_offset > 0
@@ -555,9 +660,20 @@ impl TerminalPanel {
                     (cell.fg, cell.bg)
                 };
 
+                let selected = selection_range.is_some_and(|r| r.contains(indexed.point));
                 let cy = content_y + viewport_line as f32 * pch + pixel_offset;
 
-                if !colors.is_default_bg(bg_color) {
+                if selected {
+                    let quad = Rect {
+                        x: content_x + col as f32 * pcw,
+                        y: cy,
+                        width: pcw,
+                        height: pch,
+                    };
+                    if let Some(clipped) = quad.clip_y(content_y, content_bottom) {
+                        ctx.flat_quad(clipped, selection_color);
+                    }
+                } else if !colors.is_default_bg(bg_color) {
                     let quad = Rect {
                         x: content_x + col as f32 * pcw,
                         y: cy,
@@ -640,15 +756,13 @@ impl TerminalPanel {
             // the gap at the bottom by reading one row past the viewport
             // from the grid directly (display_iter doesn't include it).
             if pixel_offset < -0.5 && display_offset > 0 {
-                use alacritty_terminal::index::{Column as GridColumn, Line as GridLine};
-
                 let grid = term.grid();
                 let grid_line = rows as i32 - display_offset as i32;
                 let y_base = content_y + rows as f32 * pch + pixel_offset;
-                let row_data = &grid[GridLine(grid_line)];
+                let row_data = &grid[Line(grid_line)];
 
                 for col_idx in 0..cols {
-                    let cell = &row_data[GridColumn(col_idx)];
+                    let cell = &row_data[Column(col_idx)];
                     let flags = cell.flags;
 
                     let (fg_color, bg_color) = if flags.contains(Flags::INVERSE) {
@@ -657,7 +771,20 @@ impl TerminalPanel {
                         (cell.fg, cell.bg)
                     };
 
-                    if !colors.is_default_bg(bg_color) {
+                    let extra_point = Point::new(Line(grid_line), Column(col_idx));
+                    let selected = selection_range.is_some_and(|r| r.contains(extra_point));
+
+                    if selected {
+                        let quad = Rect {
+                            x: content_x + col_idx as f32 * pcw,
+                            y: y_base,
+                            width: pcw,
+                            height: pch,
+                        };
+                        if let Some(clipped) = quad.clip_y(content_y, content_bottom) {
+                            ctx.flat_quad(clipped, selection_color);
+                        }
+                    } else if !colors.is_default_bg(bg_color) {
                         let quad = Rect {
                             x: content_x + col_idx as f32 * pcw,
                             y: y_base,

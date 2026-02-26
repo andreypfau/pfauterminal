@@ -1,10 +1,12 @@
 use std::sync::Arc;
+use std::time::Instant;
 
+use alacritty_terminal::selection::SelectionType;
 use winit::application::ApplicationHandler;
 use winit::event::{ElementState, MouseButton, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, EventLoopProxy};
 use winit::keyboard::{KeyCode, PhysicalKey};
-use winit::window::{Window, WindowAttributes, WindowId};
+use winit::window::{CursorIcon, Window, WindowAttributes, WindowId};
 
 use crate::draw::DrawContext;
 use crate::dropdown::{DropdownElement, DropdownMenu, MenuAction, MenuEntry};
@@ -34,6 +36,9 @@ pub struct App {
     super_pressed: bool,
     ctrl_pressed: bool,
     alt_pressed: bool,
+    mouse_left_pressed: bool,
+    last_click_time: Instant,
+    click_count: u8,
     screenshot_pending: Option<String>,
 }
 
@@ -57,6 +62,9 @@ impl App {
             super_pressed: false,
             ctrl_pressed: false,
             alt_pressed: false,
+            mouse_left_pressed: false,
+            last_click_time: Instant::now(),
+            click_count: 0,
             screenshot_pending: std::env::var("SCREENSHOT").ok().filter(|s| !s.is_empty()),
         }
     }
@@ -534,6 +542,16 @@ impl ApplicationHandler<TerminalEvent> for App {
                     return;
                 }
 
+                // Drag selection
+                if self.mouse_left_pressed {
+                    if let Some(panel) = self.tabs.get_mut(self.active_tab) {
+                        if let Some((point, side)) = panel.pixel_to_point(cx, cy) {
+                            panel.update_selection(point, side);
+                            self.request_redraw();
+                        }
+                    }
+                }
+
                 // Update tab bar hover state
                 let scale = self.gpu.as_ref().map(|g| g.scale_factor).unwrap_or(1.0);
                 let pad = self.theme.general.panel_area_padding * scale;
@@ -545,6 +563,19 @@ impl ApplicationHandler<TerminalEvent> for App {
                 };
                 if self.tab_bar.set_hover(hover) {
                     self.request_redraw();
+                }
+
+                // Set cursor icon: text (I-beam) over terminal content, default elsewhere
+                if let Some(window) = &self.window {
+                    let in_content = self
+                        .tabs
+                        .get(self.active_tab)
+                        .is_some_and(|p| p.is_in_content_area(cx, cy));
+                    window.set_cursor(if in_content {
+                        CursorIcon::Text
+                    } else {
+                        CursorIcon::Default
+                    });
                 }
             }
 
@@ -612,7 +643,35 @@ impl ApplicationHandler<TerminalEvent> for App {
                         }
                         TabBarElement::None => {}
                     }
+                } else if let Some(panel) = self.tabs.get_mut(self.active_tab) {
+                    if let Some((point, side)) = panel.pixel_to_point(cx, cy) {
+                        let now = Instant::now();
+                        if now.duration_since(self.last_click_time).as_millis() < 400 {
+                            self.click_count = (self.click_count + 1).min(3);
+                        } else {
+                            self.click_count = 1;
+                        }
+                        self.last_click_time = now;
+
+                        let ty = match self.click_count {
+                            2 => SelectionType::Semantic,
+                            3 => SelectionType::Lines,
+                            _ => SelectionType::Simple,
+                        };
+
+                        panel.start_selection(ty, point, side);
+                        self.mouse_left_pressed = true;
+                        self.request_redraw();
+                    }
                 }
+            }
+
+            WindowEvent::MouseInput {
+                state: ElementState::Released,
+                button: MouseButton::Left,
+                ..
+            } => {
+                self.mouse_left_pressed = false;
             }
 
             WindowEvent::ModifiersChanged(new_modifiers) => {
@@ -634,6 +693,18 @@ impl ApplicationHandler<TerminalEvent> for App {
 
                 if event.state == ElementState::Pressed && self.super_pressed {
                     match event.physical_key {
+                        PhysicalKey::Code(KeyCode::KeyC) => {
+                            if let Some(panel) = self.tabs.get_mut(self.active_tab) {
+                                if let Some(text) = panel.selection_to_string() {
+                                    if let Ok(mut clip) = arboard::Clipboard::new() {
+                                        let _ = clip.set_text(text);
+                                    }
+                                    panel.clear_selection();
+                                    self.request_redraw();
+                                }
+                            }
+                            return;
+                        }
                         PhysicalKey::Code(KeyCode::KeyV) => {
                             if let Ok(mut clip) = arboard::Clipboard::new()
                                 && let Ok(text) = clip.get_text()
@@ -652,6 +723,8 @@ impl ApplicationHandler<TerminalEvent> for App {
                         }
                         _ => {}
                     }
+                    // Don't pass Cmd+key combos to the terminal
+                    return;
                 }
 
                 if let Some(panel) = self.tabs.get_mut(self.active_tab) {
