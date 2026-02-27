@@ -2,6 +2,7 @@ use std::borrow::Cow;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
+use std::time::Instant;
 
 use alacritty_terminal::event::{Event, EventListener, WindowSize};
 use alacritty_terminal::event_loop::{EventLoop, EventLoopSender, Msg};
@@ -10,6 +11,7 @@ use alacritty_terminal::index::{Column, Line, Point, Side};
 use alacritty_terminal::selection::{Selection, SelectionType};
 use alacritty_terminal::sync::FairMutex;
 use alacritty_terminal::term::{self, TermMode};
+use alacritty_terminal::vte::ansi::CursorShape;
 use alacritty_terminal::tty;
 use alacritty_terminal::Term;
 use glyphon::{Buffer, Color as GlyphonColor, FontSystem, Shaping};
@@ -21,7 +23,7 @@ use winit::keyboard::{Key, KeyCode, NamedKey, PhysicalKey};
 use crate::colors::ColorScheme;
 use crate::draw::DrawContext;
 use crate::font::{self, CellMetrics};
-use crate::layout::{Rect, TextSpec};
+use crate::layout::{CursorData, Rect, TextSpec};
 use crate::ssh::{SshConfig, SshMsg};
 use crate::theme::PanelTheme;
 
@@ -174,6 +176,109 @@ impl EventListener for EventProxy {
     }
 }
 
+// --- Cursor animation ---
+
+const CURSOR_SPEED_TYPING: f32 = 50.0;
+const CURSOR_SPEED_GLIDE: f32 = 12.0;
+const CURSOR_RADIUS: f32 = 2.0;
+
+struct CursorAnimation {
+    prev_x: f32,
+    prev_y: f32,
+    target_x: f32,
+    target_y: f32,
+    prev_w: f32,
+    prev_h: f32,
+    target_w: f32,
+    target_h: f32,
+    move_time: Instant,
+    last_input_time: Instant,
+    move_speed: f32,
+    first_frame: bool,
+}
+
+impl CursorAnimation {
+    fn new() -> Self {
+        let now = Instant::now();
+        Self {
+            prev_x: 0.0,
+            prev_y: 0.0,
+            target_x: 0.0,
+            target_y: 0.0,
+            prev_w: 0.0,
+            prev_h: 0.0,
+            target_w: 0.0,
+            target_h: 0.0,
+            move_time: now,
+            last_input_time: now,
+            move_speed: CURSOR_SPEED_GLIDE,
+            first_frame: true,
+        }
+    }
+
+    fn set_target(&mut self, x: f32, y: f32, w: f32, h: f32) {
+        if self.first_frame {
+            self.prev_x = x;
+            self.prev_y = y;
+            self.prev_w = w;
+            self.prev_h = h;
+            self.target_x = x;
+            self.target_y = y;
+            self.target_w = w;
+            self.target_h = h;
+            self.move_time = Instant::now();
+            self.first_frame = false;
+            return;
+        }
+
+        let x_changed = (x - self.target_x).abs() > 0.5;
+        let y_changed = (y - self.target_y).abs() > 0.5;
+        let size_changed = (w - self.target_w).abs() > 0.5 || (h - self.target_h).abs() > 0.5;
+        if x_changed || y_changed || size_changed {
+            if y_changed || size_changed {
+                // Vertical movement or shape change — snap instantly
+                self.prev_x = x;
+                self.prev_y = y;
+                self.prev_w = w;
+                self.prev_h = h;
+            } else {
+                // Horizontal only — animate from current interpolated position
+                let elapsed = self.move_time.elapsed().as_secs_f32();
+                let factor = (-self.move_speed * elapsed).exp();
+                self.prev_x = self.target_x + (self.prev_x - self.target_x) * factor;
+                self.prev_y = y;
+                self.prev_w = w;
+                self.prev_h = h;
+            }
+            self.target_x = x;
+            self.target_y = y;
+            self.target_w = w;
+            self.target_h = h;
+            self.move_time = Instant::now();
+
+            // Pick speed for this new segment: typing = fast snap, otherwise glide
+            let input_age = self.last_input_time.elapsed().as_secs_f32();
+            self.move_speed = if input_age < 0.05 {
+                CURSOR_SPEED_TYPING
+            } else {
+                CURSOR_SPEED_GLIDE
+            };
+        }
+    }
+
+    fn on_input(&mut self) {
+        self.last_input_time = Instant::now();
+    }
+
+    fn snap(&mut self) {
+        self.prev_x = self.target_x;
+        self.prev_y = self.target_y;
+        self.prev_w = self.target_w;
+        self.prev_h = self.target_h;
+        self.move_time = Instant::now();
+    }
+}
+
 // --- Terminal panel ---
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -200,6 +305,9 @@ pub struct TerminalPanel {
     /// at any time (line clears, scrolling, etc.), so we maintain our own
     /// copy and re-apply it before each use.
     active_selection: Option<Selection>,
+    cursor_anim: CursorAnimation,
+    /// Whether the cursor was visible in the last draw call.
+    cursor_visible: bool,
 }
 
 impl TerminalPanel {
@@ -256,6 +364,8 @@ impl TerminalPanel {
             scroll_pixel_offset: 0.0,
             scroll_accumulator: 0.0,
             active_selection: None,
+            cursor_anim: CursorAnimation::new(),
+            cursor_visible: false,
         }
     }
 
@@ -280,6 +390,8 @@ impl TerminalPanel {
             scroll_pixel_offset: 0.0,
             scroll_accumulator: 0.0,
             active_selection: None,
+            cursor_anim: CursorAnimation::new(),
+            cursor_visible: false,
         }
     }
 
@@ -336,9 +448,20 @@ impl TerminalPanel {
             self.term.lock().resize(size);
             self.char_buffers.clear();
             self.char_key_map.clear();
+            self.cursor_anim.snap();
         }
 
         self.viewport = Some(viewport);
+    }
+
+    /// Notify the cursor animation that user input occurred (resets blink).
+    pub fn notify_input(&mut self) {
+        self.cursor_anim.on_input();
+    }
+
+    /// Returns true if the cursor was visible in the last draw call.
+    pub fn cursor_visible(&self) -> bool {
+        self.cursor_visible
     }
 
     pub fn handle_key(&mut self, event: &KeyEvent, ctrl: bool, alt: bool) -> bool {
@@ -364,6 +487,7 @@ impl TerminalPanel {
             return false;
         }
 
+        self.cursor_anim.on_input();
         self.active_selection = None;
         {
             let mut term = self.term.lock();
@@ -636,6 +760,7 @@ impl TerminalPanel {
             let content = term.renderable_content();
             let display_offset = content.display_offset;
             let cursor_point = content.cursor.point;
+            let cursor_shape = content.cursor.shape;
             let selection_range = content.selection;
             let selection_color = colors.selection.to_linear_f32();
 
@@ -734,22 +859,57 @@ impl TerminalPanel {
                 });
             }
 
-            // Cursor quad
-            let cur_viewport_line = cursor_point.line.0 + display_offset as i32;
-            let cur_col = cursor_point.column.0;
-            if cur_viewport_line >= 0 {
-                let cur_row = cur_viewport_line as usize;
-                if cur_row < rows && cur_col < cols {
-                    let cursor_rect = Rect {
-                        x: content_x + cur_col as f32 * pcw,
-                        y: content_y + cur_row as f32 * pch + pixel_offset,
-                        width: pcw,
-                        height: pch,
-                    };
-                    if let Some(clipped) = cursor_rect.clip_y(content_y, content_bottom) {
-                        ctx.flat_quad(clipped, colors.cursor.to_linear_f32());
+            // Animated cursor (hidden when TUI apps send ESC[?25l)
+            if cursor_shape != CursorShape::Hidden {
+                let cur_viewport_line = cursor_point.line.0 + display_offset as i32;
+                let cur_col = cursor_point.column.0;
+                if cur_viewport_line >= 0 {
+                    let cur_row = cur_viewport_line as usize;
+                    if cur_row < rows && cur_col < cols {
+                        let cx = content_x + cur_col as f32 * pcw;
+                        let cy = content_y + cur_row as f32 * pch + pixel_offset;
+
+                        let (tw, th) = match cursor_shape {
+                            CursorShape::Beam => (2.0 * scale, pch),
+                            CursorShape::Underline => (pcw, 2.0 * scale),
+                            _ => (pcw, pch), // Block and default
+                        };
+
+                        let ty = match cursor_shape {
+                            CursorShape::Underline => cy + pch - th,
+                            _ => cy,
+                        };
+
+                        self.cursor_anim.set_target(cx, ty, tw, th);
+
+                        let anim = &self.cursor_anim;
+                        ctx.cursor = Some(CursorData {
+                            prev_rect: Rect {
+                                x: anim.prev_x,
+                                y: anim.prev_y,
+                                width: anim.prev_w,
+                                height: anim.prev_h,
+                            },
+                            target_rect: Rect {
+                                x: anim.target_x,
+                                y: anim.target_y,
+                                width: anim.target_w,
+                                height: anim.target_h,
+                            },
+                            color: colors.cursor.to_linear_f32(),
+                            radius: CURSOR_RADIUS * scale,
+                            time_since_move: anim.move_time.elapsed().as_secs_f32(),
+                            time_since_input: anim.last_input_time.elapsed().as_secs_f32(),
+                            move_speed: anim.move_speed,
+                            clip_top: content_y,
+                            clip_bottom: content_bottom,
+                        });
+                        self.cursor_visible = true;
                     }
                 }
+            } else {
+                self.cursor_anim.snap();
+                self.cursor_visible = false;
             }
 
             // Extra bottom row: when content shifts up (scroll down), fill

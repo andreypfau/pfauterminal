@@ -10,7 +10,7 @@ use crate::colors::ColorScheme;
 use crate::draw::DrawContext;
 use crate::font::{self, CellMetrics};
 use crate::icons::IconManager;
-use crate::layout::{BgQuad, Rect, RoundedQuad, TextSpec};
+use crate::layout::{BgQuad, CursorData, Rect, RoundedQuad, TextSpec};
 
 /// Max rounded rects: panel islands + tab bar elements (borders, backgrounds)
 const MAX_ROUNDED_RECTS: usize = 64;
@@ -329,6 +329,138 @@ impl RoundedRectPipeline {
 }
 
 // ---------------------------------------------------------------------------
+// CursorPipeline
+// ---------------------------------------------------------------------------
+
+/// Uniform data for the cursor shader.
+#[repr(C)]
+#[derive(Copy, Clone, bytemuck::Pod, bytemuck::Zeroable)]
+struct CursorUniforms {
+    prev_bounds: [f32; 4],   // [x0, y0, x1, y1]
+    target_bounds: [f32; 4], // [x0, y0, x1, y1]
+    color: [f32; 4],
+    params: [f32; 4], // [radius, time_since_move, time_since_input, move_speed]
+    clip: [f32; 4],   // [clip_top, clip_bottom, 0, 0]
+}
+
+impl CursorUniforms {
+    fn from_cursor_data(data: &CursorData) -> Self {
+        let pr = &data.prev_rect;
+        let tr = &data.target_rect;
+        Self {
+            prev_bounds: [pr.x, pr.y, pr.x + pr.width, pr.y + pr.height],
+            target_bounds: [tr.x, tr.y, tr.x + tr.width, tr.y + tr.height],
+            color: data.color,
+            params: [
+                data.radius,
+                data.time_since_move,
+                data.time_since_input,
+                data.move_speed,
+            ],
+            clip: [data.clip_top, data.clip_bottom, 0.0, 0.0],
+        }
+    }
+}
+
+struct CursorPipeline {
+    pipeline: RenderPipeline,
+    uniform_buffer: wgpu::Buffer,
+    bind_group: BindGroup,
+}
+
+impl CursorPipeline {
+    fn new(device: &Device, render_format: TextureFormat) -> Self {
+        let uniform_buffer = device.create_buffer(&BufferDescriptor {
+            label: Some("cursor uniforms"),
+            size: std::mem::size_of::<CursorUniforms>() as u64,
+            usage: BufferUsages::UNIFORM | BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+
+        let bind_group_layout = device.create_bind_group_layout(&BindGroupLayoutDescriptor {
+            label: Some("cursor bind group layout"),
+            entries: &[BindGroupLayoutEntry {
+                binding: 0,
+                visibility: ShaderStages::VERTEX | ShaderStages::FRAGMENT,
+                ty: BindingType::Buffer {
+                    ty: BufferBindingType::Uniform,
+                    has_dynamic_offset: false,
+                    min_binding_size: wgpu::BufferSize::new(
+                        std::mem::size_of::<CursorUniforms>() as u64
+                    ),
+                },
+                count: None,
+            }],
+        });
+
+        let bind_group = device.create_bind_group(&BindGroupDescriptor {
+            label: Some("cursor bind group"),
+            layout: &bind_group_layout,
+            entries: &[BindGroupEntry {
+                binding: 0,
+                resource: uniform_buffer.as_entire_binding(),
+            }],
+        });
+
+        let shader = device.create_shader_module(ShaderModuleDescriptor {
+            label: Some("cursor shader"),
+            source: ShaderSource::Wgsl(CURSOR_SHADER.into()),
+        });
+
+        let pipeline_layout = device.create_pipeline_layout(&PipelineLayoutDescriptor {
+            label: Some("cursor pipeline layout"),
+            bind_group_layouts: &[&bind_group_layout],
+            push_constant_ranges: &[],
+        });
+
+        let pipeline = device.create_render_pipeline(&RenderPipelineDescriptor {
+            label: Some("cursor pipeline"),
+            layout: Some(&pipeline_layout),
+            vertex: VertexState {
+                module: &shader,
+                entry_point: Some("vs_main"),
+                buffers: &[],
+                compilation_options: Default::default(),
+            },
+            fragment: Some(FragmentState {
+                module: &shader,
+                entry_point: Some("fs_main"),
+                targets: &[Some(ColorTargetState {
+                    format: render_format,
+                    blend: Some(BlendState::ALPHA_BLENDING),
+                    write_mask: ColorWrites::ALL,
+                })],
+                compilation_options: Default::default(),
+            }),
+            primitive: PrimitiveState {
+                topology: PrimitiveTopology::TriangleList,
+                ..Default::default()
+            },
+            depth_stencil: None,
+            multisample: MultisampleState::default(),
+            multiview: None,
+            cache: None,
+        });
+
+        Self {
+            pipeline,
+            uniform_buffer,
+            bind_group,
+        }
+    }
+
+    fn upload(&self, queue: &Queue, uniforms: CursorUniforms) {
+        queue.write_buffer(&self.uniform_buffer, 0, bytemuck::cast_slice(&[uniforms]));
+    }
+
+    fn draw(&self, pass: &mut wgpu::RenderPass) {
+        pass.set_pipeline(&self.pipeline);
+        pass.set_bind_group(0, &self.bind_group, &[]);
+        pass.draw(0..6, 0..1);
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Uniform types
 // ---------------------------------------------------------------------------
 
@@ -514,6 +646,9 @@ pub struct GpuContext {
     quad_pipeline: RenderPipeline,
     quad_vertex_buffer: wgpu::Buffer,
 
+    // Cursor animation pipeline
+    cursor_pipeline: CursorPipeline,
+
     // Cached carrier buffers for custom glyphs (icons) — avoids per-frame allocation
     icon_carrier: Buffer,
     overlay_icon_carrier: Buffer,
@@ -589,6 +724,8 @@ impl GpuContext {
             mapped_at_creation: false,
         });
 
+        let cursor_pipeline = CursorPipeline::new(&gpu.device, gpu.render_format);
+
         // Cached icon carrier buffers (empty, scale=1.0 so positions are physical px)
         let mut icon_carrier = Buffer::new(&mut text.font_system, Metrics::new(1.0, 1.0));
         icon_carrier.set_size(&mut text.font_system, Some(0.0), Some(0.0));
@@ -613,6 +750,7 @@ impl GpuContext {
             scale_factor,
             quad_pipeline,
             quad_vertex_buffer,
+            cursor_pipeline,
             icon_carrier,
             overlay_icon_carrier,
         }
@@ -796,6 +934,12 @@ impl GpuContext {
             )
             .expect("prepare overlay text");
 
+        // Upload cursor uniforms
+        if let Some(cursor) = &scene.cursor {
+            self.cursor_pipeline
+                .upload(&self.queue, CursorUniforms::from_cursor_data(cursor));
+        }
+
         // Encode render pass
         let mut encoder = self
             .device
@@ -818,6 +962,11 @@ impl GpuContext {
                 pass.set_pipeline(&self.quad_pipeline);
                 pass.set_vertex_buffer(0, self.quad_vertex_buffer.slice(..));
                 pass.draw(0..quad_vertex_count, 0..1);
+            }
+
+            // Cursor (between flat quads and text, so text renders on top)
+            if scene.cursor.is_some() {
+                self.cursor_pipeline.draw(&mut pass);
             }
 
             self.text_renderer
@@ -1027,5 +1176,80 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
     }
 
     return vec4(u.color.rgb, u.color.a * alpha);
+}
+"#;
+
+const CURSOR_SHADER: &str = r#"
+struct Uniforms {
+    prev_bounds: vec4<f32>,
+    target_bounds: vec4<f32>,
+    color: vec4<f32>,
+    params: vec4<f32>,   // [radius, time_since_move, time_since_input, move_speed]
+    clip: vec4<f32>,     // [clip_top, clip_bottom, 0, 0]
+};
+
+@group(0) @binding(0) var<uniform> u: Uniforms;
+
+struct VertexOutput {
+    @builtin(position) position: vec4<f32>,
+};
+
+@vertex
+fn vs_main(@builtin(vertex_index) vi: u32) -> VertexOutput {
+    var positions = array<vec2<f32>, 6>(
+        vec2(-1.0, 1.0),
+        vec2(1.0, 1.0),
+        vec2(-1.0, -1.0),
+        vec2(-1.0, -1.0),
+        vec2(1.0, 1.0),
+        vec2(1.0, -1.0),
+    );
+    var out: VertexOutput;
+    out.position = vec4(positions[vi], 0.0, 1.0);
+    return out;
+}
+
+fn rounded_rect_sdf(p: vec2<f32>, half_size: vec2<f32>, r: f32) -> f32 {
+    let q = abs(p) - half_size + vec2(r);
+    return min(max(q.x, q.y), 0.0) + length(max(q, vec2(0.0))) - r;
+}
+
+@fragment
+fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
+    let pixel = in.position.xy;
+
+    // Exponential ease-out: speed is decided by CPU (fast for typing, slow for glide)
+    let t_move = u.params.y;
+    let t_input = u.params.z;
+    let speed = u.params.w;
+    let factor = exp(-speed * t_move);
+    let bounds = u.target_bounds + (u.prev_bounds - u.target_bounds) * factor;
+
+    // Clipping to content area
+    if pixel.y < u.clip.x || pixel.y > u.clip.y {
+        discard;
+    }
+
+    // SDF rounded rect at interpolated position
+    let center = (bounds.xy + bounds.zw) * 0.5;
+    let half_size = (bounds.zw - bounds.xy) * 0.5;
+    let radius = min(u.params.x, min(half_size.x, half_size.y));
+    let d = rounded_rect_sdf(pixel - center, half_size, radius);
+    let shape_alpha = 1.0 - smoothstep(-0.5, 0.5, d);
+
+    // Smooth cosine blink
+    let blink_pause = 0.5;
+    let blink_period = 1.0;
+    var blink_alpha = 1.0;
+    if t_input > blink_pause {
+        let phase = (t_input - blink_pause) / blink_period * 6.283185;
+        blink_alpha = cos(phase) * 0.5 + 0.5;
+    }
+
+    let final_alpha = u.color.a * shape_alpha * blink_alpha;
+    if final_alpha < 0.001 {
+        discard;
+    }
+    return vec4(u.color.rgb, final_alpha);
 }
 "#;

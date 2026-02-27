@@ -81,6 +81,19 @@ pub struct RoundedQuad {
     pub shadow_softness: f32,
 }
 
+/// Data passed from terminal panel to GPU for animated cursor rendering.
+pub struct CursorData {
+    pub prev_rect: Rect,
+    pub target_rect: Rect,
+    pub color: [f32; 4],
+    pub radius: f32,
+    pub time_since_move: f32,
+    pub time_since_input: f32,
+    pub move_speed: f32,
+    pub clip_top: f32,
+    pub clip_bottom: f32,
+}
+
 /// Update a field only when the new value differs; returns `true` if changed.
 pub fn update_if_changed<T: PartialEq>(field: &mut T, value: T) -> bool {
     if *field != value {

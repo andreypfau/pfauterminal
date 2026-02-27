@@ -529,6 +529,10 @@ impl ApplicationHandler<TerminalEvent> for App {
 
             WindowEvent::RedrawRequested => {
                 self.redraw();
+                // Schedule continuous redraws while cursor is visible (for blink + move animation)
+                if self.tabs.get(self.active_tab).is_some_and(|p| p.cursor_visible()) {
+                    self.request_redraw();
+                }
             }
 
             WindowEvent::CursorMoved { position, .. } => {
@@ -714,8 +718,9 @@ impl ApplicationHandler<TerminalEvent> for App {
                         PhysicalKey::Code(KeyCode::KeyV) => {
                             if let Ok(mut clip) = arboard::Clipboard::new()
                                 && let Ok(text) = clip.get_text()
-                                && let Some(panel) = self.tabs.get(self.active_tab)
+                                && let Some(panel) = self.tabs.get_mut(self.active_tab)
                             {
+                                panel.notify_input();
                                 panel.write_to_pty(text.into_bytes());
                             }
                             return;
@@ -758,8 +763,9 @@ impl ApplicationHandler<TerminalEvent> for App {
                         PhysicalKey::Code(KeyCode::KeyV) => {
                             if let Ok(mut clip) = arboard::Clipboard::new()
                                 && let Ok(text) = clip.get_text()
-                                && let Some(panel) = self.tabs.get(self.active_tab)
+                                && let Some(panel) = self.tabs.get_mut(self.active_tab)
                             {
+                                panel.notify_input();
                                 panel.write_to_pty(text.into_bytes());
                             }
                             return;

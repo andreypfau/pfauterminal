@@ -1,11 +1,12 @@
 use glyphon::{CustomGlyph, CustomGlyphId};
 
-use crate::layout::{BgQuad, Rect, RoundedQuad, TextSpec};
+use crate::layout::{BgQuad, CursorData, Rect, RoundedQuad, TextSpec};
 
 pub struct DrawContext {
     pub rounded_quads: Vec<RoundedQuad>,
     pub flat_quads: Vec<BgQuad>,
     pub custom_glyphs: Vec<CustomGlyph>,
+    pub cursor: Option<CursorData>,
 }
 
 impl DrawContext {
@@ -14,6 +15,7 @@ impl DrawContext {
             rounded_quads: Vec::new(),
             flat_quads: Vec::new(),
             custom_glyphs: Vec::new(),
+            cursor: None,
         }
     }
 
@@ -21,6 +23,7 @@ impl DrawContext {
         self.rounded_quads.clear();
         self.flat_quads.clear();
         self.custom_glyphs.clear();
+        self.cursor = None;
     }
 
     pub fn rounded_rect(&mut self, rect: Rect, color: [f32; 4], radius: f32) {
