@@ -694,6 +694,9 @@ impl ApplicationHandler<TerminalEvent> for App {
                     return;
                 }
 
+                // macOS: Cmd+key shortcuts (copy, paste, screenshot).
+                // Block ALL Cmd+key from reaching the terminal.
+                #[cfg(target_os = "macos")]
                 if event.state == ElementState::Pressed && self.super_pressed {
                     match event.physical_key {
                         PhysicalKey::Code(KeyCode::KeyC) => {
@@ -728,6 +731,41 @@ impl ApplicationHandler<TerminalEvent> for App {
                     }
                     // Don't pass Cmd+key combos to the terminal
                     return;
+                }
+
+                // Windows/Linux: Ctrl+key clipboard shortcuts.
+                // Only intercept copy and paste — all other Ctrl+key combos
+                // must reach the terminal as control characters.
+                #[cfg(not(target_os = "macos"))]
+                if event.state == ElementState::Pressed && self.ctrl_pressed {
+                    match event.physical_key {
+                        PhysicalKey::Code(KeyCode::KeyC) => {
+                            // Ctrl+C with active selection → copy to clipboard.
+                            // Without selection → fall through to send SIGINT (0x03).
+                            if let Some(panel) = self.tabs.get_mut(self.active_tab) {
+                                if panel.has_selection() {
+                                    if let Some(text) = panel.selection_to_string() {
+                                        if let Ok(mut clip) = arboard::Clipboard::new() {
+                                            let _ = clip.set_text(text);
+                                        }
+                                    }
+                                    panel.clear_selection();
+                                    self.request_redraw();
+                                    return;
+                                }
+                            }
+                        }
+                        PhysicalKey::Code(KeyCode::KeyV) => {
+                            if let Ok(mut clip) = arboard::Clipboard::new()
+                                && let Ok(text) = clip.get_text()
+                                && let Some(panel) = self.tabs.get(self.active_tab)
+                            {
+                                panel.write_to_pty(text.into_bytes());
+                            }
+                            return;
+                        }
+                        _ => {}
+                    }
                 }
 
                 if let Some(panel) = self.tabs.get_mut(self.active_tab) {
