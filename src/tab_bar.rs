@@ -77,7 +77,7 @@ impl TabBar {
             let buf = &mut self.tab_buffers[i];
             buf.set_metrics(font_system, tab_metrics);
             buf.set_size(font_system, Some(300.0), Some(tab_metrics.line_height));
-            buf.set_text(font_system, title, font::default_attrs(), Shaping::Basic);
+            buf.set_text(font_system, title, font::default_attrs(), Shaping::Advanced);
             buf.shape_until_scroll(font_system, false);
 
             let text_width = buf

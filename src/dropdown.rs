@@ -214,7 +214,7 @@ impl DropdownMenu {
                 font_system,
                 &item.label,
                 font::default_attrs(),
-                Shaping::Basic,
+                Shaping::Advanced,
             );
             buf.shape_until_scroll(font_system, false);
         }

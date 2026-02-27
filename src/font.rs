@@ -58,7 +58,7 @@ pub fn set_buffer_text(
 ) {
     buf.set_metrics(font_system, metrics);
     buf.set_size(font_system, Some(width), Some(metrics.line_height));
-    buf.set_text(font_system, text, attrs, Shaping::Basic);
+    buf.set_text(font_system, text, attrs, Shaping::Advanced);
     buf.shape_until_scroll(font_system, false);
 }
 
