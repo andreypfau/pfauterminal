@@ -60,6 +60,8 @@ pub struct TextField {
     value: String,
     placeholder: String,
     cursor_pos: usize,
+    /// When set, marks the anchor of a selection range (the other end is cursor_pos).
+    selection_anchor: Option<usize>,
     focused: bool,
     password: bool,
     char_width: f32,
@@ -85,6 +87,7 @@ impl TextField {
             value: String::new(),
             placeholder: placeholder.to_string(),
             cursor_pos: 0,
+            selection_anchor: None,
             focused: false,
             password,
             char_width,
@@ -105,6 +108,7 @@ impl TextField {
     pub fn set_value(&mut self, text: &str, font_system: &mut FontSystem) {
         self.value = text.to_string();
         self.cursor_pos = text.chars().count();
+        self.selection_anchor = None;
         self.refresh_buffer(font_system);
     }
 
@@ -125,10 +129,12 @@ impl TextField {
         let char_w = self.char_width * scale;
         let pos = (rel_x / char_w).round() as usize;
         self.cursor_pos = pos.min(self.value.chars().count());
+        self.selection_anchor = None;
         self.focused = true;
     }
 
     pub fn insert_text(&mut self, text: &str, font_system: &mut FontSystem) {
+        self.delete_selection_inner();
         for c in text.chars() {
             if c.is_control() {
                 continue;
@@ -141,6 +147,11 @@ impl TextField {
     }
 
     pub fn delete_back(&mut self, font_system: &mut FontSystem) {
+        if self.has_selection() {
+            self.delete_selection_inner();
+            self.refresh_buffer(font_system);
+            return;
+        }
         if self.cursor_pos > 0 {
             let byte_start = char_to_byte(&self.value, self.cursor_pos - 1);
             let byte_end = char_to_byte(&self.value, self.cursor_pos);
@@ -151,6 +162,11 @@ impl TextField {
     }
 
     pub fn delete_forward(&mut self, font_system: &mut FontSystem) {
+        if self.has_selection() {
+            self.delete_selection_inner();
+            self.refresh_buffer(font_system);
+            return;
+        }
         let char_count = self.value.chars().count();
         if self.cursor_pos < char_count {
             let byte_start = char_to_byte(&self.value, self.cursor_pos);
@@ -160,25 +176,119 @@ impl TextField {
         }
     }
 
-    pub fn move_left(&mut self) {
+    pub fn move_left(&mut self, shift: bool) {
+        if shift {
+            if self.selection_anchor.is_none() {
+                self.selection_anchor = Some(self.cursor_pos);
+            }
+        } else if self.has_selection() {
+            let (start, _) = self.selection_range();
+            self.cursor_pos = start;
+            self.selection_anchor = None;
+            return;
+        }
         if self.cursor_pos > 0 {
             self.cursor_pos -= 1;
         }
+        if shift && self.selection_anchor == Some(self.cursor_pos) {
+            self.selection_anchor = None;
+        }
     }
 
-    pub fn move_right(&mut self) {
+    pub fn move_right(&mut self, shift: bool) {
+        if shift {
+            if self.selection_anchor.is_none() {
+                self.selection_anchor = Some(self.cursor_pos);
+            }
+        } else if self.has_selection() {
+            let (_, end) = self.selection_range();
+            self.cursor_pos = end;
+            self.selection_anchor = None;
+            return;
+        }
         let char_count = self.value.chars().count();
         if self.cursor_pos < char_count {
             self.cursor_pos += 1;
         }
+        if shift && self.selection_anchor == Some(self.cursor_pos) {
+            self.selection_anchor = None;
+        }
     }
 
-    pub fn move_home(&mut self) {
+    pub fn move_home(&mut self, shift: bool) {
+        if shift {
+            if self.selection_anchor.is_none() {
+                self.selection_anchor = Some(self.cursor_pos);
+            }
+        } else {
+            self.selection_anchor = None;
+        }
         self.cursor_pos = 0;
+        if shift && self.selection_anchor == Some(0) {
+            self.selection_anchor = None;
+        }
     }
 
-    pub fn move_end(&mut self) {
-        self.cursor_pos = self.value.chars().count();
+    pub fn move_end(&mut self, shift: bool) {
+        if shift {
+            if self.selection_anchor.is_none() {
+                self.selection_anchor = Some(self.cursor_pos);
+            }
+        } else {
+            self.selection_anchor = None;
+        }
+        let end = self.value.chars().count();
+        self.cursor_pos = end;
+        if shift && self.selection_anchor == Some(end) {
+            self.selection_anchor = None;
+        }
+    }
+
+    pub fn select_all(&mut self) {
+        let len = self.value.chars().count();
+        if len > 0 {
+            self.selection_anchor = Some(0);
+            self.cursor_pos = len;
+        }
+    }
+
+    pub fn has_selection(&self) -> bool {
+        self.selection_anchor.is_some()
+    }
+
+    /// Returns (start, end) character indices of the selection, ordered.
+    fn selection_range(&self) -> (usize, usize) {
+        let anchor = self.selection_anchor.unwrap_or(self.cursor_pos);
+        let start = anchor.min(self.cursor_pos);
+        let end = anchor.max(self.cursor_pos);
+        (start, end)
+    }
+
+    /// Returns the selected text, or `None` if nothing is selected.
+    pub fn selected_text(&self) -> Option<String> {
+        let anchor = self.selection_anchor?;
+        let start = anchor.min(self.cursor_pos);
+        let end = anchor.max(self.cursor_pos);
+        if start == end {
+            return None;
+        }
+        let byte_start = char_to_byte(&self.value, start);
+        let byte_end = char_to_byte(&self.value, end);
+        Some(self.value[byte_start..byte_end].to_string())
+    }
+
+    /// Deletes the selected text, leaving cursor at the start of the former selection.
+    fn delete_selection_inner(&mut self) {
+        if let Some(anchor) = self.selection_anchor.take() {
+            let start = anchor.min(self.cursor_pos);
+            let end = anchor.max(self.cursor_pos);
+            if start != end {
+                let byte_start = char_to_byte(&self.value, start);
+                let byte_end = char_to_byte(&self.value, end);
+                self.value.drain(byte_start..byte_end);
+                self.cursor_pos = start;
+            }
+        }
     }
 
     fn display_text(&self) -> String {
@@ -255,10 +365,33 @@ impl TextField {
         });
 
         if self.focused {
-            let cursor_x =
-                self.rect.x + self.pad_h * scale + self.cursor_pos as f32 * self.char_width * scale;
             let cursor_h = line_h * scale;
             let cursor_y = self.rect.y + (self.rect.height - cursor_h) / 2.0;
+
+            // Draw selection highlight
+            if let Some(anchor) = self.selection_anchor {
+                let start = anchor.min(self.cursor_pos);
+                let end = anchor.max(self.cursor_pos);
+                if start != end {
+                    let sel_x =
+                        self.rect.x + self.pad_h * scale + start as f32 * self.char_width * scale;
+                    let sel_w = (end - start) as f32 * self.char_width * scale;
+                    ctx.rounded_rect(
+                        Rect {
+                            x: sel_x,
+                            y: cursor_y,
+                            width: sel_w,
+                            height: cursor_h,
+                        },
+                        colors.selection.to_linear_f32(),
+                        0.0,
+                    );
+                }
+            }
+
+            // Draw cursor
+            let cursor_x =
+                self.rect.x + self.pad_h * scale + self.cursor_pos as f32 * self.char_width * scale;
             ctx.rounded_rect(
                 Rect {
                     x: cursor_x,
