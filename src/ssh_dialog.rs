@@ -637,6 +637,7 @@ impl SshDialog {
         &mut self,
         event: &KeyEvent,
         font_system: &mut FontSystem,
+        shift_pressed: bool,
     ) -> Option<SshResult> {
         if event.state != ElementState::Pressed {
             return None;
@@ -675,19 +676,19 @@ impl SshDialog {
                 return None;
             }
             Key::Named(NamedKey::ArrowLeft) => {
-                self.focused_field_widget_mut().move_left();
+                self.focused_field_widget_mut().move_left(shift_pressed);
                 return None;
             }
             Key::Named(NamedKey::ArrowRight) => {
-                self.focused_field_widget_mut().move_right();
+                self.focused_field_widget_mut().move_right(shift_pressed);
                 return None;
             }
             Key::Named(NamedKey::Home) => {
-                self.focused_field_widget_mut().move_home();
+                self.focused_field_widget_mut().move_home(shift_pressed);
                 return None;
             }
             Key::Named(NamedKey::End) => {
-                self.focused_field_widget_mut().move_end();
+                self.focused_field_widget_mut().move_end(shift_pressed);
                 return None;
             }
             _ => {}
@@ -903,6 +904,8 @@ pub struct SshDialogWindow {
     theme: Theme,
     cursor_position: (f32, f32),
     super_pressed: bool,
+    ctrl_pressed: bool,
+    shift_pressed: bool,
 }
 
 impl SshDialogWindow {
@@ -918,7 +921,8 @@ impl SshDialogWindow {
         let attrs = WindowAttributes::default()
             .with_title("SSH Session")
             .with_inner_size(winit::dpi::LogicalSize::new(dialog_width, initial_h))
-            .with_resizable(false);
+            .with_resizable(false)
+            .with_visible(false);
 
         let window = Arc::new(
             event_loop
@@ -939,14 +943,22 @@ impl SshDialogWindow {
         let _ =
             window.request_inner_size(winit::dpi::LogicalSize::new(dialog_width, dialog_h));
 
-        Self {
+        let mut s = Self {
             window,
             gpu,
             dialog,
             theme,
             cursor_position: (0.0, 0.0),
             super_pressed: false,
-        }
+            ctrl_pressed: false,
+            shift_pressed: false,
+        };
+
+        // Render the first frame before showing the window to avoid a blank flash
+        s.render();
+        s.window.set_visible(true);
+
+        s
     }
 
     pub fn window_id(&self) -> WindowId {
@@ -1040,6 +1052,8 @@ impl SshDialogWindow {
 
             WindowEvent::ModifiersChanged(new_modifiers) => {
                 self.super_pressed = new_modifiers.state().super_key();
+                self.ctrl_pressed = new_modifiers.state().control_key();
+                self.shift_pressed = new_modifiers.state().shift_key();
                 Ok(None)
             }
 
@@ -1053,21 +1067,57 @@ impl SshDialogWindow {
                         }
                         return Err(());
                     }
-                    if self.super_pressed
-                        && let Key::Character(c) = event.logical_key.as_ref()
-                        && c == "v"
-                        && let Ok(mut clip) = arboard::Clipboard::new()
-                        && let Ok(text) = clip.get_text()
-                    {
-                        self.dialog
-                            .insert_text(&text, &mut self.gpu.font_system);
-                        self.request_redraw();
-                        return Ok(None);
+
+                    // Clipboard modifier: Cmd on macOS, Ctrl on others
+                    #[cfg(target_os = "macos")]
+                    let clipboard_mod = self.super_pressed;
+                    #[cfg(not(target_os = "macos"))]
+                    let clipboard_mod = self.ctrl_pressed;
+
+                    if clipboard_mod {
+                        if let Key::Character(c) = event.logical_key.as_ref() {
+                            match c.as_ref() {
+                                "v" => {
+                                    if let Ok(mut clip) = arboard::Clipboard::new()
+                                        && let Ok(text) = clip.get_text()
+                                    {
+                                        self.dialog
+                                            .insert_text(&text, &mut self.gpu.font_system);
+                                        self.request_redraw();
+                                    }
+                                    return Ok(None);
+                                }
+                                "c" => {
+                                    if let Some(text) = self.dialog.focused_field_widget_mut().selected_text() {
+                                        if let Ok(mut clip) = arboard::Clipboard::new() {
+                                            let _ = clip.set_text(text);
+                                        }
+                                    }
+                                    return Ok(None);
+                                }
+                                "x" => {
+                                    if let Some(text) = self.dialog.focused_field_widget_mut().selected_text() {
+                                        if let Ok(mut clip) = arboard::Clipboard::new() {
+                                            let _ = clip.set_text(text);
+                                        }
+                                        self.dialog.focused_field_widget_mut().delete_back(&mut self.gpu.font_system);
+                                        self.request_redraw();
+                                    }
+                                    return Ok(None);
+                                }
+                                "a" => {
+                                    self.dialog.focused_field_widget_mut().select_all();
+                                    self.request_redraw();
+                                    return Ok(None);
+                                }
+                                _ => {}
+                            }
+                        }
                     }
                 }
                 if let Some(result) =
                     self.dialog
-                        .handle_key(&event, &mut self.gpu.font_system)
+                        .handle_key(&event, &mut self.gpu.font_system, self.shift_pressed)
                     && !result.host.is_empty()
                 {
                     return Ok(Some(result));

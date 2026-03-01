@@ -487,18 +487,23 @@ impl ApplicationHandler<TerminalEvent> for App {
 
         let attrs = WindowAttributes::default()
             .with_title("pfauterminal")
-            .with_inner_size(winit::dpi::LogicalSize::new(800, 600));
+            .with_inner_size(winit::dpi::LogicalSize::new(800, 600))
+            .with_visible(false);
 
         let window = Arc::new(event_loop.create_window(attrs).expect("create window"));
         let gpu = GpuContext::new(window.clone(), self.theme.colors.clone());
 
-        self.window = Some(window);
+        self.window = Some(window.clone());
         self.gpu = Some(gpu);
 
         // Set up native menu bar after winit initialization
         crate::menu::setup_native_menu();
 
         self.new_tab(None);
+
+        // Render the first frame before showing the window to avoid a blank flash
+        self.redraw();
+        window.set_visible(true);
     }
 
     fn user_event(&mut self, event_loop: &ActiveEventLoop, event: TerminalEvent) {
@@ -935,7 +940,13 @@ fn detect_shells() -> Vec<(String, String)> {
     #[cfg(windows)]
     {
         // PowerShell 7+ (pwsh) — found via PATH
-        if let Ok(output) = std::process::Command::new("where").arg("pwsh").output() {
+        use std::os::windows::process::CommandExt;
+        const CREATE_NO_WINDOW: u32 = 0x08000000;
+        if let Ok(output) = std::process::Command::new("where")
+            .arg("pwsh")
+            .creation_flags(CREATE_NO_WINDOW)
+            .output()
+        {
             if output.status.success() {
                 if let Some(path) = String::from_utf8_lossy(&output.stdout).lines().next() {
                     let path = path.trim();
