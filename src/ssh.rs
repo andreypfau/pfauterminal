@@ -68,8 +68,13 @@ pub fn spawn_ssh_thread(
                 .build()
                 .expect("tokio runtime");
             rt.block_on(async move {
-                if let Err(e) = ssh_session(config, term_clone, event_proxy, rx, cols, rows).await {
+                if let Err(e) = ssh_session(config, term_clone.clone(), event_proxy.clone(), rx, cols, rows).await {
+                    use alacritty_terminal::event::EventListener;
                     log::error!("SSH session error: {e}");
+                    write_to_term(&term_clone, &format!(
+                        "\x1b[?25l\r\n\x1b[31mSSH error: {e}\x1b[0m\r\n"
+                    ));
+                    event_proxy.send_event(alacritty_terminal::event::Event::Wakeup);
                 }
             });
         })
@@ -99,39 +104,61 @@ async fn ssh_session(
     let russh_config = Arc::new(russh::client::Config::default());
     let addr = format!("{}:{}", config.host, config.port);
 
+    // Hide cursor during connection — it will be re-enabled by the remote shell
+    write_to_term(&term, &format!("\x1b[?25lConnecting to {addr}...\r\n"));
+    event_proxy.send_event(Event::Wakeup);
+
     let mut session = russh::client::connect(russh_config, &addr, SshHandler)
-        .await
-        .inspect_err(|_| {
-            event_proxy.send_event(Event::Exit);
-        })?;
+        .await?;
 
     // Authenticate
-    let authenticated = match &config.auth {
+    write_to_term(&term, &format!("Authenticating as {}...\r\n", config.username));
+    event_proxy.send_event(Event::Wakeup);
+
+    let auth_result = match &config.auth {
         SshAuth::Password(password) => {
-            session
-                .authenticate_password(&config.username, password)
-                .await?
+            match session.authenticate_password(&config.username, password).await {
+                Ok(true) => Ok(()),
+                Ok(false) => Err("server rejected password".to_string()),
+                Err(e) => Err(format!("password auth error: {e}")),
+            }
         }
         SshAuth::Key { path, passphrase } => {
             let key_path = shellexpand_path(path);
-            let key_pair = russh_keys::load_secret_key(&key_path, passphrase.as_deref())?;
-            session
-                .authenticate_publickey(&config.username, Arc::new(key_pair))
-                .await?
+            match russh_keys::load_secret_key(&key_path, passphrase.as_deref()) {
+                Ok(key_pair) => {
+                    match session.authenticate_publickey(&config.username, Arc::new(key_pair)).await {
+                        Ok(true) => Ok(()),
+                        Ok(false) => Err(format!("server rejected key {}", key_path.display())),
+                        Err(e) => Err(format!("public key auth error: {e}")),
+                    }
+                }
+                Err(e) => Err(format!("failed to load key {}: {e}", key_path.display())),
+            }
         }
         SshAuth::Agent => {
-            try_agent_auth(&mut session, &config.username).await
-                || try_default_keys(&mut session, &config.username).await
+            let mut reasons = Vec::new();
+            let ok = try_agent_auth(&mut session, &config.username, &mut reasons).await
+                || try_default_keys(&mut session, &config.username, &mut reasons).await;
+            if ok {
+                Ok(())
+            } else {
+                if reasons.is_empty() {
+                    reasons.push("no keys available and agent not reachable".to_string());
+                }
+                Err(reasons.join("\r\n  "))
+            }
         }
     };
 
-    if !authenticated {
-        log::error!("SSH authentication failed for {}@{}", config.username, config.host);
+    if let Err(reason) = auth_result {
+        log::error!("SSH authentication failed for {}@{}: {reason}", config.username, config.host);
+        // Hide cursor + show error
         write_to_term(&term, &format!(
-            "\r\nAuthentication failed for {}@{}\r\n",
+            "\x1b[?25l\r\n\x1b[31mAuthentication failed for {}@{}\r\n  {reason}\x1b[0m\r\n",
             config.username, config.host
         ));
-        event_proxy.send_event(Event::Exit);
+        event_proxy.send_event(Event::Wakeup);
         return Ok(());
     }
 
@@ -141,6 +168,9 @@ async fn ssh_session(
         .request_pty(false, "xterm-256color", cols as u32, rows as u32, 0, 0, &[])
         .await?;
     channel.request_shell(false).await?;
+
+    // Re-enable cursor now that the remote shell is ready
+    write_to_term(&term, "\x1b[?25h");
 
     event_proxy.send_event(Event::Title(format!(
         "{}@{}",
@@ -192,25 +222,88 @@ async fn ssh_session(
 async fn try_agent_auth(
     session: &mut russh::client::Handle<SshHandler>,
     username: &str,
+    reasons: &mut Vec<String>,
 ) -> bool {
     #[cfg(unix)]
     {
         use russh_keys::agent::client::AgentClient;
         let sock = match std::env::var("SSH_AUTH_SOCK") {
             Ok(s) if !s.is_empty() => s,
-            _ => return false,
+            _ => {
+                reasons.push("SSH_AUTH_SOCK not set — agent not available".to_string());
+                return false;
+            }
         };
-        if let Ok(stream) = tokio::net::UnixStream::connect(&sock).await {
-            let mut agent = AgentClient::connect(stream);
-            if let Ok(identities) = agent.request_identities().await {
-                for identity in identities {
-                    if let Ok(true) = session
-                        .authenticate_publickey_with(username, identity, &mut agent)
-                        .await
-                    {
-                        return true;
+        match tokio::net::UnixStream::connect(&sock).await {
+            Ok(stream) => {
+                let mut agent = AgentClient::connect(stream);
+                match agent.request_identities().await {
+                    Ok(identities) => {
+                        if identities.is_empty() {
+                            reasons.push("agent has no identities".to_string());
+                        }
+                        for identity in identities {
+                            match session
+                                .authenticate_publickey_with(username, identity, &mut agent)
+                                .await
+                            {
+                                Ok(true) => return true,
+                                Ok(false) => {
+                                    reasons.push("agent key rejected by server".to_string());
+                                }
+                                Err(e) => {
+                                    reasons.push(format!("agent key auth error: {e}"));
+                                }
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        reasons.push(format!("agent request_identities failed: {e}"));
                     }
                 }
+            }
+            Err(e) => {
+                reasons.push(format!("cannot connect to SSH agent at {sock}: {e}"));
+            }
+        }
+    }
+    #[cfg(windows)]
+    {
+        use russh_keys::agent::client::AgentClient;
+        use tokio::net::windows::named_pipe::ClientOptions;
+        let pipe_path = r"\\.\pipe\openssh-ssh-agent";
+        match ClientOptions::new().open(pipe_path) {
+            Ok(pipe) => {
+                let mut agent = AgentClient::connect(pipe);
+                match agent.request_identities().await {
+                    Ok(identities) => {
+                        if identities.is_empty() {
+                            reasons.push("agent has no identities".to_string());
+                        }
+                        for identity in identities {
+                            match session
+                                .authenticate_publickey_with(username, identity, &mut agent)
+                                .await
+                            {
+                                Ok(true) => return true,
+                                Ok(false) => {
+                                    reasons.push("agent key rejected by server".to_string());
+                                }
+                                Err(e) => {
+                                    reasons.push(format!("agent key auth error: {e}"));
+                                }
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        reasons.push(format!("agent request_identities failed: {e}"));
+                    }
+                }
+            }
+            Err(e) => {
+                reasons.push(format!(
+                    "cannot connect to SSH agent at {pipe_path}: {e} (is the OpenSSH Authentication Agent service running?)"
+                ));
             }
         }
     }
@@ -220,31 +313,39 @@ async fn try_agent_auth(
 async fn try_default_keys(
     session: &mut russh::client::Handle<SshHandler>,
     username: &str,
+    reasons: &mut Vec<String>,
 ) -> bool {
     let Some(ssh_dir) = dirs::home_dir().map(|h| h.join(".ssh")) else {
+        reasons.push("cannot determine home directory for default keys".to_string());
         return false;
     };
 
+    let mut found_any = false;
     for name in &["id_ed25519", "id_rsa", "id_ecdsa"] {
         let path = ssh_dir.join(name);
         if !path.exists() {
             continue;
         }
+        found_any = true;
         let key = match russh_keys::load_secret_key(&path, None) {
             Ok(k) => k,
             Err(e) => {
-                log::debug!("failed to load key {}: {e}", path.display());
+                reasons.push(format!("failed to load {}: {e}", path.display()));
                 continue;
             }
         };
         match session.authenticate_publickey(username, Arc::new(key)).await {
             Ok(true) => return true,
-            Ok(false) => continue,
+            Ok(false) => {
+                reasons.push(format!("{} rejected by server", path.display()));
+            }
             Err(e) => {
-                log::debug!("key auth failed for {}: {e}", path.display());
-                continue;
+                reasons.push(format!("{} auth error: {e}", path.display()));
             }
         }
+    }
+    if !found_any {
+        reasons.push(format!("no default keys found in {}", ssh_dir.display()));
     }
     false
 }

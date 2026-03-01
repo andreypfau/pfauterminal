@@ -9,7 +9,7 @@ use winit::keyboard::{KeyCode, PhysicalKey};
 use winit::window::{CursorIcon, Window, WindowAttributes, WindowId};
 
 use crate::draw::DrawContext;
-use crate::dropdown::{DropdownElement, DropdownMenu, MenuAction, MenuEntry};
+use crate::dropdown::{DropdownElement, DropdownMenu, MenuAction, MenuEntry, MenuPosition};
 use crate::gpu::GpuContext;
 use crate::icons;
 use crate::icons::IconManager;
@@ -32,6 +32,8 @@ pub struct App {
     dropdown: DropdownMenu,
     ssh_dialog_window: Option<SshDialogWindow>,
     saved_sessions: SavedSessions,
+    cached_shells: Option<Vec<(String, String)>>,
+    shell_receiver: Option<std::sync::mpsc::Receiver<Vec<(String, String)>>>,
     cursor_position: (f32, f32),
     super_pressed: bool,
     ctrl_pressed: bool,
@@ -46,6 +48,10 @@ impl App {
     pub fn new(event_proxy_raw: EventLoopProxy<TerminalEvent>) -> Self {
         let theme = Theme::new();
         let saved_sessions = SavedSessions::load();
+        let (shell_tx, shell_rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = shell_tx.send(detect_shells());
+        });
         Self {
             window: None,
             gpu: None,
@@ -58,6 +64,8 @@ impl App {
             dropdown: DropdownMenu::new(),
             ssh_dialog_window: None,
             saved_sessions,
+            cached_shells: None,
+            shell_receiver: Some(shell_rx),
             cursor_position: (0.0, 0.0),
             super_pressed: false,
             ctrl_pressed: false,
@@ -301,7 +309,17 @@ impl App {
     }
 
     fn open_new_tab_dropdown(&mut self) {
-        let shells = detect_shells();
+        // Populate cache from background thread if not yet available
+        if self.cached_shells.is_none() {
+            if let Some(rx) = self.shell_receiver.take() {
+                // recv() blocks only if the thread hasn't finished yet;
+                // by the time the user clicks "+", it's almost certainly done.
+                if let Ok(shells) = rx.recv() {
+                    self.cached_shells = Some(shells);
+                }
+            }
+        }
+        let shells = self.cached_shells.as_deref().unwrap_or(&[]);
         let saved = &self.saved_sessions.sessions;
 
         let gpu = self.gpu.as_mut().unwrap();
@@ -310,8 +328,8 @@ impl App {
         let surface_h = gpu.surface_config.height as f32;
 
         let mut entries: Vec<MenuEntry> = shells
-            .into_iter()
-            .map(|(label, path)| MenuEntry::item(&label, MenuAction::NewShell(path)))
+            .iter()
+            .map(|(label, path)| MenuEntry::item(label, MenuAction::NewShell(path.clone())))
             .collect();
 
         // Separator between shells and SSH section
@@ -340,8 +358,37 @@ impl App {
         let anchor = self.tab_bar.plus_rect();
         self.dropdown.open(
             entries,
-            anchor,
+            MenuPosition::BelowAnchor(anchor),
             Some(280.0),
+            scale,
+            surface_w,
+            surface_h,
+            &mut gpu.font_system,
+            &self.theme.dropdown,
+        );
+    }
+
+    fn open_context_menu(&mut self, x: f32, y: f32) {
+        let has_selection = self
+            .tabs
+            .get(self.active_tab)
+            .is_some_and(|p| p.has_selection());
+
+        let mut entries = Vec::new();
+        if has_selection {
+            entries.push(MenuEntry::item("Copy", MenuAction::Copy));
+        }
+        entries.push(MenuEntry::item("Paste", MenuAction::Paste));
+
+        let gpu = self.gpu.as_mut().unwrap();
+        let scale = gpu.scale_factor;
+        let surface_w = gpu.surface_config.width as f32;
+        let surface_h = gpu.surface_config.height as f32;
+
+        self.dropdown.open(
+            entries,
+            MenuPosition::AtPoint(x, y),
+            None,
             scale,
             surface_w,
             surface_h,
@@ -407,6 +454,25 @@ impl App {
                     };
                     self.saved_sessions.touch_by_key(key);
                     self.connect_ssh(config);
+                }
+            }
+            MenuAction::Copy => {
+                if let Some(panel) = self.tabs.get_mut(self.active_tab) {
+                    if let Some(text) = panel.selection_to_string() {
+                        if let Ok(mut clip) = arboard::Clipboard::new() {
+                            let _ = clip.set_text(text);
+                        }
+                        panel.clear_selection();
+                    }
+                }
+            }
+            MenuAction::Paste => {
+                if let Ok(mut clip) = arboard::Clipboard::new()
+                    && let Ok(text) = clip.get_text()
+                    && let Some(panel) = self.tabs.get_mut(self.active_tab)
+                {
+                    panel.notify_input();
+                    panel.write_to_pty(text.into_bytes());
                 }
             }
         }
@@ -679,6 +745,19 @@ impl ApplicationHandler<TerminalEvent> for App {
                 ..
             } => {
                 self.mouse_left_pressed = false;
+            }
+
+            WindowEvent::MouseInput {
+                state: ElementState::Pressed,
+                button: MouseButton::Right,
+                ..
+            } => {
+                let (cx, cy) = self.cursor_position;
+                if self.dropdown.is_open() {
+                    self.dropdown.close();
+                }
+                self.open_context_menu(cx, cy);
+                self.request_redraw();
             }
 
             WindowEvent::ModifiersChanged(new_modifiers) => {
