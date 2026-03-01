@@ -1,5 +1,5 @@
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use alacritty_terminal::selection::SelectionType;
 use winit::application::ApplicationHandler;
@@ -42,6 +42,10 @@ pub struct App {
     last_click_time: Instant,
     click_count: u8,
     screenshot_pending: Option<String>,
+    last_redraw: Instant,
+    /// Set when new terminal content or user input arrives — forces an
+    /// immediate render regardless of the cursor-blink throttle.
+    dirty: bool,
 }
 
 impl App {
@@ -74,6 +78,8 @@ impl App {
             last_click_time: Instant::now(),
             click_count: 0,
             screenshot_pending: std::env::var("SCREENSHOT").ok().filter(|s| !s.is_empty()),
+            last_redraw: Instant::now(),
+            dirty: false,
         }
     }
 
@@ -509,6 +515,7 @@ impl ApplicationHandler<TerminalEvent> for App {
     fn user_event(&mut self, event_loop: &ActiveEventLoop, event: TerminalEvent) {
         match event {
             TerminalEvent::Wakeup => {
+                self.dirty = true;
                 self.request_redraw();
             }
             TerminalEvent::Title(panel_id, title) => {
@@ -599,10 +606,45 @@ impl ApplicationHandler<TerminalEvent> for App {
             }
 
             WindowEvent::RedrawRequested => {
-                self.redraw();
-                // Schedule continuous redraws while cursor is visible (for blink + move animation)
-                if self.tabs.get(self.active_tab).is_some_and(|p| p.cursor_visible()) {
-                    self.request_redraw();
+                let now = Instant::now();
+                let elapsed = now.duration_since(self.last_redraw);
+
+                // New terminal content or user input — render immediately
+                if self.dirty {
+                    self.dirty = false;
+                    self.redraw();
+                    self.last_redraw = Instant::now();
+                    // Keep the continuous loop going if cursor is blinking
+                    if self.tabs.get(self.active_tab).is_some_and(|p| p.cursor_visible()) {
+                        self.request_redraw();
+                    }
+                    return;
+                }
+
+                if let Some(panel) = self.tabs.get(self.active_tab) {
+                    if panel.cursor_visible() {
+                        if panel.cursor_animating() || panel.is_smooth_scrolling() {
+                            // Active animation — redraw at full frame rate
+                            self.redraw();
+                            self.last_redraw = Instant::now();
+                            self.request_redraw();
+                        } else if elapsed >= Duration::from_millis(33) {
+                            // Idle cursor blink — 30fps is enough
+                            self.redraw();
+                            self.last_redraw = Instant::now();
+                            self.request_redraw();
+                        } else {
+                            // Too soon for idle blink — skip render, schedule next
+                            self.request_redraw();
+                        }
+                    } else {
+                        // Cursor hidden — just render (no continuous redraw)
+                        self.redraw();
+                        self.last_redraw = Instant::now();
+                    }
+                } else {
+                    self.redraw();
+                    self.last_redraw = Instant::now();
                 }
             }
 
@@ -860,6 +902,8 @@ impl ApplicationHandler<TerminalEvent> for App {
 
                 if let Some(panel) = self.tabs.get_mut(self.active_tab) {
                     panel.handle_key(&event, self.ctrl_pressed, self.alt_pressed);
+                    self.dirty = true;
+                    self.request_redraw();
                 }
             }
 
