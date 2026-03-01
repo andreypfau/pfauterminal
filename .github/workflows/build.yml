@@ -30,7 +30,7 @@ jobs:
           path: target/aarch64-apple-darwin/release/pfauterminal
 
   build-macos-x86_64:
-    runs-on: macos-13
+    runs-on: macos-latest
     steps:
       - uses: actions/checkout@v4
 
