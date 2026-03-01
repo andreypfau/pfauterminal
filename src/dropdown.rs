@@ -11,6 +11,13 @@ pub enum MenuAction {
     NewShell(String),
     OpenSshDialog,
     ConnectSavedSession(String),
+    Copy,
+    Paste,
+}
+
+pub enum MenuPosition {
+    BelowAnchor(Rect),
+    AtPoint(f32, f32),
 }
 
 pub enum MenuEntry {
@@ -89,7 +96,7 @@ impl DropdownMenu {
     pub fn open(
         &mut self,
         entries: Vec<MenuEntry>,
-        anchor_rect: Rect,
+        position: MenuPosition,
         width: Option<f32>,
         scale: f32,
         surface_width: f32,
@@ -119,8 +126,14 @@ impl DropdownMenu {
 
         let menu_h = padding * 2.0 + content_h + border * 2.0;
 
-        let mut menu_x = anchor_rect.x + (anchor_rect.width - menu_w) / 2.0;
-        let menu_y = anchor_rect.y + anchor_rect.height + gap;
+        let (mut menu_x, menu_y) = match position {
+            MenuPosition::BelowAnchor(anchor_rect) => {
+                let x = anchor_rect.x + (anchor_rect.width - menu_w) / 2.0;
+                let y = anchor_rect.y + anchor_rect.height + gap;
+                (x, y)
+            }
+            MenuPosition::AtPoint(x, y) => (x, y),
+        };
 
         if menu_x + menu_w > surface_width {
             menu_x = surface_width - menu_w;
@@ -130,7 +143,10 @@ impl DropdownMenu {
         }
 
         let final_y = if menu_y + menu_h > surface_height {
-            (anchor_rect.y - gap - menu_h).max(0.0)
+            match position {
+                MenuPosition::BelowAnchor(anchor_rect) => (anchor_rect.y - gap - menu_h).max(0.0),
+                MenuPosition::AtPoint(_, y) => (y - menu_h).max(0.0),
+            }
         } else {
             menu_y
         };

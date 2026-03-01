@@ -623,7 +623,7 @@ impl SshDialog {
         let auth_logical_w = self.auth_dropdown_rect.width / self.scale;
         self.auth_dropdown.open(
             auth_menu_items(),
-            self.auth_dropdown_rect,
+            crate::dropdown::MenuPosition::BelowAnchor(self.auth_dropdown_rect),
             Some(auth_logical_w),
             self.scale,
             dialog_w,
