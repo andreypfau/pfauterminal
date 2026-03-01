@@ -29,6 +29,27 @@ jobs:
           name: pfauterminal-macos-aarch64
           path: target/aarch64-apple-darwin/release/pfauterminal
 
+  build-macos-x86_64:
+    runs-on: macos-13
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust nightly
+        uses: dtolnay/rust-toolchain@nightly
+        with:
+          targets: x86_64-apple-darwin
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Build
+        run: cargo build --release --target x86_64-apple-darwin
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: pfauterminal-macos-x86_64
+          path: target/x86_64-apple-darwin/release/pfauterminal
+
   build-windows:
     runs-on: windows-latest
     steps:
@@ -52,7 +73,7 @@ jobs:
 
   release:
     if: startsWith(github.ref, 'refs/tags/v')
-    needs: [build-macos, build-windows]
+    needs: [build-macos, build-macos-x86_64, build-windows]
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -65,6 +86,12 @@ jobs:
           name: pfauterminal-macos-aarch64
           path: artifacts/macos
 
+      - name: Download macOS x86_64 artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: pfauterminal-macos-x86_64
+          path: artifacts/macos-x86_64
+
       - name: Download Windows artifact
         uses: actions/download-artifact@v4
         with:
@@ -73,16 +100,71 @@ jobs:
 
       - name: Prepare release assets
         run: |
-          mv artifacts/macos/pfauterminal pfauterminal-macos-aarch64
+          chmod +x artifacts/macos/pfauterminal
+          tar -czf pfauterminal-macos-aarch64.tar.gz -C artifacts/macos pfauterminal
+          chmod +x artifacts/macos-x86_64/pfauterminal
+          tar -czf pfauterminal-macos-x86_64.tar.gz -C artifacts/macos-x86_64 pfauterminal
           mv artifacts/windows/pfauterminal.exe pfauterminal-windows-x86_64.exe
-          chmod +x pfauterminal-macos-aarch64
 
       - name: Create release
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           gh release create "${{ github.ref_name }}" \
-            pfauterminal-macos-aarch64 \
+            pfauterminal-macos-aarch64.tar.gz \
+            pfauterminal-macos-x86_64.tar.gz \
             pfauterminal-windows-x86_64.exe \
             --title "${{ github.ref_name }}" \
             --generate-notes
+
+      - name: Update Homebrew formula
+        env:
+          HOMEBREW_TAP_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}
+        if: env.HOMEBREW_TAP_TOKEN != ''
+        run: |
+          VERSION="${{ github.ref_name }}"
+          VERSION_NUM="${VERSION#v}"
+          REPO="${{ github.repository }}"
+
+          SHA256_ARM64=$(sha256sum pfauterminal-macos-aarch64.tar.gz | cut -d ' ' -f 1)
+          SHA256_X86_64=$(sha256sum pfauterminal-macos-x86_64.tar.gz | cut -d ' ' -f 1)
+
+          git clone https://x-access-token:${HOMEBREW_TAP_TOKEN}@github.com/andreypfau/homebrew-tap.git tap-repo
+          mkdir -p tap-repo/Formula
+
+          cat > tap-repo/Formula/pfauterminal.rb << FORMULA
+          class Pfauterminal < Formula
+            desc "A modern GPU-accelerated terminal emulator"
+            homepage "https://github.com/${REPO}"
+            version "${VERSION_NUM}"
+            license "MIT"
+
+            on_macos do
+              if Hardware::CPU.arm?
+                url "https://github.com/${REPO}/releases/download/${VERSION}/pfauterminal-macos-aarch64.tar.gz"
+                sha256 "${SHA256_ARM64}"
+              elsif Hardware::CPU.intel?
+                url "https://github.com/${REPO}/releases/download/${VERSION}/pfauterminal-macos-x86_64.tar.gz"
+                sha256 "${SHA256_X86_64}"
+              end
+            end
+
+            def install
+              bin.install "pfauterminal"
+            end
+
+            test do
+              assert_predicate bin/"pfauterminal", :executable?
+            end
+          end
+          FORMULA
+
+          # Remove leading spaces from heredoc
+          sed -i 's/^          //' tap-repo/Formula/pfauterminal.rb
+
+          cd tap-repo
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add Formula/pfauterminal.rb
+          git commit -m "Update pfauterminal to ${VERSION}"
+          git push
