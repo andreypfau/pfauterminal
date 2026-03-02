@@ -649,7 +649,7 @@ impl TerminalPanel {
     pub fn handle_scroll(&mut self, delta: MouseScrollDelta, cell_height: f64) -> bool {
         match delta {
             MouseScrollDelta::LineDelta(_, y) => {
-                let lines = y as i32;
+                let lines = (y as i32) * 3;
                 if lines != 0 {
                     let mut term = self.term.lock();
                     term.scroll_display(alacritty_terminal::grid::Scroll::Delta(lines));
@@ -810,7 +810,7 @@ impl TerminalPanel {
         let metrics = font::metrics();
 
         // --- Snapshot grid data under the lock, then release it ---
-        let (cells, cursor_point, cursor_shape, selection_range, display_offset, extra_row_cells) = {
+        let (cells, cursor_point, cursor_shape, selection_range, display_offset, extra_row_cells, total_lines, screen_lines) = {
             let mut term = self.term.lock();
             // Re-apply our selection — terminal output may have cleared it.
             if let Some(sel) = &self.active_selection {
@@ -818,6 +818,8 @@ impl TerminalPanel {
             }
             let content = term.renderable_content();
             let display_offset = content.display_offset;
+            let total_lines = term.grid().total_lines();
+            let screen_lines = term.grid().screen_lines();
             let cursor_point = content.cursor.point;
             let cursor_shape = content.cursor.shape;
             let selection_range = content.selection;
@@ -863,7 +865,7 @@ impl TerminalPanel {
                 None
             };
 
-            (cells, cursor_point, cursor_shape, selection_range, display_offset, extra_row_cells)
+            (cells, cursor_point, cursor_shape, selection_range, display_offset, extra_row_cells, total_lines, screen_lines)
         }; // lock released here
 
         // --- Build quads and text specs without holding the lock ---
@@ -1102,6 +1104,29 @@ impl TerminalPanel {
                     bounds: content_clip,
                 });
             }
+        }
+
+        // --- Scrollbar ---
+        if total_lines > screen_lines {
+            let content_height = vp.content_rect.height;
+            let scrollbar_width = 6.0 * scale;
+            let min_scrollbar_height = 20.0 * scale;
+            let scrollbar_height = ((screen_lines as f32 / total_lines as f32) * content_height)
+                .max(min_scrollbar_height);
+            let max_offset = total_lines.saturating_sub(screen_lines);
+            let scrollbar_y = if max_offset > 0 {
+                content_y + (display_offset as f32 / max_offset as f32)
+                    * (content_height - scrollbar_height)
+            } else {
+                content_y
+            };
+            let scrollbar_rect = Rect {
+                x: content_x + vp.content_rect.width - scrollbar_width,
+                y: scrollbar_y,
+                width: scrollbar_width,
+                height: scrollbar_height,
+            };
+            ctx.rounded_rect(scrollbar_rect, [1.0, 1.0, 1.0, 0.25], 3.0 * scale);
         }
     }
 
