@@ -1122,7 +1122,7 @@ impl ApplicationHandler<TerminalEvent> for App {
                             return;
                         }
                         PhysicalKey::Code(KeyCode::KeyT) => {
-                            self.open_new_tab_dropdown();
+                            self.new_tab(None);
                             self.request_redraw();
                             return;
                         }
@@ -1173,7 +1173,7 @@ impl ApplicationHandler<TerminalEvent> for App {
                             return;
                         }
                         PhysicalKey::Code(KeyCode::KeyT) => {
-                            self.open_new_tab_dropdown();
+                            self.new_tab(None);
                             self.request_redraw();
                             return;
                         }
