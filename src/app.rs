@@ -4,7 +4,7 @@ use std::time::{Duration, Instant};
 use alacritty_terminal::selection::SelectionType;
 use winit::application::ApplicationHandler;
 use winit::event::{ElementState, MouseButton, WindowEvent};
-use winit::event_loop::{ActiveEventLoop, EventLoopProxy};
+use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoopProxy};
 use winit::keyboard::{KeyCode, PhysicalKey};
 use winit::window::{CursorIcon, Window, WindowAttributes, WindowId};
 
@@ -655,8 +655,9 @@ impl ApplicationHandler<TerminalEvent> for App {
                             self.last_redraw = Instant::now();
                             self.request_redraw();
                         } else {
-                            // Too soon for idle blink — skip render, schedule next
-                            self.request_redraw();
+                            // Too soon for idle blink — sleep until next frame instead of busy-looping
+                            let wait_until = self.last_redraw + Duration::from_millis(33);
+                            event_loop.set_control_flow(ControlFlow::WaitUntil(wait_until));
                         }
                     } else {
                         // Cursor hidden — just render (no continuous redraw)
@@ -967,6 +968,19 @@ impl ApplicationHandler<TerminalEvent> for App {
             }
 
             _ => {}
+        }
+    }
+
+    fn about_to_wait(&mut self, _event_loop: &ActiveEventLoop) {
+        // After waking up from WaitUntil, request a redraw so the cursor blink updates.
+        // Only request if enough time has passed to avoid re-entering a busy loop.
+        let elapsed = self.last_redraw.elapsed();
+        if elapsed >= Duration::from_millis(33) {
+            if let Some(panel) = self.tabs.get(self.active_tab) {
+                if panel.cursor_visible() {
+                    self.request_redraw();
+                }
+            }
         }
     }
 }
