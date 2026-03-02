@@ -913,7 +913,7 @@ impl SshDialogWindow {
         event_loop: &ActiveEventLoop,
         theme: &Theme,
         prefill: Option<&SshPrefill>,
-    ) -> Self {
+    ) -> Option<Self> {
         let theme = theme.clone();
         let dialog_width = theme.dialog.width;
         let initial_h = 280.0;
@@ -924,18 +924,17 @@ impl SshDialogWindow {
             .with_resizable(false)
             .with_visible(false);
 
-        let window = Arc::new(
-            event_loop
-                .create_window(attrs)
-                .expect("create SSH dialog window"),
-        );
+        let window = match event_loop.create_window(attrs) {
+            Ok(w) => Arc::new(w),
+            Err(_) => return None,
+        };
         let actual_scale = window.scale_factor() as f32;
 
         let mut gpu = crate::gpu::GpuSimple::new(
             window.clone(),
             theme.colors.clone(),
             theme.dialog.max_rounded_rects,
-        );
+        )?;
 
         let dialog = SshDialog::new(actual_scale, &theme, &mut gpu.font_system, prefill);
 
@@ -958,7 +957,7 @@ impl SshDialogWindow {
         s.render();
         s.window.set_visible(true);
 
-        s
+        Some(s)
     }
 
     pub fn window_id(&self) -> WindowId {
@@ -1198,9 +1197,7 @@ impl SshDialogWindow {
                     .surface
                     .configure(&self.gpu.device, &self.gpu.surface_config);
             }
-            Err(e) => {
-                log::error!("ssh dialog render error: {e}");
-            }
+            Err(_) => {}
         }
     }
 }

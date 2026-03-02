@@ -102,7 +102,7 @@ impl App {
         gpu: &GpuContext,
         shell: Option<String>,
         args: Vec<String>,
-    ) -> TerminalPanel {
+    ) -> Option<TerminalPanel> {
         let (panel_id, vp, event_proxy) = self.new_panel_params(gpu);
         let cell_px = (
             (gpu.cell.width * gpu.scale_factor) as u16,
@@ -123,7 +123,7 @@ impl App {
     }
 
     fn update_viewports(&mut self) {
-        let gpu = self.gpu.as_ref().unwrap();
+        let Some(gpu) = self.gpu.as_ref() else { return };
         let cell = gpu.cell;
         let scale = gpu.scale_factor;
         let area = self.panel_area(gpu);
@@ -136,7 +136,7 @@ impl App {
     }
 
     fn update_tab_bar(&mut self) {
-        let gpu = self.gpu.as_mut().unwrap();
+        let Some(gpu) = self.gpu.as_mut() else { return };
         let scale = gpu.scale_factor;
         let pad = self.theme.general.panel_area_padding * scale;
         let panel_width = gpu.surface_config.width as f32 - 2.0 * pad;
@@ -164,7 +164,7 @@ impl App {
             return false;
         }
 
-        let gpu = self.gpu.as_mut().unwrap();
+        let Some(gpu) = self.gpu.as_mut() else { return false };
         let scale = gpu.scale_factor;
         let cell = gpu.cell;
         let colors = gpu.colors.clone();
@@ -237,12 +237,7 @@ impl App {
                 let h = gpu.surface_config.height;
                 gpu.resize(w, h);
             }
-            Err(wgpu::SurfaceError::Timeout) => {
-                log::warn!("surface timeout");
-            }
-            Err(e) => {
-                log::error!("render error: {e}");
-            }
+            Err(_) => {}
         }
         took_screenshot
     }
@@ -281,9 +276,10 @@ impl App {
     }
 
     fn new_tab(&mut self, shell: Option<String>) {
-        let gpu = self.gpu.as_ref().unwrap();
-        let panel = self.create_terminal_panel(gpu, shell, Vec::new());
-        self.add_tab(panel);
+        let Some(gpu) = self.gpu.as_ref() else { return };
+        if let Some(panel) = self.create_terminal_panel(gpu, shell, Vec::new()) {
+            self.add_tab(panel);
+        }
     }
 
     fn new_tab_ssh(&mut self, result: SshResult) {
@@ -291,7 +287,7 @@ impl App {
     }
 
     fn connect_ssh(&mut self, config: crate::ssh::SshConfig) {
-        let gpu = self.gpu.as_ref().unwrap();
+        let Some(gpu) = self.gpu.as_ref() else { return };
         let (panel_id, vp, event_proxy) = self.new_panel_params(gpu);
         let size = TermSize::new(vp.cols, vp.rows);
         let panel = TerminalPanel::new_ssh(panel_id, size, event_proxy, config);
@@ -328,7 +324,7 @@ impl App {
         let shells = self.cached_shells.as_deref().unwrap_or(&[]);
         let saved = &self.saved_sessions.sessions;
 
-        let gpu = self.gpu.as_mut().unwrap();
+        let Some(gpu) = self.gpu.as_mut() else { return };
         let scale = gpu.scale_factor;
         let surface_w = gpu.surface_config.width as f32;
         let surface_h = gpu.surface_config.height as f32;
@@ -386,7 +382,7 @@ impl App {
         }
         entries.push(MenuEntry::item("Paste", MenuAction::Paste));
 
-        let gpu = self.gpu.as_mut().unwrap();
+        let Some(gpu) = self.gpu.as_mut() else { return };
         let scale = gpu.scale_factor;
         let surface_w = gpu.surface_config.width as f32;
         let surface_h = gpu.surface_config.height as f32;
@@ -408,7 +404,7 @@ impl App {
             return; // already open
         }
         self.ssh_dialog_window =
-            Some(SshDialogWindow::open(event_loop, &self.theme, prefill.as_ref()));
+            SshDialogWindow::open(event_loop, &self.theme, prefill.as_ref());
     }
 
     fn save_ssh_session(&mut self, result: &SshResult) {
@@ -496,8 +492,20 @@ impl ApplicationHandler<TerminalEvent> for App {
             .with_inner_size(winit::dpi::LogicalSize::new(800, 600))
             .with_visible(false);
 
-        let window = Arc::new(event_loop.create_window(attrs).expect("create window"));
-        let gpu = GpuContext::new(window.clone(), self.theme.colors.clone());
+        let window = match event_loop.create_window(attrs) {
+            Ok(w) => Arc::new(w),
+            Err(_) => {
+                event_loop.exit();
+                return;
+            }
+        };
+        let gpu = match GpuContext::new(window.clone(), self.theme.colors.clone()) {
+            Some(g) => g,
+            None => {
+                event_loop.exit();
+                return;
+            }
+        };
 
         self.window = Some(window.clone());
         self.gpu = Some(gpu);
@@ -534,7 +542,6 @@ impl ApplicationHandler<TerminalEvent> for App {
                 }
             }
             TerminalEvent::Exit(panel_id) => {
-                log::info!("terminal {panel_id:?} exited");
                 self.tabs.retain(|p| p.id() != panel_id);
 
                 if self.tabs.is_empty() {
@@ -855,7 +862,6 @@ impl ApplicationHandler<TerminalEvent> for App {
                             self.screenshot_pending =
                                 Some("/tmp/pfauterminal_screenshot.png".to_string());
                             self.request_redraw();
-                            log::info!("screenshot requested");
                             return;
                         }
                         _ => {}

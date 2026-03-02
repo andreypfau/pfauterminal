@@ -25,11 +25,8 @@ impl IconManager {
         Self {
             trees: ICONS
                 .iter()
-                .map(|&(id, svg)| {
-                    (
-                        id,
-                        resvg::usvg::Tree::from_str(svg, &opts).expect("parse svg"),
-                    )
+                .filter_map(|&(id, svg)| {
+                    Some((id, resvg::usvg::Tree::from_str(svg, &opts).ok()?))
                 })
                 .collect(),
         }
