@@ -37,14 +37,20 @@ mod macos {
     const CMD_OPT_MASK: usize = (1 << 20) | (1 << 19);
 
     unsafe fn nsstring(s: &str) -> *mut Object {
-        let cls = Class::get("NSString").unwrap();
-        let cstr = CString::new(s).unwrap();
+        let Some(cls) = Class::get("NSString") else {
+            return std::ptr::null_mut();
+        };
+        let Ok(cstr) = CString::new(s) else {
+            return std::ptr::null_mut();
+        };
         msg_send![cls, stringWithUTF8String: cstr.as_ptr()]
     }
 
     unsafe fn menu_item(title: &str, action: Sel, key: &str) -> *mut Object {
         unsafe {
-            let cls = Class::get("NSMenuItem").unwrap();
+            let Some(cls) = Class::get("NSMenuItem") else {
+                return std::ptr::null_mut();
+            };
             let ns_title = nsstring(title);
             let ns_key = nsstring(key);
             let item: *mut Object = msg_send![cls, alloc];
@@ -53,7 +59,9 @@ mod macos {
     }
 
     unsafe fn separator() -> *mut Object {
-        let cls = Class::get("NSMenuItem").unwrap();
+        let Some(cls) = Class::get("NSMenuItem") else {
+            return std::ptr::null_mut();
+        };
         msg_send![cls, separatorItem]
     }
 
@@ -70,8 +78,11 @@ mod macos {
                 nsstring(&format!("Copyright © {APP_YEAR} {APP_AUTHOR}")),
             ];
 
+            let Some(dict_cls) = Class::get("NSDictionary") else {
+                return std::ptr::null_mut();
+            };
             msg_send![
-                Class::get("NSDictionary").unwrap(),
+                dict_cls,
                 dictionaryWithObjects: values.as_ptr()
                 forKeys: keys.as_ptr()
                 count: 3usize
@@ -82,8 +93,8 @@ mod macos {
     /// Objective-C method called when "About pfauterminal" is clicked.
     extern "C" fn handle_about(_this: &Object, _cmd: Sel, _sender: *mut Object) {
         unsafe {
-            let app: *mut Object =
-                msg_send![Class::get("NSApplication").unwrap(), sharedApplication];
+            let Some(app_cls) = Class::get("NSApplication") else { return };
+            let app: *mut Object = msg_send![app_cls, sharedApplication];
             let dict = about_options_dict();
             let _: () = msg_send![app, orderFrontStandardAboutPanelWithOptions: dict];
         }
@@ -93,8 +104,12 @@ mod macos {
     /// panel with our custom ApplicationName / Version / Copyright.
     unsafe fn register_about_handler() -> *mut Object {
         unsafe {
-            let superclass = Class::get("NSObject").unwrap();
-            let mut decl = ClassDecl::new("PFAUAboutHandler", superclass).unwrap();
+            let Some(superclass) = Class::get("NSObject") else {
+                return std::ptr::null_mut();
+            };
+            let Some(mut decl) = ClassDecl::new("PFAUAboutHandler", superclass) else {
+                return std::ptr::null_mut();
+            };
             decl.add_method(
                 sel!(showAbout:),
                 handle_about as extern "C" fn(&Object, Sel, *mut Object),
@@ -106,10 +121,10 @@ mod macos {
 
     pub fn setup_menu_bar() {
         unsafe {
-            let app: *mut Object =
-                msg_send![Class::get("NSApplication").unwrap(), sharedApplication];
-            let menu_cls = Class::get("NSMenu").unwrap();
-            let mi_cls = Class::get("NSMenuItem").unwrap();
+            let Some(app_cls) = Class::get("NSApplication") else { return };
+            let app: *mut Object = msg_send![app_cls, sharedApplication];
+            let Some(menu_cls) = Class::get("NSMenu") else { return };
+            let Some(mi_cls) = Class::get("NSMenuItem") else { return };
 
             // Handler for the About action (leaked intentionally — lives for app lifetime)
             let about_handler = register_about_handler();
@@ -183,8 +198,8 @@ mod macos {
 
     pub fn show_about_panel() {
         unsafe {
-            let app: *mut Object =
-                msg_send![Class::get("NSApplication").unwrap(), sharedApplication];
+            let Some(app_cls) = Class::get("NSApplication") else { return };
+            let app: *mut Object = msg_send![app_cls, sharedApplication];
             let dict = about_options_dict();
             let _: () = msg_send![app, orderFrontStandardAboutPanelWithOptions: dict];
         }

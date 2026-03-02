@@ -11,8 +11,9 @@ use alacritty_terminal::index::{Column, Line, Point, Side};
 use alacritty_terminal::selection::{Selection, SelectionType};
 use alacritty_terminal::sync::FairMutex;
 use alacritty_terminal::term::{self, TermMode};
-use alacritty_terminal::vte::ansi::CursorShape;
+use alacritty_terminal::vte::ansi::{Color, CursorShape};
 use alacritty_terminal::tty;
+use alacritty_terminal::term::cell::Flags;
 use alacritty_terminal::Term;
 use glyphon::{Buffer, Color as GlyphonColor, FontSystem, Shaping};
 use tokio::sync::mpsc;
@@ -279,6 +280,17 @@ impl CursorAnimation {
     }
 }
 
+// --- Grid snapshot (for lock-free rendering) ---
+
+#[derive(Clone, Copy)]
+struct SnapshotCell {
+    point: Point,
+    c: char,
+    fg: Color,
+    bg: Color,
+    flags: Flags,
+}
+
 // --- Terminal panel ---
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -318,7 +330,7 @@ impl TerminalPanel {
         event_proxy: EventProxy,
         shell: Option<String>,
         args: Vec<String>,
-    ) -> Self {
+    ) -> Option<Self> {
         let config = alacritty_terminal::term::Config::default();
         let term = Term::new(config, &size, event_proxy.clone());
         let term = Arc::new(FairMutex::new(term));
@@ -344,16 +356,15 @@ impl TerminalPanel {
             cell_height: cell_px.1,
         };
 
-        let pty = tty::new(&pty_config, window_size, 0).expect("failed to create PTY");
-        let event_loop = EventLoop::new(term.clone(), event_proxy.clone(), pty, false, false)
-            .expect("failed to create event loop");
+        let pty = tty::new(&pty_config, window_size, 0).ok()?;
+        let event_loop = EventLoop::new(term.clone(), event_proxy.clone(), pty, false, false).ok()?;
         let channel = event_loop.channel();
 
         event_proxy.set_backend(Backend::Local(channel.clone()));
 
         event_loop.spawn();
 
-        Self {
+        Some(Self {
             id,
             term,
             backend: Backend::Local(channel),
@@ -366,7 +377,7 @@ impl TerminalPanel {
             active_selection: None,
             cursor_anim: CursorAnimation::new(),
             cursor_visible: false,
-        }
+        })
     }
 
     pub fn new_ssh(
@@ -464,6 +475,13 @@ impl TerminalPanel {
         self.cursor_visible
     }
 
+    /// Returns true if the cursor move animation is still in progress.
+    pub fn cursor_animating(&self) -> bool {
+        let elapsed = self.cursor_anim.move_time.elapsed().as_secs_f32();
+        let factor = (-self.cursor_anim.move_speed * elapsed).exp();
+        factor > 0.01
+    }
+
     pub fn handle_key(&mut self, event: &KeyEvent, ctrl: bool, alt: bool) -> bool {
         if event.state != ElementState::Pressed {
             return false;
@@ -489,17 +507,16 @@ impl TerminalPanel {
 
         self.cursor_anim.on_input();
         self.active_selection = None;
-        {
+        let mode = {
             let mut term = self.term.lock();
             term.selection = None;
             if term.grid().display_offset() != 0 {
                 term.scroll_display(alacritty_terminal::grid::Scroll::Bottom);
             }
-        }
+            *term.mode()
+        };
         self.scroll_pixel_offset = 0.0;
         self.scroll_accumulator = 0.0;
-
-        let mode = *self.term.lock().mode();
         let app_cursor = mode.contains(TermMode::APP_CURSOR);
         // SS3 prefix for application cursor mode, CSI for normal mode
         let cursor_prefix: &[u8] = if app_cursor { b"\x1bO" } else { b"\x1b[" };
@@ -508,7 +525,7 @@ impl TerminalPanel {
         if ctrl {
             let ctrl_byte = match event.logical_key.as_ref() {
                 Key::Character(c) if c.len() == 1 => {
-                    let ch = c.chars().next().unwrap();
+                    let Some(ch) = c.chars().next() else { return false };
                     match ch {
                         'a'..='z' => Some(ch as u8 - b'a' + 1),
                         'A'..='Z' => Some(ch as u8 - b'A' + 1),
@@ -749,9 +766,8 @@ impl TerminalPanel {
 
         let metrics = font::metrics();
 
-        {
-            use alacritty_terminal::term::cell::Flags;
-
+        // --- Snapshot grid data under the lock, then release it ---
+        let (cells, cursor_point, cursor_shape, selection_range, display_offset, extra_row_cells) = {
             let mut term = self.term.lock();
             // Re-apply our selection — terminal output may have cleared it.
             if let Some(sel) = &self.active_selection {
@@ -762,36 +778,214 @@ impl TerminalPanel {
             let cursor_point = content.cursor.point;
             let cursor_shape = content.cursor.shape;
             let selection_range = content.selection;
-            let selection_color = colors.selection.to_linear_f32();
 
             // display_iter provides screen_lines+1 rows: one extra above the
             // viewport (viewport_line == -1). We render it when pixel_offset > 0
             // to fill the gap at the top during smooth upward scroll.
             let min_vline = if pixel_offset > 0.0 { -1 } else { 0 };
 
-            for indexed in content.display_iter {
+            let cells: Vec<SnapshotCell> = content.display_iter.filter_map(|indexed| {
                 let viewport_line = indexed.point.line.0 + display_offset as i32;
                 let col = indexed.point.column.0;
                 if viewport_line < min_vline || viewport_line >= rows as i32 || col >= cols {
-                    continue;
+                    return None;
                 }
-
                 let cell = &*indexed;
-                let flags = cell.flags;
+                Some(SnapshotCell {
+                    point: indexed.point,
+                    c: cell.c,
+                    fg: cell.fg,
+                    bg: cell.bg,
+                    flags: cell.flags,
+                })
+            }).collect();
+
+            // Extra bottom row: when content shifts up (scroll down), read
+            // one row past the viewport from the grid directly.
+            let extra_row_cells = if pixel_offset < -0.5 && display_offset > 0 {
+                let grid = term.grid();
+                let grid_line = rows as i32 - display_offset as i32;
+                let row_data = &grid[Line(grid_line)];
+                Some((0..cols).map(|col_idx| {
+                    let cell = &row_data[Column(col_idx)];
+                    SnapshotCell {
+                        point: Point::new(Line(grid_line), Column(col_idx)),
+                        c: cell.c,
+                        fg: cell.fg,
+                        bg: cell.bg,
+                        flags: cell.flags,
+                    }
+                }).collect::<Vec<_>>())
+            } else {
+                None
+            };
+
+            (cells, cursor_point, cursor_shape, selection_range, display_offset, extra_row_cells)
+        }; // lock released here
+
+        // --- Build quads and text specs without holding the lock ---
+        let selection_color = colors.selection.to_linear_f32();
+
+        for snap in &cells {
+            let viewport_line = snap.point.line.0 + display_offset as i32;
+            let col = snap.point.column.0;
+            let flags = snap.flags;
+
+            let (fg_color, bg_color) = if flags.contains(Flags::INVERSE) {
+                (snap.bg, snap.fg)
+            } else {
+                (snap.fg, snap.bg)
+            };
+
+            let selected = selection_range.is_some_and(|r| r.contains(snap.point));
+            let cy = content_y + viewport_line as f32 * pch + pixel_offset;
+
+            if selected {
+                let quad = Rect {
+                    x: content_x + col as f32 * pcw,
+                    y: cy,
+                    width: pcw,
+                    height: pch,
+                };
+                if let Some(clipped) = quad.clip_y(content_y, content_bottom) {
+                    ctx.flat_quad(clipped, selection_color);
+                }
+            } else if !colors.is_default_bg(bg_color) {
+                let quad = Rect {
+                    x: content_x + col as f32 * pcw,
+                    y: cy,
+                    width: pcw,
+                    height: pch,
+                };
+                if let Some(clipped) = quad.clip_y(content_y, content_bottom) {
+                    ctx.flat_quad(clipped, colors.to_rgba(bg_color));
+                }
+            }
+
+            let is_invisible = flags.intersects(
+                Flags::WIDE_CHAR_SPACER | Flags::LEADING_WIDE_CHAR_SPACER | Flags::HIDDEN,
+            );
+            let c = if is_invisible { ' ' } else { snap.c };
+            if c == ' ' || c == '\0' {
+                continue;
+            }
+
+            let dim = flags.contains(Flags::DIM);
+            let fg = if dim {
+                let base = colors.to_glyphon_fg(fg_color);
+                GlyphonColor::rgba(base.r() / 2, base.g() / 2, base.b() / 2, base.a())
+            } else {
+                colors.to_glyphon_fg(fg_color)
+            };
+
+            let cx = content_x + col as f32 * pcw;
+
+            if let Some(rects) = block_char_rects(c, cx, cy, pcw, pch) {
+                let color = glyphon_to_linear(fg);
+                for r in rects {
+                    if let Some(clipped) = r.clip_y(content_y, content_bottom) {
+                        ctx.flat_quad(clipped, color);
+                    }
+                }
+                continue;
+            }
+
+            let bold = flags.contains(Flags::BOLD);
+            let italic = flags.contains(Flags::ITALIC);
+            let key = CharKey { ch: c, bold, italic };
+            let buf_idx = get_or_create_buffer(
+                &mut self.char_buffers,
+                &mut self.char_key_map,
+                key,
+                font_system,
+                metrics,
+                cell_metrics,
+            );
+
+            text_specs.push(TextSpec {
+                left: cx,
+                top: cy,
+                color: fg,
+                buffer_index: buf_idx,
+                bounds: content_clip,
+            });
+        }
+
+        // Animated cursor (hidden when TUI apps send ESC[?25l)
+        if cursor_shape != CursorShape::Hidden {
+            let cur_viewport_line = cursor_point.line.0 + display_offset as i32;
+            let cur_col = cursor_point.column.0;
+            if cur_viewport_line >= 0 {
+                let cur_row = cur_viewport_line as usize;
+                if cur_row < rows && cur_col < cols {
+                    let cx = content_x + cur_col as f32 * pcw;
+                    let cy = content_y + cur_row as f32 * pch + pixel_offset;
+
+                    let (tw, th) = match cursor_shape {
+                        CursorShape::Beam => (2.0 * scale, pch),
+                        CursorShape::Underline => (pcw, 2.0 * scale),
+                        _ => (pcw, pch), // Block and default
+                    };
+
+                    let ty = match cursor_shape {
+                        CursorShape::Underline => cy + pch - th,
+                        _ => cy,
+                    };
+
+                    self.cursor_anim.set_target(cx, ty, tw, th);
+
+                    let anim = &self.cursor_anim;
+                    ctx.cursor = Some(CursorData {
+                        prev_rect: Rect {
+                            x: anim.prev_x,
+                            y: anim.prev_y,
+                            width: anim.prev_w,
+                            height: anim.prev_h,
+                        },
+                        target_rect: Rect {
+                            x: anim.target_x,
+                            y: anim.target_y,
+                            width: anim.target_w,
+                            height: anim.target_h,
+                        },
+                        color: colors.cursor.to_linear_f32(),
+                        radius: CURSOR_RADIUS * scale,
+                        time_since_move: anim.move_time.elapsed().as_secs_f32(),
+                        time_since_input: anim.last_input_time.elapsed().as_secs_f32(),
+                        move_speed: anim.move_speed,
+                        clip_top: content_y,
+                        clip_bottom: content_bottom,
+                    });
+                    self.cursor_visible = true;
+                }
+            }
+        } else {
+            self.cursor_anim.snap();
+            self.cursor_visible = false;
+        }
+
+        // Extra bottom row: fill the gap at the bottom during smooth scroll
+        if let Some(extra_cells) = &extra_row_cells {
+            let grid_line = rows as i32 - display_offset as i32;
+            let _ = grid_line; // used only for point construction during snapshot
+            let y_base = content_y + rows as f32 * pch + pixel_offset;
+
+            for snap in extra_cells {
+                let col_idx = snap.point.column.0;
+                let flags = snap.flags;
 
                 let (fg_color, bg_color) = if flags.contains(Flags::INVERSE) {
-                    (cell.bg, cell.fg)
+                    (snap.bg, snap.fg)
                 } else {
-                    (cell.fg, cell.bg)
+                    (snap.fg, snap.bg)
                 };
 
-                let selected = selection_range.is_some_and(|r| r.contains(indexed.point));
-                let cy = content_y + viewport_line as f32 * pch + pixel_offset;
+                let selected = selection_range.is_some_and(|r| r.contains(snap.point));
 
                 if selected {
                     let quad = Rect {
-                        x: content_x + col as f32 * pcw,
-                        y: cy,
+                        x: content_x + col_idx as f32 * pcw,
+                        y: y_base,
                         width: pcw,
                         height: pch,
                     };
@@ -800,8 +994,8 @@ impl TerminalPanel {
                     }
                 } else if !colors.is_default_bg(bg_color) {
                     let quad = Rect {
-                        x: content_x + col as f32 * pcw,
-                        y: cy,
+                        x: content_x + col_idx as f32 * pcw,
+                        y: y_base,
                         width: pcw,
                         height: pch,
                     };
@@ -811,9 +1005,11 @@ impl TerminalPanel {
                 }
 
                 let is_invisible = flags.intersects(
-                    Flags::WIDE_CHAR_SPACER | Flags::LEADING_WIDE_CHAR_SPACER | Flags::HIDDEN,
+                    Flags::WIDE_CHAR_SPACER
+                        | Flags::LEADING_WIDE_CHAR_SPACER
+                        | Flags::HIDDEN,
                 );
-                let c = if is_invisible { ' ' } else { cell.c };
+                let c = if is_invisible { ' ' } else { snap.c };
                 if c == ' ' || c == '\0' {
                     continue;
                 }
@@ -821,14 +1017,19 @@ impl TerminalPanel {
                 let dim = flags.contains(Flags::DIM);
                 let fg = if dim {
                     let base = colors.to_glyphon_fg(fg_color);
-                    GlyphonColor::rgba(base.r() / 2, base.g() / 2, base.b() / 2, base.a())
+                    GlyphonColor::rgba(
+                        base.r() / 2,
+                        base.g() / 2,
+                        base.b() / 2,
+                        base.a(),
+                    )
                 } else {
                     colors.to_glyphon_fg(fg_color)
                 };
 
-                let cx = content_x + col as f32 * pcw;
+                let cx = content_x + col_idx as f32 * pcw;
 
-                if let Some(rects) = block_char_rects(c, cx, cy, pcw, pch) {
+                if let Some(rects) = block_char_rects(c, cx, y_base, pcw, pch) {
                     let color = glyphon_to_linear(fg);
                     for r in rects {
                         if let Some(clipped) = r.clip_y(content_y, content_bottom) {
@@ -852,165 +1053,11 @@ impl TerminalPanel {
 
                 text_specs.push(TextSpec {
                     left: cx,
-                    top: cy,
+                    top: y_base,
                     color: fg,
                     buffer_index: buf_idx,
                     bounds: content_clip,
                 });
-            }
-
-            // Animated cursor (hidden when TUI apps send ESC[?25l)
-            if cursor_shape != CursorShape::Hidden {
-                let cur_viewport_line = cursor_point.line.0 + display_offset as i32;
-                let cur_col = cursor_point.column.0;
-                if cur_viewport_line >= 0 {
-                    let cur_row = cur_viewport_line as usize;
-                    if cur_row < rows && cur_col < cols {
-                        let cx = content_x + cur_col as f32 * pcw;
-                        let cy = content_y + cur_row as f32 * pch + pixel_offset;
-
-                        let (tw, th) = match cursor_shape {
-                            CursorShape::Beam => (2.0 * scale, pch),
-                            CursorShape::Underline => (pcw, 2.0 * scale),
-                            _ => (pcw, pch), // Block and default
-                        };
-
-                        let ty = match cursor_shape {
-                            CursorShape::Underline => cy + pch - th,
-                            _ => cy,
-                        };
-
-                        self.cursor_anim.set_target(cx, ty, tw, th);
-
-                        let anim = &self.cursor_anim;
-                        ctx.cursor = Some(CursorData {
-                            prev_rect: Rect {
-                                x: anim.prev_x,
-                                y: anim.prev_y,
-                                width: anim.prev_w,
-                                height: anim.prev_h,
-                            },
-                            target_rect: Rect {
-                                x: anim.target_x,
-                                y: anim.target_y,
-                                width: anim.target_w,
-                                height: anim.target_h,
-                            },
-                            color: colors.cursor.to_linear_f32(),
-                            radius: CURSOR_RADIUS * scale,
-                            time_since_move: anim.move_time.elapsed().as_secs_f32(),
-                            time_since_input: anim.last_input_time.elapsed().as_secs_f32(),
-                            move_speed: anim.move_speed,
-                            clip_top: content_y,
-                            clip_bottom: content_bottom,
-                        });
-                        self.cursor_visible = true;
-                    }
-                }
-            } else {
-                self.cursor_anim.snap();
-                self.cursor_visible = false;
-            }
-
-            // Extra bottom row: when content shifts up (scroll down), fill
-            // the gap at the bottom by reading one row past the viewport
-            // from the grid directly (display_iter doesn't include it).
-            if pixel_offset < -0.5 && display_offset > 0 {
-                let grid = term.grid();
-                let grid_line = rows as i32 - display_offset as i32;
-                let y_base = content_y + rows as f32 * pch + pixel_offset;
-                let row_data = &grid[Line(grid_line)];
-
-                for col_idx in 0..cols {
-                    let cell = &row_data[Column(col_idx)];
-                    let flags = cell.flags;
-
-                    let (fg_color, bg_color) = if flags.contains(Flags::INVERSE) {
-                        (cell.bg, cell.fg)
-                    } else {
-                        (cell.fg, cell.bg)
-                    };
-
-                    let extra_point = Point::new(Line(grid_line), Column(col_idx));
-                    let selected = selection_range.is_some_and(|r| r.contains(extra_point));
-
-                    if selected {
-                        let quad = Rect {
-                            x: content_x + col_idx as f32 * pcw,
-                            y: y_base,
-                            width: pcw,
-                            height: pch,
-                        };
-                        if let Some(clipped) = quad.clip_y(content_y, content_bottom) {
-                            ctx.flat_quad(clipped, selection_color);
-                        }
-                    } else if !colors.is_default_bg(bg_color) {
-                        let quad = Rect {
-                            x: content_x + col_idx as f32 * pcw,
-                            y: y_base,
-                            width: pcw,
-                            height: pch,
-                        };
-                        if let Some(clipped) = quad.clip_y(content_y, content_bottom) {
-                            ctx.flat_quad(clipped, colors.to_rgba(bg_color));
-                        }
-                    }
-
-                    let is_invisible = flags.intersects(
-                        Flags::WIDE_CHAR_SPACER
-                            | Flags::LEADING_WIDE_CHAR_SPACER
-                            | Flags::HIDDEN,
-                    );
-                    let c = if is_invisible { ' ' } else { cell.c };
-                    if c == ' ' || c == '\0' {
-                        continue;
-                    }
-
-                    let dim = flags.contains(Flags::DIM);
-                    let fg = if dim {
-                        let base = colors.to_glyphon_fg(fg_color);
-                        GlyphonColor::rgba(
-                            base.r() / 2,
-                            base.g() / 2,
-                            base.b() / 2,
-                            base.a(),
-                        )
-                    } else {
-                        colors.to_glyphon_fg(fg_color)
-                    };
-
-                    let cx = content_x + col_idx as f32 * pcw;
-
-                    if let Some(rects) = block_char_rects(c, cx, y_base, pcw, pch) {
-                        let color = glyphon_to_linear(fg);
-                        for r in rects {
-                            if let Some(clipped) = r.clip_y(content_y, content_bottom) {
-                                ctx.flat_quad(clipped, color);
-                            }
-                        }
-                        continue;
-                    }
-
-                    let bold = flags.contains(Flags::BOLD);
-                    let italic = flags.contains(Flags::ITALIC);
-                    let key = CharKey { ch: c, bold, italic };
-                    let buf_idx = get_or_create_buffer(
-                        &mut self.char_buffers,
-                        &mut self.char_key_map,
-                        key,
-                        font_system,
-                        metrics,
-                        cell_metrics,
-                    );
-
-                    text_specs.push(TextSpec {
-                        left: cx,
-                        top: y_base,
-                        color: fg,
-                        buffer_index: buf_idx,
-                        bounds: content_clip,
-                    });
-                }
             }
         }
     }

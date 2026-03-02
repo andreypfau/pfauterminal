@@ -31,35 +31,37 @@ fn disable_app_nap() {
     use objc::runtime::{Class, Object};
     use objc::{msg_send, sel, sel_impl};
     unsafe {
-        let cls = Class::get("NSProcessInfo").unwrap();
+        let Some(cls) = Class::get("NSProcessInfo") else { return };
         let info: *mut Object = msg_send![cls, processInfo];
-        // NSActivityUserInitiatedAllowingIdleSystemSleep = 0x00FFFFFF
-        let reason = ns_string("Terminal I/O");
+        let Some(reason) = ns_string("Terminal I/O") else { return };
         let _: *mut Object =
             msg_send![info, beginActivityWithOptions:0x00FFFFFFu64 reason:reason];
     }
 
-    unsafe fn ns_string(s: &str) -> *mut Object {
+    unsafe fn ns_string(s: &str) -> Option<*mut Object> {
         use objc::runtime::Class;
         use std::ffi::CString;
-        let cls = Class::get("NSString").unwrap();
-        let cstr = CString::new(s).unwrap();
-        msg_send![cls, stringWithUTF8String: cstr.as_ptr()]
+        let cls = Class::get("NSString")?;
+        let cstr = CString::new(s).ok()?;
+        Some(msg_send![cls, stringWithUTF8String: cstr.as_ptr()])
     }
 }
 
 fn main() {
-    env_logger::init();
-
     #[cfg(target_os = "macos")]
     disable_app_nap();
 
-    let event_loop = EventLoop::<TerminalEvent>::with_user_event()
-        .build()
-        .expect("create event loop");
+    let event_loop = match EventLoop::<TerminalEvent>::with_user_event().build() {
+        Ok(el) => el,
+        Err(_) => {
+            std::process::exit(1);
+        }
+    };
 
     let proxy = event_loop.create_proxy();
     let mut app = App::new(proxy);
 
-    event_loop.run_app(&mut app).expect("run event loop");
+    if event_loop.run_app(&mut app).is_err() {
+        std::process::exit(1);
+    }
 }

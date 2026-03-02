@@ -60,25 +60,33 @@ pub fn spawn_ssh_thread(
     let cols = size.columns as u16;
     let rows = size.screen_lines as u16;
 
-    std::thread::Builder::new()
+    let _ = std::thread::Builder::new()
         .name("ssh-io".into())
         .spawn(move || {
-            let rt = tokio::runtime::Builder::new_current_thread()
+            let rt = match tokio::runtime::Builder::new_current_thread()
                 .enable_all()
                 .build()
-                .expect("tokio runtime");
+            {
+                Ok(rt) => rt,
+                Err(e) => {
+                    use alacritty_terminal::event::EventListener;
+                    write_to_term(&term_clone, &format!(
+                        "\x1b[?25l\r\n\x1b[31mFailed to create async runtime: {e}\x1b[0m\r\n"
+                    ));
+                    event_proxy.send_event(alacritty_terminal::event::Event::Wakeup);
+                    return;
+                }
+            };
             rt.block_on(async move {
                 if let Err(e) = ssh_session(config, term_clone.clone(), event_proxy.clone(), rx, cols, rows).await {
                     use alacritty_terminal::event::EventListener;
-                    log::error!("SSH session error: {e}");
                     write_to_term(&term_clone, &format!(
                         "\x1b[?25l\r\n\x1b[31mSSH error: {e}\x1b[0m\r\n"
                     ));
                     event_proxy.send_event(alacritty_terminal::event::Event::Wakeup);
                 }
             });
-        })
-        .expect("spawn ssh thread");
+        });
 
     (term, tx)
 }
@@ -152,8 +160,6 @@ async fn ssh_session(
     };
 
     if let Err(reason) = auth_result {
-        log::error!("SSH authentication failed for {}@{}: {reason}", config.username, config.host);
-        // Hide cursor + show error
         write_to_term(&term, &format!(
             "\x1b[?25l\r\n\x1b[31mAuthentication failed for {}@{}\r\n  {reason}\x1b[0m\r\n",
             config.username, config.host

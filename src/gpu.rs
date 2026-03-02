@@ -41,7 +41,7 @@ struct GpuInit {
 }
 
 /// Initialize wgpu device, queue, surface, and configuration for a window.
-fn init_gpu(window: Arc<winit::window::Window>, texture_usages: TextureUsages) -> GpuInit {
+fn init_gpu(window: Arc<winit::window::Window>, texture_usages: TextureUsages) -> Option<GpuInit> {
     let size = window.inner_size();
 
     let instance = Instance::new(InstanceDescriptor {
@@ -49,14 +49,13 @@ fn init_gpu(window: Arc<winit::window::Window>, texture_usages: TextureUsages) -
         ..Default::default()
     });
 
-    let surface = instance.create_surface(window).expect("create surface");
+    let surface = instance.create_surface(window).ok()?;
 
     let adapter = pollster::block_on(instance.request_adapter(&RequestAdapterOptions {
         compatible_surface: Some(&surface),
         power_preference: PowerPreference::LowPower,
         ..Default::default()
-    }))
-    .expect("no adapter");
+    }))?;
 
     let (device, queue) = pollster::block_on(adapter.request_device(
         &DeviceDescriptor {
@@ -65,7 +64,7 @@ fn init_gpu(window: Arc<winit::window::Window>, texture_usages: TextureUsages) -
         },
         None,
     ))
-    .expect("request device");
+    .ok()?;
 
     let caps = surface.get_capabilities(&adapter);
     let surface_format = caps
@@ -95,13 +94,13 @@ fn init_gpu(window: Arc<winit::window::Window>, texture_usages: TextureUsages) -
     };
     surface.configure(&device, &surface_config);
 
-    GpuInit {
+    Some(GpuInit {
         device,
         queue,
         surface,
         surface_config,
         render_format,
-    }
+    })
 }
 
 struct TextResources {
@@ -519,13 +518,13 @@ impl GpuSimple {
         window: Arc<winit::window::Window>,
         colors: ColorScheme,
         max_rounded_rects: usize,
-    ) -> Self {
-        let gpu = init_gpu(window, TextureUsages::RENDER_ATTACHMENT);
+    ) -> Option<Self> {
+        let gpu = init_gpu(window, TextureUsages::RENDER_ATTACHMENT)?;
         let text = init_text_resources(&gpu.device, &gpu.queue, gpu.render_format);
         let rounded_rect =
             RoundedRectPipeline::new(&gpu.device, gpu.render_format, max_rounded_rects);
 
-        Self {
+        Some(Self {
             device: gpu.device,
             queue: gpu.queue,
             surface: gpu.surface,
@@ -539,7 +538,7 @@ impl GpuSimple {
             viewport: text.viewport,
             rounded_rect,
             colors,
-        }
+        })
     }
 
     pub fn resize(&mut self, width: u32, height: u32) {
@@ -579,7 +578,7 @@ impl GpuSimple {
                 base_text,
                 &mut self.swash_cache,
             )
-            .expect("prepare base text");
+            .ok();
 
         self.overlay_text_renderer
             .prepare(
@@ -591,7 +590,7 @@ impl GpuSimple {
                 overlay_text,
                 &mut self.swash_cache,
             )
-            .expect("prepare overlay text");
+            .ok();
 
         let mut encoder = self
             .device
@@ -605,13 +604,13 @@ impl GpuSimple {
             self.rounded_rect.draw_range(&mut pass, 0, base_rr_count);
             self.text_renderer
                 .render(&self.atlas, &self.viewport, &mut pass)
-                .expect("render base text");
+                .ok();
 
             self.rounded_rect
                 .draw_range(&mut pass, base_rr_count, total_rr_count - base_rr_count);
             self.overlay_text_renderer
                 .render(&self.atlas, &self.viewport, &mut pass)
-                .expect("render overlay text");
+                .ok();
         }
 
         finish_frame(&self.queue, &mut self.atlas, encoder, frame);
@@ -655,13 +654,13 @@ pub struct GpuContext {
 }
 
 impl GpuContext {
-    pub fn new(window: Arc<winit::window::Window>, colors: ColorScheme) -> Self {
+    pub fn new(window: Arc<winit::window::Window>, colors: ColorScheme) -> Option<Self> {
         let scale_factor = window.scale_factor() as f32;
 
         let gpu = init_gpu(
             window,
             TextureUsages::RENDER_ATTACHMENT | TextureUsages::COPY_SRC,
-        );
+        )?;
         let mut text = init_text_resources(&gpu.device, &gpu.queue, gpu.render_format);
         let rounded_rect =
             RoundedRectPipeline::new(&gpu.device, gpu.render_format, MAX_ROUNDED_RECTS);
@@ -732,7 +731,7 @@ impl GpuContext {
         let mut overlay_icon_carrier = Buffer::new(&mut text.font_system, Metrics::new(1.0, 1.0));
         overlay_icon_carrier.set_size(&mut text.font_system, Some(0.0), Some(0.0));
 
-        Self {
+        Some(Self {
             device: gpu.device,
             queue: gpu.queue,
             surface: gpu.surface,
@@ -753,7 +752,7 @@ impl GpuContext {
             cursor_pipeline,
             icon_carrier,
             overlay_icon_carrier,
-        }
+        })
     }
 
     fn capture_screenshot(&self, path: &str, texture: &Texture) {
@@ -794,10 +793,12 @@ impl GpuContext {
         let buffer_slice = staging_buf.slice(..);
         let (tx, rx) = std::sync::mpsc::channel();
         buffer_slice.map_async(MapMode::Read, move |result| {
-            tx.send(result).unwrap();
+            let _ = tx.send(result);
         });
         self.device.poll(Maintain::Wait);
-        rx.recv().unwrap().expect("map staging buffer");
+        if rx.recv().ok().and_then(|r| r.ok()).is_none() {
+            return;
+        }
 
         let data = buffer_slice.get_mapped_range();
         save_screenshot(path, &data, width, height, padded_row);
@@ -895,7 +896,7 @@ impl GpuContext {
                 &mut self.swash_cache,
                 |req| icon_manager.rasterize(req),
             )
-            .expect("prepare scene text");
+            .ok();
 
         // Overlay text (dropdown) with icon support
         let mut overlay_areas: Vec<TextArea> = Vec::new();
@@ -932,7 +933,7 @@ impl GpuContext {
                 &mut self.swash_cache,
                 |req| icon_manager.rasterize(req),
             )
-            .expect("prepare overlay text");
+            .ok();
 
         // Upload cursor uniforms
         if let Some(cursor) = &scene.cursor {
@@ -971,7 +972,7 @@ impl GpuContext {
 
             self.text_renderer
                 .render(&self.atlas, &self.viewport, &mut pass)
-                .expect("render scene text");
+                .ok();
 
             // === Overlay layer ===
             self.rounded_rect.draw_range(
@@ -982,7 +983,7 @@ impl GpuContext {
 
             self.overlay_text_renderer
                 .render(&self.atlas, &self.viewport, &mut pass)
-                .expect("render overlay text");
+                .ok();
         }
 
         if let Some(path) = screenshot_path {
@@ -1003,7 +1004,10 @@ impl GpuContext {
 // ---------------------------------------------------------------------------
 
 fn save_screenshot(path: &str, data: &[u8], width: u32, height: u32, padded_row: u32) {
-    let file = std::fs::File::create(path).expect("create screenshot file");
+    let file = match std::fs::File::create(path) {
+        Ok(f) => f,
+        Err(_) => return,
+    };
     let writer = std::io::BufWriter::new(file);
 
     let mut encoder = png::Encoder::new(writer, width, height);
@@ -1011,7 +1015,10 @@ fn save_screenshot(path: &str, data: &[u8], width: u32, height: u32, padded_row:
     encoder.set_depth(png::BitDepth::Eight);
     encoder.set_source_srgb(png::SrgbRenderingIntent::Perceptual);
 
-    let mut writer = encoder.write_header().expect("write PNG header");
+    let mut writer = match encoder.write_header() {
+        Ok(w) => w,
+        Err(_) => return,
+    };
 
     // Convert from BGRA (wgpu surface format) to RGBA, stripping row padding
     let unpadded_row = width * 4;
@@ -1029,8 +1036,7 @@ fn save_screenshot(path: &str, data: &[u8], width: u32, height: u32, padded_row:
         }
     }
 
-    writer.write_image_data(&rgba_data).expect("write PNG data");
-    log::info!("screenshot saved to {path}");
+    let _ = writer.write_image_data(&rgba_data);
 }
 
 pub fn push_text_specs<'a>(

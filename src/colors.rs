@@ -199,11 +199,8 @@ impl ColorScheme {
     pub fn load() -> Self {
         let path = config_path();
         if let Ok(data) = fs::read_to_string(&path) {
-            match serde_json::from_str::<ColorScheme>(&data) {
-                Ok(scheme) => return scheme,
-                Err(e) => {
-                    log::warn!("invalid colors.json, using defaults: {e}");
-                }
+            if let Ok(scheme) = serde_json::from_str::<ColorScheme>(&data) {
+                return scheme;
             }
         }
         Self::default()
