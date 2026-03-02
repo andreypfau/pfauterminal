@@ -425,6 +425,8 @@ impl App {
 
     fn new_tab(&mut self, shell: Option<String>) {
         let Some(gpu) = self.gpu.as_ref() else { return };
+        // When no shell is specified, use the user's default login shell
+        let shell = shell.or_else(|| detect_default_shell().map(|(_, path)| path));
         let panel = match self.create_terminal_panel(gpu, shell, Vec::new()) {
             Ok(p) => p,
             Err(error) => {
@@ -1262,10 +1264,44 @@ impl ApplicationHandler<TerminalEvent> for App {
     }
 }
 
+/// Return the user's default login shell as (name, path).
+fn detect_default_shell() -> Option<(String, String)> {
+    #[cfg(not(windows))]
+    {
+        if let Ok(shell_path) = std::env::var("SHELL") {
+            let path = std::path::Path::new(&shell_path);
+            if path.exists() {
+                let name = path
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                    .unwrap_or("shell")
+                    .to_string();
+                return Some((name, shell_path));
+            }
+        }
+    }
+    #[cfg(windows)]
+    {
+        if let Ok(comspec) = std::env::var("ComSpec") {
+            if std::path::Path::new(&comspec).exists() {
+                return Some(("cmd".to_string(), comspec));
+            }
+        }
+    }
+    None
+}
+
 /// Detect available shells on the system. Returns (display_label, full_path) pairs.
+/// The user's default login shell is placed first with a "Default (...)" label.
 fn detect_shells() -> Vec<(String, String)> {
     let mut shells = Vec::new();
     let mut seen = std::collections::HashSet::new();
+
+    // Insert the user's default login shell at the top
+    if let Some((name, path)) = detect_default_shell() {
+        seen.insert(name.clone());
+        shells.push((format!("Default ({name})"), path));
+    }
 
     #[cfg(not(windows))]
     {
