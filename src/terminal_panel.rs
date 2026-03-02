@@ -820,10 +820,12 @@ impl TerminalPanel {
         self.term.lock().selection = None;
     }
 
-    pub fn selection_to_string(&self) -> Option<String> {
-        // Re-apply our selection since terminal output may have cleared it.
+    pub fn selection_to_string(&mut self) -> Option<String> {
         let mut term = self.term.lock();
-        if let Some(sel) = &self.active_selection {
+        // Sync selection back from terminal (may have been rotated by scroll).
+        if term.selection.is_some() {
+            self.active_selection = term.selection.clone();
+        } else if let Some(sel) = &self.active_selection {
             term.selection = Some(sel.clone());
         }
         term.selection_to_string()
@@ -879,8 +881,13 @@ impl TerminalPanel {
         // --- Snapshot grid data under the lock, then release it ---
         let (cursor_point, cursor_shape, selection_range, display_offset, extra_row_cells, total_lines, screen_lines) = {
             let mut term = self.term.lock();
-            // Re-apply our selection — terminal output may have cleared it.
-            if let Some(sel) = &self.active_selection {
+            // Sync selection: if the terminal still has one (possibly rotated
+            // by new output), adopt it so our copy tracks the scroll.
+            // Only re-apply our copy when the terminal has cleared it
+            // (e.g. screen clear) but we still want to keep highlighting.
+            if term.selection.is_some() {
+                self.active_selection = term.selection.clone();
+            } else if let Some(sel) = &self.active_selection {
                 term.selection = Some(sel.clone());
             }
             let content = term.renderable_content();
