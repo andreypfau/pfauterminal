@@ -339,7 +339,7 @@ impl TerminalPanel {
 
         let pty_config = tty::Options {
             shell: shell.map(|program| tty::Shell::new(program, args)),
-            working_directory: None,
+            working_directory: dirs::home_dir(),
             drain_on_exit: true,
             env: {
                 let mut env = std::collections::HashMap::new();
