@@ -9,6 +9,12 @@ pub struct DrawContext {
     pub cursor: Option<CursorData>,
 }
 
+impl Default for DrawContext {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl DrawContext {
     pub fn new() -> Self {
         Self {

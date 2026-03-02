@@ -651,6 +651,21 @@ pub struct GpuContext {
     // Cached carrier buffers for custom glyphs (icons) — avoids per-frame allocation
     icon_carrier: Buffer,
     overlay_icon_carrier: Buffer,
+
+    // Reusable buffer for quad vertices — avoids per-frame Vec allocation.
+    reuse_quad_verts: Vec<QuadVertex>,
+
+    // Cached render counts from last full (content_changed=true) frame,
+    // reused during blink-only frames to avoid re-uploading GPU data.
+    cached_scene_rr_count: usize,
+    cached_total_rr_count: usize,
+    cached_quad_vertex_count: u32,
+
+    // Content texture: caches all non-cursor content (rounded rects, quads, text).
+    // On blink-only frames, this is copied to the surface and only the cursor
+    // is drawn on top, eliminating ~10 draw calls per frame.
+    content_texture: Texture,
+    content_view: TextureView,
 }
 
 impl GpuContext {
@@ -659,7 +674,7 @@ impl GpuContext {
 
         let gpu = init_gpu(
             window,
-            TextureUsages::RENDER_ATTACHMENT | TextureUsages::COPY_SRC,
+            TextureUsages::RENDER_ATTACHMENT | TextureUsages::COPY_SRC | TextureUsages::COPY_DST,
         )?;
         let mut text = init_text_resources(&gpu.device, &gpu.queue, gpu.render_format);
         let rounded_rect =
@@ -725,6 +740,23 @@ impl GpuContext {
 
         let cursor_pipeline = CursorPipeline::new(&gpu.device, gpu.render_format);
 
+        // Content texture: caches non-cursor content for blink-only frames
+        let content_texture = gpu.device.create_texture(&TextureDescriptor {
+            label: Some("content cache"),
+            size: Extent3d {
+                width: gpu.surface_config.width.max(1),
+                height: gpu.surface_config.height.max(1),
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: TextureDimension::D2,
+            format: gpu.render_format,
+            usage: TextureUsages::RENDER_ATTACHMENT | TextureUsages::COPY_SRC,
+            view_formats: &[],
+        });
+        let content_view = content_texture.create_view(&TextureViewDescriptor::default());
+
         // Cached icon carrier buffers (empty, scale=1.0 so positions are physical px)
         let mut icon_carrier = Buffer::new(&mut text.font_system, Metrics::new(1.0, 1.0));
         icon_carrier.set_size(&mut text.font_system, Some(0.0), Some(0.0));
@@ -752,6 +784,12 @@ impl GpuContext {
             cursor_pipeline,
             icon_carrier,
             overlay_icon_carrier,
+            content_texture,
+            content_view,
+            reuse_quad_verts: Vec::new(),
+            cached_scene_rr_count: 0,
+            cached_total_rr_count: 0,
+            cached_quad_vertex_count: 0,
         })
     }
 
@@ -813,6 +851,23 @@ impl GpuContext {
         self.surface_config.width = width;
         self.surface_config.height = height;
         self.surface.configure(&self.device, &self.surface_config);
+
+        // Recreate content cache texture at the new size
+        self.content_texture = self.device.create_texture(&TextureDescriptor {
+            label: Some("content cache"),
+            size: Extent3d {
+                width: width.max(1),
+                height: height.max(1),
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: TextureDimension::D2,
+            format: self.render_format,
+            usage: TextureUsages::RENDER_ATTACHMENT | TextureUsages::COPY_SRC,
+            view_formats: &[],
+        });
+        self.content_view = self.content_texture.create_view(&TextureViewDescriptor::default());
     }
 
     /// Render a complete frame with scene (panels + tab bar) and overlay (dropdown).
@@ -825,85 +880,76 @@ impl GpuContext {
         overlay_text: &[(&[TextSpec], &[Buffer])],
         icon_manager: &IconManager,
         screenshot_path: Option<&str>,
+        content_changed: bool,
     ) -> Result<(), SurfaceError> {
         let scale_factor = self.scale_factor;
+
+        #[cfg(feature = "debug-fps")]
+        let _gt0 = std::time::Instant::now();
+
         let (frame, view) = begin_frame(&self.surface, self.render_format)?;
+
+        #[cfg(feature = "debug-fps")]
+        let _gt1 = std::time::Instant::now();
 
         let w = self.surface_config.width as f32;
         let h = self.surface_config.height as f32;
 
-        // Upload rounded rect uniforms in two groups:
-        // Scene -- drawn before text
-        // Overlay -- drawn after text, on top of everything
-        let scene_rr_count = self
-            .rounded_rect
-            .upload_quads(&self.queue, &scene.rounded_quads, 0);
+        let (scene_rr_count, total_rounded_rects, quad_vertex_count);
 
-        let total_rounded_rects =
-            self.rounded_rect
-                .upload_quads(&self.queue, &overlay.rounded_quads, scene_rr_count);
+        if content_changed {
+            // Upload rounded rect uniforms in two groups:
+            // Scene -- drawn before text
+            // Overlay -- drawn after text, on top of everything
+            scene_rr_count = self
+                .rounded_rect
+                .upload_quads(&self.queue, &scene.rounded_quads, 0);
 
-        // Build all quad vertices (scene flat quads: tab bar separator + cell backgrounds)
-        let mut quad_verts: Vec<QuadVertex> = Vec::new();
-        for bq in &scene.flat_quads {
-            push_quad(&mut quad_verts, bq, w, h);
+            total_rounded_rects =
+                self.rounded_rect
+                    .upload_quads(&self.queue, &overlay.rounded_quads, scene_rr_count);
+
+            // Build all quad vertices (scene flat quads: tab bar separator + cell backgrounds)
+            self.reuse_quad_verts.clear();
+            for bq in &scene.flat_quads {
+                push_quad(&mut self.reuse_quad_verts, bq, w, h);
+            }
+
+            quad_vertex_count = self.reuse_quad_verts.len() as u32;
+            if !self.reuse_quad_verts.is_empty() {
+                self.queue.write_buffer(
+                    &self.quad_vertex_buffer,
+                    0,
+                    bytemuck::cast_slice(&self.reuse_quad_verts),
+                );
+            }
+
+            // Cache counts for blink-only frames
+            self.cached_scene_rr_count = scene_rr_count;
+            self.cached_total_rr_count = total_rounded_rects;
+            self.cached_quad_vertex_count = quad_vertex_count;
+        } else {
+            // Blink-only frame: reuse GPU buffers from last full frame
+            scene_rr_count = self.cached_scene_rr_count;
+            total_rounded_rects = self.cached_total_rr_count;
+            quad_vertex_count = self.cached_quad_vertex_count;
         }
 
-        let quad_vertex_count = quad_verts.len() as u32;
-        if !quad_verts.is_empty() {
-            self.queue.write_buffer(
-                &self.quad_vertex_buffer,
-                0,
-                bytemuck::cast_slice(&quad_verts),
-            );
+        #[cfg(feature = "debug-fps")]
+        let _gt2 = std::time::Instant::now();
+
+        // glyphon text — only update viewport when content changes
+        if content_changed {
+            update_viewport(&mut self.viewport, &self.queue, &self.surface_config);
         }
 
-        // glyphon text
-        update_viewport(&mut self.viewport, &self.queue, &self.surface_config);
+        if content_changed {
+            // Build scene TextAreas
+            let mut text_areas: Vec<TextArea> = Vec::new();
 
-        // Build scene TextAreas
-        let mut text_areas: Vec<TextArea> = Vec::new();
-
-        // Icon carrier for custom glyphs (uses cached buffer)
-        text_areas.push(TextArea {
-            buffer: &self.icon_carrier,
-            left: 0.0,
-            top: 0.0,
-            scale: 1.0,
-            bounds: TextBounds {
-                left: 0,
-                top: 0,
-                right: w as i32,
-                bottom: h as i32,
-            },
-            default_color: self.colors.foreground.to_glyphon(),
-            custom_glyphs: &scene.custom_glyphs,
-        });
-
-        // Scene text areas (tab bar + panels)
-        for &(specs, bufs) in scene_text {
-            push_text_specs(&mut text_areas, specs, bufs, scale_factor);
-        }
-
-        self.text_renderer
-            .prepare_with_custom(
-                &self.device,
-                &self.queue,
-                &mut self.font_system,
-                &mut self.atlas,
-                &self.viewport,
-                text_areas,
-                &mut self.swash_cache,
-                |req| icon_manager.rasterize(req),
-            )
-            .ok();
-
-        // Overlay text (dropdown) with icon support
-        let mut overlay_areas: Vec<TextArea> = Vec::new();
-
-        if !overlay.custom_glyphs.is_empty() {
-            overlay_areas.push(TextArea {
-                buffer: &self.overlay_icon_carrier,
+            // Icon carrier for custom glyphs (uses cached buffer)
+            text_areas.push(TextArea {
+                buffer: &self.icon_carrier,
                 left: 0.0,
                 top: 0.0,
                 scale: 1.0,
@@ -914,32 +960,78 @@ impl GpuContext {
                     bottom: h as i32,
                 },
                 default_color: self.colors.foreground.to_glyphon(),
-                custom_glyphs: &overlay.custom_glyphs,
+                custom_glyphs: &scene.custom_glyphs,
             });
+
+            // Scene text areas (tab bar + panels)
+            for &(specs, bufs) in scene_text {
+                push_text_specs(&mut text_areas, specs, bufs, scale_factor);
+            }
+
+            self.text_renderer
+                .prepare_with_custom(
+                    &self.device,
+                    &self.queue,
+                    &mut self.font_system,
+                    &mut self.atlas,
+                    &self.viewport,
+                    text_areas,
+                    &mut self.swash_cache,
+                    |req| icon_manager.rasterize(req),
+                )
+                .ok();
         }
 
-        for &(specs, bufs) in overlay_text {
-            push_text_specs(&mut overlay_areas, specs, bufs, scale_factor);
+        #[cfg(feature = "debug-fps")]
+        let _gt3 = std::time::Instant::now();
+
+        if content_changed {
+            // Overlay text (dropdown) with icon support
+            let mut overlay_areas: Vec<TextArea> = Vec::new();
+
+            if !overlay.custom_glyphs.is_empty() {
+                overlay_areas.push(TextArea {
+                    buffer: &self.overlay_icon_carrier,
+                    left: 0.0,
+                    top: 0.0,
+                    scale: 1.0,
+                    bounds: TextBounds {
+                        left: 0,
+                        top: 0,
+                        right: w as i32,
+                        bottom: h as i32,
+                    },
+                    default_color: self.colors.foreground.to_glyphon(),
+                    custom_glyphs: &overlay.custom_glyphs,
+                });
+            }
+
+            for &(specs, bufs) in overlay_text {
+                push_text_specs(&mut overlay_areas, specs, bufs, scale_factor);
+            }
+
+            self.overlay_text_renderer
+                .prepare_with_custom(
+                    &self.device,
+                    &self.queue,
+                    &mut self.font_system,
+                    &mut self.atlas,
+                    &self.viewport,
+                    overlay_areas,
+                    &mut self.swash_cache,
+                    |req| icon_manager.rasterize(req),
+                )
+                .ok();
         }
 
-        self.overlay_text_renderer
-            .prepare_with_custom(
-                &self.device,
-                &self.queue,
-                &mut self.font_system,
-                &mut self.atlas,
-                &self.viewport,
-                overlay_areas,
-                &mut self.swash_cache,
-                |req| icon_manager.rasterize(req),
-            )
-            .ok();
-
-        // Upload cursor uniforms
+        // Upload cursor uniforms (always — cursor blink needs fresh time data)
         if let Some(cursor) = &scene.cursor {
             self.cursor_pipeline
                 .upload(&self.queue, CursorUniforms::from_cursor_data(cursor));
         }
+
+        #[cfg(feature = "debug-fps")]
+        let _gt4 = std::time::Instant::now();
 
         // Encode render pass
         let mut encoder = self
@@ -948,51 +1040,126 @@ impl GpuContext {
                 label: Some("render encoder"),
             });
 
-        {
-            let mut pass = begin_clear_pass(
-                &mut encoder,
-                &view,
-                "main pass",
-                self.colors.chrome.to_wgpu_color(),
-            );
+        if content_changed {
+            // Render scene layer (without cursor/overlay) to content_texture.
+            // Cursor and overlay are drawn separately so the cursor appears
+            // between scene and overlay (behind dropdown menus).
+            {
+                let mut pass = begin_clear_pass(
+                    &mut encoder,
+                    &self.content_view,
+                    "content pass",
+                    self.colors.chrome.to_wgpu_color(),
+                );
 
-            // === Scene layer ===
-            self.rounded_rect.draw_range(&mut pass, 0, scene_rr_count);
+                // === Scene layer only ===
+                self.rounded_rect.draw_range(&mut pass, 0, scene_rr_count);
 
-            if quad_vertex_count > 0 {
-                pass.set_pipeline(&self.quad_pipeline);
-                pass.set_vertex_buffer(0, self.quad_vertex_buffer.slice(..));
-                pass.draw(0..quad_vertex_count, 0..1);
+                if quad_vertex_count > 0 {
+                    pass.set_pipeline(&self.quad_pipeline);
+                    pass.set_vertex_buffer(0, self.quad_vertex_buffer.slice(..));
+                    pass.draw(0..quad_vertex_count, 0..1);
+                }
+
+                self.text_renderer
+                    .render(&self.atlas, &self.viewport, &mut pass)
+                    .ok();
             }
+        }
 
-            // Cursor (between flat quads and text, so text renders on top)
+        // Copy content texture (scene only) to surface
+        encoder.copy_texture_to_texture(
+            self.content_texture.as_image_copy(),
+            frame.texture.as_image_copy(),
+            Extent3d {
+                width: self.surface_config.width,
+                height: self.surface_config.height,
+                depth_or_array_layers: 1,
+            },
+        );
+
+        // Draw cursor + overlay on surface (cursor behind overlay)
+        {
+            let mut pass = encoder.begin_render_pass(&RenderPassDescriptor {
+                label: Some("cursor+overlay pass"),
+                color_attachments: &[Some(RenderPassColorAttachment {
+                    view: &view,
+                    resolve_target: None,
+                    ops: Operations {
+                        load: LoadOp::Load,
+                        store: StoreOp::Store,
+                    },
+                })],
+                depth_stencil_attachment: None,
+                timestamp_writes: None,
+                occlusion_query_set: None,
+            });
+
+            // Cursor (behind overlay)
             if scene.cursor.is_some() {
                 self.cursor_pipeline.draw(&mut pass);
             }
 
-            self.text_renderer
-                .render(&self.atlas, &self.viewport, &mut pass)
-                .ok();
-
-            // === Overlay layer ===
-            self.rounded_rect.draw_range(
-                &mut pass,
-                scene_rr_count,
-                total_rounded_rects - scene_rr_count,
-            );
-
+            // Overlay layer (dropdown menus — on top of cursor)
+            let overlay_count = total_rounded_rects - scene_rr_count;
+            if overlay_count > 0 {
+                self.rounded_rect
+                    .draw_range(&mut pass, scene_rr_count, overlay_count);
+            }
             self.overlay_text_renderer
                 .render(&self.atlas, &self.viewport, &mut pass)
                 .ok();
         }
+
+        #[cfg(feature = "debug-fps")]
+        let _gt5 = std::time::Instant::now();
 
         if let Some(path) = screenshot_path {
             self.queue.submit(std::iter::once(encoder.finish()));
             self.capture_screenshot(path, &frame.texture);
             frame.present();
             self.atlas.trim();
-        } else {
+        } else if content_changed {
             finish_frame(&self.queue, &mut self.atlas, encoder, frame);
+        } else {
+            // Blink-only frame: submit + present but skip atlas.trim()
+            self.queue.submit(std::iter::once(encoder.finish()));
+            frame.present();
+        }
+
+        #[cfg(feature = "debug-fps")]
+        {
+            use std::sync::atomic::{AtomicU64, Ordering};
+            static BEGIN: AtomicU64 = AtomicU64::new(0);
+            static UPLOAD: AtomicU64 = AtomicU64::new(0);
+            static TEXT_PREP: AtomicU64 = AtomicU64::new(0);
+            static OVERLAY: AtomicU64 = AtomicU64::new(0);
+            static ENCODE: AtomicU64 = AtomicU64::new(0);
+            static SUBMIT: AtomicU64 = AtomicU64::new(0);
+            static COUNT: AtomicU64 = AtomicU64::new(0);
+            static LAST: AtomicU64 = AtomicU64::new(0);
+            BEGIN.fetch_add(_gt1.duration_since(_gt0).as_micros() as u64, Ordering::Relaxed);
+            UPLOAD.fetch_add(_gt2.duration_since(_gt1).as_micros() as u64, Ordering::Relaxed);
+            TEXT_PREP.fetch_add(_gt3.duration_since(_gt2).as_micros() as u64, Ordering::Relaxed);
+            OVERLAY.fetch_add(_gt4.duration_since(_gt3).as_micros() as u64, Ordering::Relaxed);
+            ENCODE.fetch_add(_gt5.duration_since(_gt4).as_micros() as u64, Ordering::Relaxed);
+            SUBMIT.fetch_add(std::time::Instant::now().duration_since(_gt5).as_micros() as u64, Ordering::Relaxed);
+            let c = COUNT.fetch_add(1, Ordering::Relaxed) + 1;
+            let now_ms = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_millis() as u64;
+            let l = LAST.load(Ordering::Relaxed);
+            if now_ms - l >= 3000 {
+                LAST.store(now_ms, Ordering::Relaxed);
+                let prev_c = c.saturating_sub(COUNT.swap(0, Ordering::Relaxed));
+                let dc = if prev_c == 0 { 1 } else { prev_c };
+                let b = BEGIN.swap(0, Ordering::Relaxed);
+                let u = UPLOAD.swap(0, Ordering::Relaxed);
+                let t = TEXT_PREP.swap(0, Ordering::Relaxed);
+                let o = OVERLAY.swap(0, Ordering::Relaxed);
+                let e = ENCODE.swap(0, Ordering::Relaxed);
+                let s = SUBMIT.swap(0, Ordering::Relaxed);
+                eprintln!("  [gpu] frames={dc} begin={}us upload={}us text={}us overlay={}us encode={}us submit={}us total={}us",
+                    b/dc, u/dc, t/dc, o/dc, e/dc, s/dc, (b+u+t+o+e+s)/dc);
+            }
         }
 
         Ok(())

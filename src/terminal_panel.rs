@@ -320,6 +320,8 @@ pub struct TerminalPanel {
     cursor_anim: CursorAnimation,
     /// Whether the cursor was visible in the last draw call.
     cursor_visible: bool,
+    /// Reusable buffer for grid cell snapshots — avoids per-frame Vec allocation.
+    snapshot_cells: Vec<SnapshotCell>,
 }
 
 impl TerminalPanel {
@@ -383,6 +385,7 @@ impl TerminalPanel {
             active_selection: None,
             cursor_anim: CursorAnimation::new(),
             cursor_visible: false,
+            snapshot_cells: Vec::new(),
         })
     }
 
@@ -409,6 +412,7 @@ impl TerminalPanel {
             active_selection: None,
             cursor_anim: CursorAnimation::new(),
             cursor_visible: false,
+            snapshot_cells: Vec::new(),
         }
     }
 
@@ -446,6 +450,7 @@ impl TerminalPanel {
             active_selection: None,
             cursor_anim: CursorAnimation::new(),
             cursor_visible: false,
+            snapshot_cells: Vec::new(),
         }
     }
 
@@ -523,6 +528,45 @@ impl TerminalPanel {
         let elapsed = self.cursor_anim.move_time.elapsed().as_secs_f32();
         let factor = (-self.cursor_anim.move_speed * elapsed).exp();
         factor > 0.01
+    }
+
+    /// Returns the instant of the last user input (for blink pause scheduling).
+    pub fn last_input_time(&self) -> Instant {
+        self.cursor_anim.last_input_time
+    }
+
+    /// Build fresh CursorData from cached cursor_anim fields without
+    /// locking the terminal mutex or iterating the grid.
+    /// Returns `None` if cursor was not visible in the last draw.
+    pub fn cursor_data(&self, colors: &ColorScheme, scale: f32) -> Option<CursorData> {
+        if !self.cursor_visible {
+            return None;
+        }
+        let vp = self.viewport.as_ref()?;
+        let content_y = vp.content_rect.y;
+        let content_bottom = content_y + vp.content_rect.height;
+        let anim = &self.cursor_anim;
+        Some(CursorData {
+            prev_rect: Rect {
+                x: anim.prev_x,
+                y: anim.prev_y,
+                width: anim.prev_w,
+                height: anim.prev_h,
+            },
+            target_rect: Rect {
+                x: anim.target_x,
+                y: anim.target_y,
+                width: anim.target_w,
+                height: anim.target_h,
+            },
+            color: colors.cursor.to_linear_f32(),
+            radius: CURSOR_RADIUS * scale,
+            time_since_move: anim.move_time.elapsed().as_secs_f32(),
+            time_since_input: anim.last_input_time.elapsed().as_secs_f32(),
+            move_speed: anim.move_speed,
+            clip_top: content_y,
+            clip_bottom: content_bottom,
+        })
     }
 
     pub fn handle_key(&mut self, event: &KeyEvent, ctrl: bool, alt: bool) -> bool {
@@ -686,6 +730,9 @@ impl TerminalPanel {
                 }
                 drop(term);
                 self.scroll_pixel_offset = self.scroll_accumulator as f32;
+                if self.scroll_pixel_offset.abs() <= 0.5 {
+                    self.scroll_pixel_offset = 0.0;
+                }
                 true
             }
         }
@@ -693,7 +740,7 @@ impl TerminalPanel {
 
     /// Returns true if a smooth scroll animation is in progress.
     pub fn is_smooth_scrolling(&self) -> bool {
-        self.scroll_pixel_offset != 0.0
+        self.scroll_pixel_offset.abs() > 0.5
     }
 
     /// Map physical-pixel coordinates to a grid Point + Side.
@@ -810,7 +857,7 @@ impl TerminalPanel {
         let metrics = font::metrics();
 
         // --- Snapshot grid data under the lock, then release it ---
-        let (cells, cursor_point, cursor_shape, selection_range, display_offset, extra_row_cells, total_lines, screen_lines) = {
+        let (cursor_point, cursor_shape, selection_range, display_offset, extra_row_cells, total_lines, screen_lines) = {
             let mut term = self.term.lock();
             // Re-apply our selection — terminal output may have cleared it.
             if let Some(sel) = &self.active_selection {
@@ -829,21 +876,22 @@ impl TerminalPanel {
             // to fill the gap at the top during smooth upward scroll.
             let min_vline = if pixel_offset > 0.0 { -1 } else { 0 };
 
-            let cells: Vec<SnapshotCell> = content.display_iter.filter_map(|indexed| {
+            self.snapshot_cells.clear();
+            for indexed in content.display_iter {
                 let viewport_line = indexed.point.line.0 + display_offset as i32;
                 let col = indexed.point.column.0;
                 if viewport_line < min_vline || viewport_line >= rows as i32 || col >= cols {
-                    return None;
+                    continue;
                 }
                 let cell = &*indexed;
-                Some(SnapshotCell {
+                self.snapshot_cells.push(SnapshotCell {
                     point: indexed.point,
                     c: cell.c,
                     fg: cell.fg,
                     bg: cell.bg,
                     flags: cell.flags,
-                })
-            }).collect();
+                });
+            }
 
             // Extra bottom row: when content shifts up (scroll down), read
             // one row past the viewport from the grid directly.
@@ -865,13 +913,13 @@ impl TerminalPanel {
                 None
             };
 
-            (cells, cursor_point, cursor_shape, selection_range, display_offset, extra_row_cells, total_lines, screen_lines)
+            (cursor_point, cursor_shape, selection_range, display_offset, extra_row_cells, total_lines, screen_lines)
         }; // lock released here
 
         // --- Build quads and text specs without holding the lock ---
         let selection_color = colors.selection.to_linear_f32();
 
-        for snap in &cells {
+        for snap in &self.snapshot_cells {
             let viewport_line = snap.point.line.0 + display_offset as i32;
             let col = snap.point.column.0;
             let flags = snap.flags;

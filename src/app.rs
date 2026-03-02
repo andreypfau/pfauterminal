@@ -1,6 +1,15 @@
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+#[cfg(feature = "debug-fps")]
+mod redraw_debug {
+    use std::sync::atomic::AtomicU64;
+    pub static DIRTY_COUNT: AtomicU64 = AtomicU64::new(0);
+    pub static BLINK_COUNT: AtomicU64 = AtomicU64::new(0);
+    pub static ANIM_COUNT: AtomicU64 = AtomicU64::new(0);
+    pub static PAUSE_COUNT: AtomicU64 = AtomicU64::new(0);
+}
+
 use alacritty_terminal::selection::SelectionType;
 use winit::application::ApplicationHandler;
 use winit::event::{ElementState, MouseButton, WindowEvent};
@@ -13,12 +22,15 @@ use crate::dropdown::{DropdownElement, DropdownMenu, MenuAction, MenuEntry, Menu
 use crate::gpu::GpuContext;
 use crate::icons;
 use crate::icons::IconManager;
-use crate::layout::Rect;
+use crate::layout::{Rect, TextSpec};
 use crate::saved_sessions::{now_unix, SavedAuthType, SavedSession, SavedSessions};
 use crate::ssh_dialog::{AuthMethod, SshDialogWindow, SshPrefill, SshResult};
 use crate::tab_bar::{TabBar, TabBarElement};
 use crate::terminal_panel::{EventProxy, PanelId, TermSize, TerminalEvent, TerminalPanel};
 use crate::theme::Theme;
+
+/// Fixed blink interval — 30 fps.
+const BLINK_INTERVAL: Duration = Duration::from_millis(33);
 
 pub struct App {
     window: Option<Arc<Window>>,
@@ -46,6 +58,16 @@ pub struct App {
     /// Set when new terminal content or user input arrives — forces an
     /// immediate render regardless of the cursor-blink throttle.
     dirty: bool,
+    /// Window is fully occluded (hidden behind other windows) — skip all rendering.
+    occluded: bool,
+
+    // Cached scene data from the last full (dirty) redraw.
+    // Reused during blink-only frames to avoid rebuilding the scene.
+    cached_scene: DrawContext,
+    cached_overlay: DrawContext,
+    cached_scene_panel_text: Vec<TextSpec>,
+    cached_scene_tab_text: Vec<TextSpec>,
+    cached_overlay_text: Vec<TextSpec>,
 }
 
 impl App {
@@ -80,6 +102,12 @@ impl App {
             screenshot_pending: std::env::var("SCREENSHOT").ok().filter(|s| !s.is_empty()),
             last_redraw: Instant::now(),
             dirty: false,
+            occluded: false,
+            cached_scene: DrawContext::new(),
+            cached_overlay: DrawContext::new(),
+            cached_scene_panel_text: Vec::new(),
+            cached_scene_tab_text: Vec::new(),
+            cached_overlay_text: Vec::new(),
         }
     }
 
@@ -158,8 +186,11 @@ impl App {
         );
     }
 
+    /// Full redraw: rebuild scene from scratch, upload everything to GPU.
     /// Returns true if a screenshot was captured (signals auto-exit).
     fn redraw(&mut self) -> bool {
+        #[cfg(feature = "debug-fps")]
+        let _debug_t0 = Instant::now();
         if self.gpu.is_none() || self.tabs.is_empty() {
             return false;
         }
@@ -170,10 +201,16 @@ impl App {
         let colors = gpu.colors.clone();
         let theme = &self.theme;
 
-        // Scene: panels + tab bar
-        let mut scene = DrawContext::new();
-        let mut scene_tab_text = Vec::new();
-        let mut scene_panel_text = Vec::new();
+        // Scene: panels + tab bar — reuse cached Vecs to avoid per-frame allocation
+        let mut scene = std::mem::take(&mut self.cached_scene);
+        let mut scene_tab_text = std::mem::take(&mut self.cached_scene_tab_text);
+        let mut scene_panel_text = std::mem::take(&mut self.cached_scene_panel_text);
+        scene.clear();
+        scene_tab_text.clear();
+        scene_panel_text.clear();
+
+        #[cfg(feature = "debug-fps")]
+        let _debug_t1 = Instant::now();
 
         // Panel rendering
         let panel = &mut self.tabs[self.active_tab];
@@ -186,6 +223,9 @@ impl App {
             &theme.panel,
         );
         let panel_bufs = panel.buffers();
+
+        #[cfg(feature = "debug-fps")]
+        let _debug_t2 = Instant::now();
 
         // Tab bar rendering
         let area = Rect {
@@ -205,19 +245,24 @@ impl App {
         );
         let tab_bufs = self.tab_bar.tab_buffers();
 
-        // Overlay: dropdown
-        let mut overlay = DrawContext::new();
-        let mut overlay_dd_text = Vec::new();
+        // Overlay: dropdown — reuse cached Vecs
+        let mut overlay = std::mem::take(&mut self.cached_overlay);
+        let mut overlay_dd_text = std::mem::take(&mut self.cached_overlay_text);
+        overlay.clear();
+        overlay_dd_text.clear();
         if self.dropdown.is_open() {
             self.dropdown.draw(&mut overlay, &mut overlay_dd_text, theme, scale);
         }
         let dd_bufs = self.dropdown.item_buffers();
 
-        let scene_text: Vec<(&[crate::layout::TextSpec], &[glyphon::Buffer])> = vec![
+        #[cfg(feature = "debug-fps")]
+        let _debug_t3 = Instant::now();
+
+        let scene_text: Vec<(&[TextSpec], &[glyphon::Buffer])> = vec![
             (&scene_tab_text, tab_bufs),
             (&scene_panel_text, panel_bufs),
         ];
-        let overlay_text: Vec<(&[crate::layout::TextSpec], &[glyphon::Buffer])> = vec![
+        let overlay_text: Vec<(&[TextSpec], &[glyphon::Buffer])> = vec![
             (&overlay_dd_text, dd_bufs),
         ];
 
@@ -230,6 +275,7 @@ impl App {
             &overlay_text,
             &self.icon_manager,
             screenshot.as_deref(),
+            true, // content_changed
         ) {
             Ok(()) => {}
             Err(wgpu::SurfaceError::Lost | wgpu::SurfaceError::Outdated) => {
@@ -239,10 +285,112 @@ impl App {
             }
             Err(_) => {}
         }
+
+        // Cache scene data for blink-only frames
+        self.cached_scene = scene;
+        self.cached_overlay = overlay;
+        self.cached_scene_panel_text = scene_panel_text;
+        self.cached_scene_tab_text = scene_tab_text;
+        self.cached_overlay_text = overlay_dd_text;
+
+        #[cfg(feature = "debug-fps")]
+        let _debug_t4 = Instant::now();
+
+        #[cfg(feature = "debug-fps")]
+        {
+            use std::sync::atomic::{AtomicU64, Ordering};
+            static TOTAL_US: AtomicU64 = AtomicU64::new(0);
+            static COUNT: AtomicU64 = AtomicU64::new(0);
+            static LAST: AtomicU64 = AtomicU64::new(0);
+            static PANEL_US: AtomicU64 = AtomicU64::new(0);
+            static TAB_US: AtomicU64 = AtomicU64::new(0);
+            static GPU_US: AtomicU64 = AtomicU64::new(0);
+            let panel = _debug_t2.duration_since(_debug_t1).as_micros() as u64;
+            let tab = _debug_t3.duration_since(_debug_t2).as_micros() as u64;
+            let gpuf = _debug_t4.duration_since(_debug_t3).as_micros() as u64;
+            let total = _debug_t4.duration_since(_debug_t0).as_micros() as u64;
+            PANEL_US.fetch_add(panel, Ordering::Relaxed);
+            TAB_US.fetch_add(tab, Ordering::Relaxed);
+            GPU_US.fetch_add(gpuf, Ordering::Relaxed);
+            TOTAL_US.fetch_add(total, Ordering::Relaxed);
+            let c = COUNT.fetch_add(1, Ordering::Relaxed) + 1;
+            let now_ms = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_millis() as u64;
+            let l = LAST.load(Ordering::Relaxed);
+            if now_ms - l >= 3000 {
+                LAST.store(now_ms, Ordering::Relaxed);
+                let p = PANEL_US.swap(0, Ordering::Relaxed);
+                let t = TAB_US.swap(0, Ordering::Relaxed);
+                let g = GPU_US.swap(0, Ordering::Relaxed);
+                let tot = TOTAL_US.swap(0, Ordering::Relaxed);
+                let dc = COUNT.swap(0, Ordering::Relaxed).max(1);
+                eprintln!("[render] frames={dc} panel={}us tab={}us gpu={}us total={}us",
+                    p/dc, t/dc, g/dc, tot/dc);
+            }
+        }
         took_screenshot
     }
 
-    fn request_redraw(&self) {
+    /// Blink-only redraw: reuse cached scene, only update cursor uniform.
+    /// Skips scene rebuild and GPU data uploads for minimal CPU usage.
+    fn redraw_blink_only(&mut self) {
+        if self.gpu.is_none() || self.tabs.is_empty() {
+            return;
+        }
+
+        let Some(gpu) = self.gpu.as_mut() else { return };
+        let colors = &gpu.colors;
+        let scale = gpu.scale_factor;
+
+        // Update only the cursor data in the cached scene
+        if let Some(panel) = self.tabs.get(self.active_tab) {
+            self.cached_scene.cursor = panel.cursor_data(colors, scale);
+        }
+
+        let panel_bufs = self.tabs.get(self.active_tab)
+            .map(|p| p.buffers())
+            .unwrap_or(&[]);
+        let tab_bufs = self.tab_bar.tab_buffers();
+        let dd_bufs = self.dropdown.item_buffers();
+
+        let scene_text: Vec<(&[TextSpec], &[glyphon::Buffer])> = vec![
+            (&self.cached_scene_tab_text, tab_bufs),
+            (&self.cached_scene_panel_text, panel_bufs),
+        ];
+        let overlay_text: Vec<(&[TextSpec], &[glyphon::Buffer])> = vec![
+            (&self.cached_overlay_text, dd_bufs),
+        ];
+
+        match gpu.render_frame(
+            &self.cached_scene,
+            &self.cached_overlay,
+            &scene_text,
+            &overlay_text,
+            &self.icon_manager,
+            None,
+            false, // content_changed = false
+        ) {
+            Ok(()) => {}
+            Err(wgpu::SurfaceError::Lost | wgpu::SurfaceError::Outdated) => {
+                let w = gpu.surface_config.width;
+                let h = gpu.surface_config.height;
+                gpu.resize(w, h);
+            }
+            Err(_) => {}
+        }
+    }
+
+    fn request_redraw(&mut self) {
+        self.dirty = true;
+        #[cfg(feature = "debug-fps")]
+        {
+            use std::sync::atomic::{AtomicU64, Ordering};
+            static RR_COUNT: AtomicU64 = AtomicU64::new(0);
+            static RR_LAST: AtomicU64 = AtomicU64::new(0);
+            let c = RR_COUNT.fetch_add(1, Ordering::Relaxed) + 1;
+            let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_millis() as u64;
+            let l = RR_LAST.load(Ordering::Relaxed);
+            if now - l >= 3000 { RR_LAST.store(now, Ordering::Relaxed); eprintln!("[request_redraw] total: {c}"); }
+        }
         if let Some(w) = &self.window {
             w.request_redraw();
         }
@@ -539,8 +687,28 @@ impl ApplicationHandler<TerminalEvent> for App {
             TerminalEvent::Wakeup => {
                 self.dirty = true;
                 self.request_redraw();
+                #[cfg(feature = "debug-fps")]
+                {
+                    use std::sync::atomic::{AtomicU64, Ordering};
+                    static COUNT: AtomicU64 = AtomicU64::new(0);
+                    static LAST: AtomicU64 = AtomicU64::new(0);
+                    let c = COUNT.fetch_add(1, Ordering::Relaxed) + 1;
+                    let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_millis() as u64;
+                    let last = LAST.load(Ordering::Relaxed);
+                    if now - last >= 3000 { LAST.store(now, Ordering::Relaxed); eprintln!("[wakeup] total: {c}"); }
+                }
             }
             TerminalEvent::Title(panel_id, title) => {
+                #[cfg(feature = "debug-fps")]
+                {
+                    use std::sync::atomic::{AtomicU64, Ordering};
+                    static COUNT: AtomicU64 = AtomicU64::new(0);
+                    static LAST: AtomicU64 = AtomicU64::new(0);
+                    let c = COUNT.fetch_add(1, Ordering::Relaxed) + 1;
+                    let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_millis() as u64;
+                    let l = LAST.load(Ordering::Relaxed);
+                    if now - l >= 3000 { LAST.store(now, Ordering::Relaxed); eprintln!("[title] total: {c}"); }
+                }
                 if let Some(panel) = self.tabs.iter_mut().find(|p| p.id() == panel_id) {
                     panel.set_title(title);
                 }
@@ -626,18 +794,70 @@ impl ApplicationHandler<TerminalEvent> for App {
                 self.sync_tab_state();
             }
 
+            WindowEvent::Occluded(is_occluded) => {
+                self.occluded = is_occluded;
+                if !is_occluded {
+                    self.request_redraw();
+                }
+            }
+
             WindowEvent::RedrawRequested => {
+                #[cfg(feature = "debug-fps")]
+                {
+                    use std::sync::atomic::{AtomicU64, Ordering};
+                    use crate::app::redraw_debug::*;
+                    static COUNT: AtomicU64 = AtomicU64::new(0);
+                    static LAST: AtomicU64 = AtomicU64::new(0);
+                    if self.dirty { DIRTY_COUNT.fetch_add(1, Ordering::Relaxed); }
+                    let c = COUNT.fetch_add(1, Ordering::Relaxed) + 1;
+                    let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_millis() as u64;
+                    let l = LAST.load(Ordering::Relaxed);
+                    if now - l >= 3000 {
+                        LAST.store(now, Ordering::Relaxed);
+                        let d = DIRTY_COUNT.swap(0, Ordering::Relaxed);
+                        let b = BLINK_COUNT.swap(0, Ordering::Relaxed);
+                        let a = ANIM_COUNT.swap(0, Ordering::Relaxed);
+                        let p = PAUSE_COUNT.swap(0, Ordering::Relaxed);
+                        let n = COUNT.swap(0, Ordering::Relaxed).max(1);
+                        eprintln!("[redraw_req] total={c} dirty={d} blink={b} anim={a} pause={p} (per {n})");
+                    }
+                }
+                if self.occluded {
+                    return;
+                }
+
                 let now = Instant::now();
                 let elapsed = now.duration_since(self.last_redraw);
 
-                // New terminal content or user input — render immediately
+                // New terminal content or user input — full render immediately
                 if self.dirty {
                     self.dirty = false;
                     self.redraw();
                     self.last_redraw = Instant::now();
-                    // Keep the continuous loop going if cursor is blinking
+                    // Keep the blink loop going if cursor is visible, but use a timer
                     if self.tabs.get(self.active_tab).is_some_and(|p| p.cursor_visible()) {
-                        self.request_redraw();
+                        let interval = if self.tabs.get(self.active_tab)
+                            .is_some_and(|p| p.cursor_animating() || p.is_smooth_scrolling())
+                        {
+                            Duration::from_millis(16) // ~60fps for active animations
+                        } else {
+                            // During blink pause (500ms after input), sleep until
+                            // pause expires instead of rendering 30fps of identical
+                            // solid cursor.
+                            let input_age = self.tabs.get(self.active_tab)
+                                .map(|p| p.last_input_time().elapsed())
+                                .unwrap_or(Duration::from_secs(1));
+                            if input_age < Duration::from_millis(500) {
+                                let remaining = Duration::from_millis(500) - input_age;
+                                event_loop.set_control_flow(ControlFlow::WaitUntil(
+                                    Instant::now() + remaining,
+                                ));
+                                return;
+                            }
+                            BLINK_INTERVAL
+                        };
+                        let wait_until = self.last_redraw + interval;
+                        event_loop.set_control_flow(ControlFlow::WaitUntil(wait_until));
                     }
                     return;
                 }
@@ -645,19 +865,39 @@ impl ApplicationHandler<TerminalEvent> for App {
                 if let Some(panel) = self.tabs.get(self.active_tab) {
                     if panel.cursor_visible() {
                         if panel.cursor_animating() || panel.is_smooth_scrolling() {
-                            // Active animation — redraw at full frame rate
-                            self.redraw();
-                            self.last_redraw = Instant::now();
-                            self.request_redraw();
-                        } else if elapsed >= Duration::from_millis(33) {
-                            // Idle cursor blink — 30fps is enough
+                            // Active animation — full redraw at high frame rate
+                            #[cfg(feature = "debug-fps")]
+                            redraw_debug::ANIM_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                             self.redraw();
                             self.last_redraw = Instant::now();
                             self.request_redraw();
                         } else {
-                            // Too soon for idle blink — sleep until next frame instead of busy-looping
-                            let wait_until = self.last_redraw + Duration::from_millis(33);
-                            event_loop.set_control_flow(ControlFlow::WaitUntil(wait_until));
+                            // Check blink pause: during 500ms after input, cursor
+                            // is solid — no need to render at all.
+                            let input_age = panel.last_input_time().elapsed();
+                            if input_age < Duration::from_millis(500) {
+                                #[cfg(feature = "debug-fps")]
+                                redraw_debug::PAUSE_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                                let remaining = Duration::from_millis(500) - input_age;
+                                event_loop.set_control_flow(ControlFlow::WaitUntil(
+                                    Instant::now() + remaining,
+                                ));
+                                return;
+                            }
+
+                            if elapsed >= BLINK_INTERVAL {
+                                // Idle cursor blink — use blink-only fast path
+                                #[cfg(feature = "debug-fps")]
+                                redraw_debug::BLINK_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                                self.redraw_blink_only();
+                                self.last_redraw = Instant::now();
+                                let wait_until = self.last_redraw + BLINK_INTERVAL;
+                                event_loop.set_control_flow(ControlFlow::WaitUntil(wait_until));
+                            } else {
+                                // Too soon for idle blink — sleep until next frame
+                                let wait_until = self.last_redraw + BLINK_INTERVAL;
+                                event_loop.set_control_flow(ControlFlow::WaitUntil(wait_until));
+                            }
                         }
                     } else {
                         // Cursor hidden — just render (no continuous redraw)
@@ -971,14 +1211,51 @@ impl ApplicationHandler<TerminalEvent> for App {
         }
     }
 
-    fn about_to_wait(&mut self, _event_loop: &ActiveEventLoop) {
-        // After waking up from WaitUntil, request a redraw so the cursor blink updates.
-        // Only request if enough time has passed to avoid re-entering a busy loop.
-        let elapsed = self.last_redraw.elapsed();
-        if elapsed >= Duration::from_millis(33) {
-            if let Some(panel) = self.tabs.get(self.active_tab) {
-                if panel.cursor_visible() {
-                    self.request_redraw();
+    fn new_events(&mut self, event_loop: &ActiveEventLoop, cause: winit::event::StartCause) {
+        // When woken by WaitUntil timer, render directly instead of going
+        // through request_redraw → RedrawRequested to avoid macOS event
+        // dispatch overhead (~600us per wakeup).
+        if matches!(cause, winit::event::StartCause::ResumeTimeReached { .. }) {
+            if self.occluded {
+                return;
+            }
+            if self.dirty {
+                // Content changed while sleeping — do a full redraw via
+                // the standard path.
+                if let Some(w) = &self.window {
+                    w.request_redraw();
+                }
+                return;
+            }
+            // Extract panel state before mutable borrows
+            let panel_state = self.tabs.get(self.active_tab).map(|p| {
+                (p.cursor_visible(), p.cursor_animating(), p.is_smooth_scrolling(), p.last_input_time())
+            });
+            if let Some((cursor_vis, animating, scrolling, last_input)) = panel_state {
+                if cursor_vis {
+                    if animating || scrolling {
+                        // Active animation — full redraw needed
+                        self.redraw();
+                        self.last_redraw = Instant::now();
+                        if let Some(w) = &self.window {
+                            w.request_redraw();
+                        }
+                    } else {
+                        // Check blink pause
+                        let input_age = last_input.elapsed();
+                        if input_age < Duration::from_millis(500) {
+                            let remaining = Duration::from_millis(500) - input_age;
+                            event_loop.set_control_flow(ControlFlow::WaitUntil(
+                                Instant::now() + remaining,
+                            ));
+                            return;
+                        }
+                        // Blink-only render — skip event dispatch overhead
+                        self.redraw_blink_only();
+                        self.last_redraw = Instant::now();
+                        let wait_until = self.last_redraw + BLINK_INTERVAL;
+                        event_loop.set_control_flow(ControlFlow::WaitUntil(wait_until));
+                    }
                 }
             }
         }
