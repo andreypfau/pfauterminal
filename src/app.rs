@@ -245,11 +245,12 @@ impl App {
         );
         let tab_bufs = self.tab_bar.tab_buffers();
 
-        // Overlay: dropdown — reuse cached Vecs
+        // Overlay: scrollbar + dropdown — reuse cached Vecs
         let mut overlay = std::mem::take(&mut self.cached_overlay);
         let mut overlay_dd_text = std::mem::take(&mut self.cached_overlay_text);
         overlay.clear();
         overlay_dd_text.clear();
+        panel.draw_scrollbar(&mut overlay);
         if self.dropdown.is_open() {
             self.dropdown.draw(&mut overlay, &mut overlay_dd_text, theme, scale);
         }
@@ -926,10 +927,13 @@ impl ApplicationHandler<TerminalEvent> for App {
                     return;
                 }
 
-                // Drag selection
+                // Drag scrollbar or selection
                 if self.mouse_left_pressed {
                     if let Some(panel) = self.tabs.get_mut(self.active_tab) {
-                        if let Some((point, side)) = panel.pixel_to_point(cx, cy) {
+                        if panel.is_scrollbar_dragging() {
+                            panel.update_scrollbar_drag(cy);
+                            self.request_redraw();
+                        } else if let Some((point, side)) = panel.pixel_to_point(cx, cy) {
                             panel.update_selection(point, side);
                             self.request_redraw();
                         }
@@ -949,17 +953,22 @@ impl ApplicationHandler<TerminalEvent> for App {
                     self.request_redraw();
                 }
 
-                // Set cursor icon: text (I-beam) over terminal content, default elsewhere
+                // Set cursor icon
                 if let Some(window) = &self.window {
-                    let in_content = self
-                        .tabs
-                        .get(self.active_tab)
-                        .is_some_and(|p| p.is_in_content_area(cx, cy));
-                    window.set_cursor(if in_content {
+                    let panel = self.tabs.get(self.active_tab);
+                    let dragging_scrollbar = panel.as_ref().is_some_and(|p| p.is_scrollbar_dragging());
+                    let on_scrollbar = panel.as_ref().is_some_and(|p| p.is_in_scrollbar_area(cx, cy));
+                    let in_content = panel.is_some_and(|p| p.is_in_content_area(cx, cy));
+                    let icon = if dragging_scrollbar {
+                        CursorIcon::Grabbing
+                    } else if on_scrollbar {
+                        CursorIcon::Grab
+                    } else if in_content {
                         CursorIcon::Text
                     } else {
                         CursorIcon::Default
-                    });
+                    };
+                    window.set_cursor(icon);
                 }
             }
 
@@ -1028,7 +1037,11 @@ impl ApplicationHandler<TerminalEvent> for App {
                         TabBarElement::None => {}
                     }
                 } else if let Some(panel) = self.tabs.get_mut(self.active_tab) {
-                    if let Some((point, side)) = panel.pixel_to_point(cx, cy) {
+                    // Try scrollbar drag first
+                    if panel.try_start_scrollbar_drag(cx, cy) {
+                        self.mouse_left_pressed = true;
+                        self.request_redraw();
+                    } else if let Some((point, side)) = panel.pixel_to_point(cx, cy) {
                         let now = Instant::now();
                         if now.duration_since(self.last_click_time).as_millis() < 400 {
                             self.click_count = (self.click_count + 1).min(3);
@@ -1055,6 +1068,9 @@ impl ApplicationHandler<TerminalEvent> for App {
                 button: MouseButton::Left,
                 ..
             } => {
+                if let Some(panel) = self.tabs.get_mut(self.active_tab) {
+                    panel.stop_scrollbar_drag();
+                }
                 self.mouse_left_pressed = false;
             }
 
