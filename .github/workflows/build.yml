@@ -185,6 +185,7 @@ jobs:
           chmod +x artifacts/macos-x86_64/pfauterminal
           tar -czf pfauterminal-macos-x86_64.tar.gz -C artifacts/macos-x86_64 pfauterminal
           mv artifacts/windows/pfauterminal.exe pfauterminal-windows-x86_64.exe
+          chmod +x artifacts/pfauterminal.app/Contents/MacOS/pfauterminal
           cd artifacts && zip -ry ../pfauterminal-macos-app.zip pfauterminal.app && cd ..
 
       - name: Create release
