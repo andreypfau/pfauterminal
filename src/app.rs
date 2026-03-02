@@ -878,6 +878,19 @@ impl ApplicationHandler<TerminalEvent> for App {
                             self.request_redraw();
                             return;
                         }
+                        PhysicalKey::Code(KeyCode::KeyT) => {
+                            self.open_new_tab_dropdown();
+                            self.request_redraw();
+                            return;
+                        }
+                        PhysicalKey::Code(KeyCode::KeyW) => {
+                            if self.tabs.len() <= 1 {
+                                event_loop.exit();
+                            } else {
+                                self.close_tab(self.active_tab);
+                            }
+                            return;
+                        }
                         _ => {}
                     }
                     // Don't pass Cmd+key combos to the terminal
@@ -913,6 +926,19 @@ impl ApplicationHandler<TerminalEvent> for App {
                             {
                                 panel.notify_input();
                                 panel.write_to_pty(text.into_bytes());
+                            }
+                            return;
+                        }
+                        PhysicalKey::Code(KeyCode::KeyT) => {
+                            self.open_new_tab_dropdown();
+                            self.request_redraw();
+                            return;
+                        }
+                        PhysicalKey::Code(KeyCode::KeyW) => {
+                            if self.tabs.len() <= 1 {
+                                event_loop.exit();
+                            } else {
+                                self.close_tab(self.active_tab);
                             }
                             return;
                         }
