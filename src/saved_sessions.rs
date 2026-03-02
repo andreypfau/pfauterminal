@@ -9,6 +9,8 @@ pub struct SavedSession {
     pub auth_type: SavedAuthType,
     #[serde(default)]
     pub key_path: Option<String>,
+    #[serde(default)]
+    pub password: Option<String>,
     pub last_used: u64,
 }
 
@@ -75,6 +77,7 @@ impl SavedSessions {
             existing.last_used = session.last_used;
             existing.auth_type = session.auth_type;
             existing.key_path = session.key_path;
+            existing.password = session.password;
         } else {
             self.sessions.push(session);
         }

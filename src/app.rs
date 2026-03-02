@@ -421,6 +421,12 @@ impl App {
                 AuthMethod::Key => Some(result.key_path.clone()),
                 _ => None,
             },
+            password: match result.auth_method {
+                AuthMethod::Password if !result.password.is_empty() => {
+                    Some(result.password.clone())
+                }
+                _ => None,
+            },
             last_used: now_unix(),
         };
         self.saved_sessions.upsert(saved);
@@ -442,7 +448,9 @@ impl App {
                         username: session.username.clone(),
                         auth: match &session.auth_type {
                             SavedAuthType::Password => {
-                                crate::ssh::SshAuth::Password(String::new())
+                                crate::ssh::SshAuth::Password(
+                                    session.password.clone().unwrap_or_default(),
+                                )
                             }
                             SavedAuthType::Key => crate::ssh::SshAuth::Key {
                                 path: session
