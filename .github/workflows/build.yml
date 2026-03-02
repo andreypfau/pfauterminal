@@ -50,6 +50,79 @@ jobs:
           name: pfauterminal-macos-x86_64
           path: target/x86_64-apple-darwin/release/pfauterminal
 
+  bundle-macos:
+    needs: [build-macos, build-macos-x86_64]
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download aarch64 binary
+        uses: actions/download-artifact@v4
+        with:
+          name: pfauterminal-macos-aarch64
+          path: artifacts/aarch64
+
+      - name: Download x86_64 binary
+        uses: actions/download-artifact@v4
+        with:
+          name: pfauterminal-macos-x86_64
+          path: artifacts/x86_64
+
+      - name: Create universal binary
+        run: |
+          chmod +x artifacts/aarch64/pfauterminal artifacts/x86_64/pfauterminal
+          lipo -create -output pfauterminal \
+            artifacts/aarch64/pfauterminal \
+            artifacts/x86_64/pfauterminal
+          lipo -info pfauterminal
+
+      - name: Assemble .app bundle
+        run: |
+          APP="pfauterminal.app"
+          mkdir -p "${APP}/Contents/MacOS"
+          mkdir -p "${APP}/Contents/Resources/en.lproj"
+          mkdir -p "${APP}/Contents/Resources/ru.lproj"
+
+          cp pfauterminal "${APP}/Contents/MacOS/pfauterminal"
+          cp resources/macos/Info.plist "${APP}/Contents/Info.plist"
+          cp resources/macos/en.lproj/InfoPlist.strings "${APP}/Contents/Resources/en.lproj/InfoPlist.strings"
+          cp resources/macos/ru.lproj/InfoPlist.strings "${APP}/Contents/Resources/ru.lproj/InfoPlist.strings"
+
+      - name: Generate .icns icon (if source exists)
+        run: |
+          if [ -f resources/macos/AppIcon.png ]; then
+            ICONSET="AppIcon.iconset"
+            mkdir -p "${ICONSET}"
+            sips -z 16 16     resources/macos/AppIcon.png --out "${ICONSET}/icon_16x16.png"
+            sips -z 32 32     resources/macos/AppIcon.png --out "${ICONSET}/icon_16x16@2x.png"
+            sips -z 32 32     resources/macos/AppIcon.png --out "${ICONSET}/icon_32x32.png"
+            sips -z 64 64     resources/macos/AppIcon.png --out "${ICONSET}/icon_32x32@2x.png"
+            sips -z 128 128   resources/macos/AppIcon.png --out "${ICONSET}/icon_128x128.png"
+            sips -z 256 256   resources/macos/AppIcon.png --out "${ICONSET}/icon_128x128@2x.png"
+            sips -z 256 256   resources/macos/AppIcon.png --out "${ICONSET}/icon_256x256.png"
+            sips -z 512 512   resources/macos/AppIcon.png --out "${ICONSET}/icon_256x256@2x.png"
+            sips -z 512 512   resources/macos/AppIcon.png --out "${ICONSET}/icon_512x512.png"
+            sips -z 1024 1024 resources/macos/AppIcon.png --out "${ICONSET}/icon_512x512@2x.png"
+            iconutil -c icns "${ICONSET}" -o pfauterminal.app/Contents/Resources/AppIcon.icns
+            rm -rf "${ICONSET}"
+            echo "Icon generated successfully"
+          else
+            echo "No AppIcon.png found, skipping icon generation"
+          fi
+
+      - name: Patch version from tag
+        if: startsWith(github.ref, 'refs/tags/v')
+        run: |
+          VERSION="${GITHUB_REF_NAME#v}"
+          /usr/libexec/PlistBuddy -c "Set :CFBundleVersion ${VERSION}" pfauterminal.app/Contents/Info.plist
+          /usr/libexec/PlistBuddy -c "Set :CFBundleShortVersionString ${VERSION}" pfauterminal.app/Contents/Info.plist
+
+      - name: Upload .app artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: pfauterminal-macos-app
+          path: pfauterminal.app
+
   build-windows:
     runs-on: windows-latest
     steps:
@@ -73,14 +146,14 @@ jobs:
 
   release:
     if: startsWith(github.ref, 'refs/tags/v')
-    needs: [build-macos, build-macos-x86_64, build-windows]
+    needs: [build-macos, build-macos-x86_64, bundle-macos, build-windows]
     runs-on: ubuntu-latest
     permissions:
       contents: write
     steps:
       - uses: actions/checkout@v4
 
-      - name: Download macOS artifact
+      - name: Download macOS aarch64 artifact
         uses: actions/download-artifact@v4
         with:
           name: pfauterminal-macos-aarch64
@@ -91,6 +164,12 @@ jobs:
         with:
           name: pfauterminal-macos-x86_64
           path: artifacts/macos-x86_64
+
+      - name: Download macOS .app artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: pfauterminal-macos-app
+          path: artifacts/pfauterminal.app
 
       - name: Download Windows artifact
         uses: actions/download-artifact@v4
@@ -105,6 +184,7 @@ jobs:
           chmod +x artifacts/macos-x86_64/pfauterminal
           tar -czf pfauterminal-macos-x86_64.tar.gz -C artifacts/macos-x86_64 pfauterminal
           mv artifacts/windows/pfauterminal.exe pfauterminal-windows-x86_64.exe
+          cd artifacts && zip -ry ../pfauterminal-macos-app.zip pfauterminal.app && cd ..
 
       - name: Create release
         env:
@@ -113,11 +193,12 @@ jobs:
           gh release create "${{ github.ref_name }}" \
             pfauterminal-macos-aarch64.tar.gz \
             pfauterminal-macos-x86_64.tar.gz \
+            pfauterminal-macos-app.zip \
             pfauterminal-windows-x86_64.exe \
             --title "${{ github.ref_name }}" \
             --generate-notes
 
-      - name: Update Homebrew formula
+      - name: Update Homebrew tap
         env:
           HOMEBREW_TAP_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}
         if: env.HOMEBREW_TAP_TOKEN != ''
@@ -128,9 +209,11 @@ jobs:
 
           SHA256_ARM64=$(sha256sum pfauterminal-macos-aarch64.tar.gz | cut -d ' ' -f 1)
           SHA256_X86_64=$(sha256sum pfauterminal-macos-x86_64.tar.gz | cut -d ' ' -f 1)
+          SHA256_APP=$(sha256sum pfauterminal-macos-app.zip | cut -d ' ' -f 1)
 
           git clone https://x-access-token:${HOMEBREW_TAP_TOKEN}@github.com/andreypfau/homebrew-tap.git tap-repo
           mkdir -p tap-repo/Formula
+          mkdir -p tap-repo/Casks
 
           cat > tap-repo/Formula/pfauterminal.rb << FORMULA
           class Pfauterminal < Formula
@@ -159,12 +242,32 @@ jobs:
           end
           FORMULA
 
+          cat > tap-repo/Casks/pfauterminal.rb << CASK
+          cask "pfauterminal" do
+            version "${VERSION_NUM}"
+            sha256 "${SHA256_APP}"
+
+            url "https://github.com/${REPO}/releases/download/${VERSION}/pfauterminal-macos-app.zip"
+            name "PfauTerminal"
+            desc "A modern GPU-accelerated terminal emulator"
+            homepage "https://github.com/${REPO}"
+
+            app "pfauterminal.app"
+
+            zap trash: [
+              "~/Library/Preferences/io.github.andreypfau.pfauterminal.plist",
+              "~/Library/Caches/io.github.andreypfau.pfauterminal",
+            ]
+          end
+          CASK
+
           # Remove leading spaces from heredoc
           sed -i 's/^          //' tap-repo/Formula/pfauterminal.rb
+          sed -i 's/^          //' tap-repo/Casks/pfauterminal.rb
 
           cd tap-repo
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
-          git add Formula/pfauterminal.rb
+          git add Formula/pfauterminal.rb Casks/pfauterminal.rb
           git commit -m "Update pfauterminal to ${VERSION}"
           git push
