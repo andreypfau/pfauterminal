@@ -651,12 +651,32 @@ impl TerminalPanel {
             Key::Named(NamedKey::Backspace) => Some(b"\x7f".to_vec()),
             Key::Named(NamedKey::Tab) => Some(b"\t".to_vec()),
             Key::Named(NamedKey::Escape) => Some(b"\x1b".to_vec()),
-            Key::Named(NamedKey::ArrowUp) => Some([cursor_prefix, b"A"].concat()),
-            Key::Named(NamedKey::ArrowDown) => Some([cursor_prefix, b"B"].concat()),
-            Key::Named(NamedKey::ArrowRight) => Some([cursor_prefix, b"C"].concat()),
-            Key::Named(NamedKey::ArrowLeft) => Some([cursor_prefix, b"D"].concat()),
-            Key::Named(NamedKey::Home) => Some([cursor_prefix, b"H"].concat()),
-            Key::Named(NamedKey::End) => Some([cursor_prefix, b"F"].concat()),
+            Key::Named(
+                NamedKey::ArrowUp
+                | NamedKey::ArrowDown
+                | NamedKey::ArrowRight
+                | NamedKey::ArrowLeft
+                | NamedKey::Home
+                | NamedKey::End,
+            ) => {
+                let suffix = match event.logical_key.as_ref() {
+                    Key::Named(NamedKey::ArrowUp) => b'A',
+                    Key::Named(NamedKey::ArrowDown) => b'B',
+                    Key::Named(NamedKey::ArrowRight) => b'C',
+                    Key::Named(NamedKey::ArrowLeft) => b'D',
+                    Key::Named(NamedKey::Home) => b'H',
+                    Key::Named(NamedKey::End) => b'F',
+                    _ => unreachable!(),
+                };
+                // xterm modifier encoding: 1 + (Alt=2) + (Ctrl=4)
+                let modifier = 1 + if alt { 2 } else { 0 } + if ctrl { 4 } else { 0 };
+                if modifier > 1 {
+                    // Modified keys always use CSI format, even in app cursor mode
+                    Some(format!("\x1b[1;{modifier}{}", suffix as char).into_bytes())
+                } else {
+                    Some([cursor_prefix, &[suffix]].concat())
+                }
+            }
             Key::Named(NamedKey::PageUp) => Some(b"\x1b[5~".to_vec()),
             Key::Named(NamedKey::PageDown) => Some(b"\x1b[6~".to_vec()),
             Key::Named(NamedKey::Delete) => Some(b"\x1b[3~".to_vec()),
