@@ -57,10 +57,11 @@ pub fn spawn_ssh_thread(
     let (tx, rx) = mpsc::unbounded_channel();
 
     let term_clone = term.clone();
+    let term_err = term.clone();
     let cols = size.columns as u16;
     let rows = size.screen_lines as u16;
 
-    let _ = std::thread::Builder::new()
+    if let Err(e) = std::thread::Builder::new()
         .name("ssh-io".into())
         .spawn(move || {
             let rt = match tokio::runtime::Builder::new_current_thread()
@@ -86,7 +87,12 @@ pub fn spawn_ssh_thread(
                     event_proxy.send_event(alacritty_terminal::event::Event::Wakeup);
                 }
             });
-        });
+        })
+    {
+        write_to_term(&term_err, &format!(
+            "\x1b[?25l\r\n\x1b[31mFailed to spawn SSH thread: {e}\x1b[0m\r\n"
+        ));
+    }
 
     (term, tx)
 }
