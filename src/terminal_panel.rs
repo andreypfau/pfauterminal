@@ -330,7 +330,7 @@ impl TerminalPanel {
         event_proxy: EventProxy,
         shell: Option<String>,
         args: Vec<String>,
-    ) -> Option<Self> {
+    ) -> Result<Self, String> {
         let config = alacritty_terminal::term::Config::default();
         let term = Term::new(config, &size, event_proxy.clone());
         let term = Arc::new(FairMutex::new(term));
@@ -356,15 +356,21 @@ impl TerminalPanel {
             cell_height: cell_px.1,
         };
 
-        let pty = tty::new(&pty_config, window_size, 0).ok()?;
-        let event_loop = EventLoop::new(term.clone(), event_proxy.clone(), pty, false, false).ok()?;
+        let pty = match tty::new(&pty_config, window_size, 0) {
+            Ok(p) => p,
+            Err(e) => return Err(format!("Failed to create PTY: {e}")),
+        };
+        let event_loop = match EventLoop::new(term.clone(), event_proxy.clone(), pty, false, false) {
+            Ok(el) => el,
+            Err(e) => return Err(format!("Failed to start event loop: {e}")),
+        };
         let channel = event_loop.channel();
 
         event_proxy.set_backend(Backend::Local(channel.clone()));
 
         event_loop.spawn();
 
-        Some(Self {
+        Ok(Self {
             id,
             term,
             backend: Backend::Local(channel),
@@ -398,6 +404,43 @@ impl TerminalPanel {
             char_buffers: Vec::new(),
             char_key_map: HashMap::new(),
             title: String::from("SSH"),
+            scroll_pixel_offset: 0.0,
+            scroll_accumulator: 0.0,
+            active_selection: None,
+            cursor_anim: CursorAnimation::new(),
+            cursor_visible: false,
+        }
+    }
+
+    /// Create a read-only panel that displays an error message to the user.
+    pub fn new_error(
+        id: PanelId,
+        size: TermSize,
+        event_proxy: EventProxy,
+        error: &str,
+    ) -> Self {
+        let config = alacritty_terminal::term::Config::default();
+        let term = Term::new(config, &size, event_proxy.clone());
+        let term = Arc::new(FairMutex::new(term));
+
+        // Write the error message into the terminal buffer so the user can see it
+        let msg = format!("\x1b[?25l\r\n\x1b[31m{error}\x1b[0m\r\n");
+        let mut parser = alacritty_terminal::vte::ansi::Processor::<
+            alacritty_terminal::vte::ansi::StdSyncHandler,
+        >::new();
+        {
+            let mut t = term.lock();
+            parser.advance(&mut *t, msg.as_bytes());
+        }
+
+        Self {
+            id,
+            term,
+            backend: Backend::Ssh(mpsc::unbounded_channel().0),
+            viewport: None,
+            char_buffers: Vec::new(),
+            char_key_map: HashMap::new(),
+            title: String::from("Error"),
             scroll_pixel_offset: 0.0,
             scroll_accumulator: 0.0,
             active_selection: None,

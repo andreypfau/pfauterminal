@@ -102,7 +102,7 @@ impl App {
         gpu: &GpuContext,
         shell: Option<String>,
         args: Vec<String>,
-    ) -> Option<TerminalPanel> {
+    ) -> Result<TerminalPanel, String> {
         let (panel_id, vp, event_proxy) = self.new_panel_params(gpu);
         let cell_px = (
             (gpu.cell.width * gpu.scale_factor) as u16,
@@ -277,9 +277,15 @@ impl App {
 
     fn new_tab(&mut self, shell: Option<String>) {
         let Some(gpu) = self.gpu.as_ref() else { return };
-        if let Some(panel) = self.create_terminal_panel(gpu, shell, Vec::new()) {
-            self.add_tab(panel);
-        }
+        let panel = match self.create_terminal_panel(gpu, shell, Vec::new()) {
+            Ok(p) => p,
+            Err(error) => {
+                let (panel_id, vp, event_proxy) = self.new_panel_params(gpu);
+                let size = TermSize::new(vp.cols, vp.rows);
+                TerminalPanel::new_error(panel_id, size, event_proxy, &error)
+            }
+        };
+        self.add_tab(panel);
     }
 
     fn new_tab_ssh(&mut self, result: SshResult) {
