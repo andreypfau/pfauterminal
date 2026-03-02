@@ -84,6 +84,7 @@ jobs:
           mkdir -p "${APP}/Contents/Resources/ru.lproj"
 
           cp pfauterminal "${APP}/Contents/MacOS/pfauterminal"
+          chmod +x "${APP}/Contents/MacOS/pfauterminal"
           cp resources/macos/Info.plist "${APP}/Contents/Info.plist"
           cp resources/macos/en.lproj/InfoPlist.strings "${APP}/Contents/Resources/en.lproj/InfoPlist.strings"
           cp resources/macos/ru.lproj/InfoPlist.strings "${APP}/Contents/Resources/ru.lproj/InfoPlist.strings"
