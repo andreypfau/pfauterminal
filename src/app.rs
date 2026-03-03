@@ -24,7 +24,7 @@ use crate::icons;
 use crate::icons::IconManager;
 use crate::layout::{Rect, TextSpec};
 use crate::saved_sessions::{now_unix, SavedAuthType, SavedSession, SavedSessions};
-use crate::ssh_dialog::{AuthMethod, SshDialogWindow, SshPrefill, SshResult};
+use crate::ssh_dialog::{AuthMethod, SshDialog, SshPrefill, SshResult};
 use crate::tab_bar::{TabBar, TabBarElement};
 use crate::terminal_panel::{EventProxy, PanelId, TermSize, TerminalEvent, TerminalPanel};
 use crate::theme::Theme;
@@ -42,7 +42,7 @@ pub struct App {
     active_tab: usize,
     tab_bar: TabBar,
     dropdown: DropdownMenu,
-    ssh_dialog_window: Option<SshDialogWindow>,
+    ssh_dialog: Option<SshDialog>,
     saved_sessions: SavedSessions,
     cached_shells: Option<Vec<(String, String)>>,
     shell_receiver: Option<std::sync::mpsc::Receiver<Vec<(String, String)>>>,
@@ -50,6 +50,7 @@ pub struct App {
     super_pressed: bool,
     ctrl_pressed: bool,
     alt_pressed: bool,
+    shift_pressed: bool,
     mouse_left_pressed: bool,
     last_click_time: Instant,
     click_count: u8,
@@ -88,7 +89,7 @@ impl App {
             active_tab: 0,
             tab_bar: TabBar::new(),
             dropdown: DropdownMenu::new(),
-            ssh_dialog_window: None,
+            ssh_dialog: None,
             saved_sessions,
             cached_shells: None,
             shell_receiver: Some(shell_rx),
@@ -96,6 +97,7 @@ impl App {
             super_pressed: false,
             ctrl_pressed: false,
             alt_pressed: false,
+            shift_pressed: false,
             mouse_left_pressed: false,
             last_click_time: Instant::now(),
             click_count: 0,
@@ -245,7 +247,7 @@ impl App {
         );
         let tab_bufs = self.tab_bar.tab_buffers();
 
-        // Overlay: scrollbar + dropdown — reuse cached Vecs
+        // Overlay: scrollbar + dropdown + SSH dialog — reuse cached Vecs
         let mut overlay = std::mem::take(&mut self.cached_overlay);
         let mut overlay_dd_text = std::mem::take(&mut self.cached_overlay_text);
         overlay.clear();
@@ -256,6 +258,27 @@ impl App {
         }
         let dd_bufs = self.dropdown.item_buffers();
 
+        // SSH dialog overlay (scrim + dialog body + auth dropdown)
+        let mut dialog_text_areas: Vec<glyphon::TextArea> = Vec::new();
+        let mut dialog_dd_text: Vec<TextSpec> = Vec::new();
+        if let Some(dialog) = &self.ssh_dialog {
+            let sw = gpu.surface_config.width as f32;
+            let sh = gpu.surface_config.height as f32;
+            SshDialog::draw_scrim(&mut overlay, sw, sh);
+            dialog.draw(&mut overlay, &mut dialog_text_areas, scale, &colors);
+            if dialog.auth_dropdown().is_open() {
+                dialog.auth_dropdown().draw(
+                    &mut overlay,
+                    &mut dialog_dd_text,
+                    theme,
+                    scale,
+                );
+            }
+        }
+        let auth_dd_bufs = self.ssh_dialog.as_ref()
+            .map(|d| d.auth_dropdown().item_buffers())
+            .unwrap_or(&[]);
+
         #[cfg(feature = "debug-fps")]
         let _debug_t3 = Instant::now();
 
@@ -265,6 +288,7 @@ impl App {
         ];
         let overlay_text: Vec<(&[TextSpec], &[glyphon::Buffer])> = vec![
             (&overlay_dd_text, dd_bufs),
+            (&dialog_dd_text, auth_dd_bufs),
         ];
 
         let screenshot = self.screenshot_pending.take();
@@ -274,6 +298,7 @@ impl App {
             &overlay,
             &scene_text,
             &overlay_text,
+            dialog_text_areas,
             &self.icon_manager,
             screenshot.as_deref(),
             true, // content_changed
@@ -334,6 +359,12 @@ impl App {
     /// Blink-only redraw: reuse cached scene, only update cursor uniform.
     /// Skips scene rebuild and GPU data uploads for minimal CPU usage.
     fn redraw_blink_only(&mut self) {
+        // When the SSH dialog is open, always do a full redraw
+        if self.ssh_dialog.is_some() {
+            self.redraw();
+            return;
+        }
+
         if self.gpu.is_none() || self.tabs.is_empty() {
             return;
         }
@@ -366,6 +397,7 @@ impl App {
             &self.cached_overlay,
             &scene_text,
             &overlay_text,
+            Vec::new(),
             &self.icon_manager,
             None,
             false, // content_changed = false
@@ -426,8 +458,9 @@ impl App {
 
     fn new_tab(&mut self, shell: Option<String>) {
         let Some(gpu) = self.gpu.as_ref() else { return };
-        // When no shell is specified, use the user's default login shell
-        let shell = shell.or_else(|| detect_default_shell().map(|(_, path)| path));
+        // When shell is None, alacritty_terminal uses its own default_shell_command
+        // which launches a proper login shell via /usr/bin/login on macOS.
+        // This ensures ~/.zprofile is sourced and Homebrew PATH is available.
         let panel = match self.create_terminal_panel(gpu, shell, Vec::new()) {
             Ok(p) => p,
             Err(error) => {
@@ -556,12 +589,22 @@ impl App {
         );
     }
 
-    fn open_ssh_dialog(&mut self, event_loop: &ActiveEventLoop, prefill: Option<SshPrefill>) {
-        if self.ssh_dialog_window.is_some() {
+    fn open_ssh_dialog(&mut self, prefill: Option<SshPrefill>) {
+        if self.ssh_dialog.is_some() {
             return; // already open
         }
-        self.ssh_dialog_window =
-            SshDialogWindow::open(event_loop, &self.theme, prefill.as_ref());
+        let Some(gpu) = self.gpu.as_mut() else { return };
+        let scale = gpu.scale_factor;
+        let sw = gpu.surface_config.width as f32;
+        let sh = gpu.surface_config.height as f32;
+        self.ssh_dialog = Some(SshDialog::new(
+            scale,
+            &self.theme,
+            &mut gpu.font_system,
+            prefill.as_ref(),
+            sw,
+            sh,
+        ));
     }
 
     fn save_ssh_session(&mut self, result: &SshResult) {
@@ -589,13 +632,13 @@ impl App {
         self.saved_sessions.upsert(saved);
     }
 
-    fn execute_menu_action(&mut self, action: &MenuAction, event_loop: &ActiveEventLoop) {
+    fn execute_menu_action(&mut self, action: &MenuAction) {
         match action {
             MenuAction::NewShell(shell_path) => {
                 self.new_tab(Some(shell_path.clone()));
             }
             MenuAction::OpenSshDialog => {
-                self.open_ssh_dialog(event_loop, None);
+                self.open_ssh_dialog(None);
             }
             MenuAction::ConnectSavedSession(key) => {
                 if let Some(session) = self.saved_sessions.find_by_key(key) {
@@ -717,15 +760,6 @@ impl ApplicationHandler<TerminalEvent> for App {
                 }
                 self.sync_tab_state();
             }
-            TerminalEvent::SshDialogClose(result) => {
-                self.ssh_dialog_window = None;
-                if let Some(result) = result
-                    && !result.host.is_empty()
-                {
-                    self.save_ssh_session(&result);
-                    self.new_tab_ssh(result);
-                }
-            }
             TerminalEvent::Exit(panel_id) => {
                 self.tabs.retain(|p| p.id() != panel_id);
 
@@ -745,31 +779,7 @@ impl ApplicationHandler<TerminalEvent> for App {
         window_id: WindowId,
         event: WindowEvent,
     ) {
-        // Route events to SSH dialog window if it matches
-        if let Some(dialog_win) = &mut self.ssh_dialog_window
-            && window_id == dialog_win.window_id()
-        {
-            match dialog_win.handle_event(event) {
-                Ok(None) => {} // continue
-                Ok(Some(result)) => {
-                    // Defer close — dropping the window inside its own event
-                    // handler (e.g. key_down) crashes on macOS because the
-                    // NSView is deallocated while Objective-C still holds it.
-                    let _ = self
-                        .event_proxy_raw
-                        .send_event(TerminalEvent::SshDialogClose(Some(result)));
-                }
-                Err(()) => {
-                    // Defer cancel
-                    let _ = self
-                        .event_proxy_raw
-                        .send_event(TerminalEvent::SshDialogClose(None));
-                }
-            }
-            return;
-        }
-
-        // Ignore events for unknown windows (stale events from recently closed dialog)
+        // Ignore events for unknown windows
         if let Some(main_window) = &self.window
             && window_id != main_window.id()
         {
@@ -785,6 +795,13 @@ impl ApplicationHandler<TerminalEvent> for App {
                 self.dropdown.close();
                 if let Some(gpu) = &mut self.gpu {
                     gpu.resize(new_size.width, new_size.height);
+                    // Recenter SSH dialog on resize
+                    if let Some(dialog) = &mut self.ssh_dialog {
+                        let scale = gpu.scale_factor;
+                        let sw = new_size.width as f32;
+                        let sh = new_size.height as f32;
+                        dialog.compute_layout_centered(scale, sw, sh, &mut gpu.font_system);
+                    }
                 }
                 self.sync_tab_state();
             }
@@ -793,6 +810,14 @@ impl ApplicationHandler<TerminalEvent> for App {
                 self.dropdown.close();
                 if let Some(gpu) = &mut self.gpu {
                     gpu.scale_factor = scale_factor as f32;
+                    // Recenter SSH dialog on scale change
+                    if let Some(dialog) = &mut self.ssh_dialog {
+                        let sw = gpu.surface_config.width as f32;
+                        let sh = gpu.surface_config.height as f32;
+                        dialog.compute_layout_centered(
+                            scale_factor as f32, sw, sh, &mut gpu.font_system,
+                        );
+                    }
                 }
                 self.sync_tab_state();
             }
@@ -918,6 +943,16 @@ impl ApplicationHandler<TerminalEvent> for App {
                 self.cursor_position = (position.x as f32, position.y as f32);
                 let (cx, cy) = self.cursor_position;
 
+                // SSH dialog intercepts mouse move when open
+                if let Some(dialog) = &mut self.ssh_dialog {
+                    let cursor = dialog.handle_mouse_move(cx, cy);
+                    if let Some(window) = &self.window {
+                        window.set_cursor(cursor);
+                    }
+                    self.request_redraw();
+                    return;
+                }
+
                 // Dropdown hover takes priority when open
                 if self.dropdown.is_open() {
                     let hover = self.dropdown.hit_test(cx, cy);
@@ -985,6 +1020,30 @@ impl ApplicationHandler<TerminalEvent> for App {
             } => {
                 let (cx, cy) = self.cursor_position;
 
+                // SSH dialog intercepts all clicks when open
+                if self.ssh_dialog.is_some() {
+                    let Some(gpu) = self.gpu.as_mut() else { return };
+                    let dropdown_theme = self.theme.dropdown.clone();
+                    let dialog = self.ssh_dialog.as_mut().unwrap();
+                    match dialog.handle_mouse_click(
+                        cx, cy,
+                        &mut gpu.font_system,
+                        &dropdown_theme,
+                    ) {
+                        Ok(None) => {}
+                        Ok(Some(result)) => {
+                            self.ssh_dialog = None;
+                            self.save_ssh_session(&result);
+                            self.new_tab_ssh(result);
+                        }
+                        Err(()) => {
+                            self.ssh_dialog = None;
+                        }
+                    }
+                    self.request_redraw();
+                    return;
+                }
+
                 // Dropdown intercepts all clicks when open
                 if self.dropdown.is_open() {
                     match self.dropdown.hit_test(cx, cy) {
@@ -992,7 +1051,7 @@ impl ApplicationHandler<TerminalEvent> for App {
                             let action = self.dropdown.action_for(idx).cloned();
                             self.dropdown.close();
                             if let Some(action) = action {
-                                self.execute_menu_action(&action, event_loop);
+                                self.execute_menu_action(&action);
                             }
                         }
                         DropdownElement::CloseButton(idx) => {
@@ -1079,6 +1138,9 @@ impl ApplicationHandler<TerminalEvent> for App {
                 button: MouseButton::Right,
                 ..
             } => {
+                if self.ssh_dialog.is_some() {
+                    return; // Dialog absorbs right-clicks
+                }
                 let (cx, cy) = self.cursor_position;
                 if self.dropdown.is_open() {
                     self.dropdown.close();
@@ -1091,9 +1153,38 @@ impl ApplicationHandler<TerminalEvent> for App {
                 self.super_pressed = new_modifiers.state().super_key();
                 self.ctrl_pressed = new_modifiers.state().control_key();
                 self.alt_pressed = new_modifiers.state().alt_key();
+                self.shift_pressed = new_modifiers.state().shift_key();
             }
 
             WindowEvent::KeyboardInput { event, .. } => {
+                // SSH dialog intercepts all keyboard input when open
+                if self.ssh_dialog.is_some() {
+                    let Some(gpu) = self.gpu.as_mut() else { return };
+                    let dialog = self.ssh_dialog.as_mut().unwrap();
+                    let shift = self.shift_pressed;
+                    let super_p = self.super_pressed;
+                    let ctrl_p = self.ctrl_pressed;
+                    match dialog.handle_key_event(
+                        &event,
+                        &mut gpu.font_system,
+                        super_p,
+                        ctrl_p,
+                        shift,
+                    ) {
+                        Ok(None) => {}
+                        Ok(Some(result)) => {
+                            self.ssh_dialog = None;
+                            self.save_ssh_session(&result);
+                            self.new_tab_ssh(result);
+                        }
+                        Err(()) => {
+                            self.ssh_dialog = None;
+                        }
+                    }
+                    self.request_redraw();
+                    return;
+                }
+
                 // Close dropdown on Escape
                 if self.dropdown.is_open()
                     && event.state == ElementState::Pressed
@@ -1213,6 +1304,9 @@ impl ApplicationHandler<TerminalEvent> for App {
             }
 
             WindowEvent::MouseWheel { delta, .. } => {
+                if self.ssh_dialog.is_some() {
+                    return; // Dialog absorbs scroll events
+                }
                 let cell_height = self
                     .gpu
                     .as_ref()

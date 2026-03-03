@@ -36,8 +36,6 @@ pub enum TerminalEvent {
     Wakeup,
     Title(PanelId, String),
     Exit(PanelId),
-    /// Deferred SSH dialog close — carries an optional result (None = cancelled).
-    SshDialogClose(Option<crate::ssh_dialog::SshResult>),
 }
 
 // --- Panel types ---
@@ -342,7 +340,11 @@ impl TerminalPanel {
         let term = Arc::new(FairMutex::new(term));
 
         let pty_config = tty::Options {
-            shell: shell.map(|program| tty::Shell::new(program, args)),
+            shell: shell.map(|program| {
+                let mut shell_args = vec!["--login".to_string()];
+                shell_args.extend(args);
+                tty::Shell::new(program, shell_args)
+            }),
             working_directory: dirs::home_dir(),
             drain_on_exit: true,
             env: {
