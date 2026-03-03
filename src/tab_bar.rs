@@ -101,8 +101,7 @@ impl TabBar {
         let total_width = total_tabs_width + total_gaps + plus_w;
 
         let panel_x = y_offset;
-        let start_x = panel_x + (surface_width - total_width) / 2.0;
-        let mut x = start_x.max(panel_x);
+        let mut x = panel_x + gap;
 
         self.tab_rects.clear();
         self.close_rects.clear();
