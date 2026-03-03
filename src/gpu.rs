@@ -12,8 +12,8 @@ use crate::font::{self, CellMetrics};
 use crate::icons::IconManager;
 use crate::layout::{BgQuad, CursorData, Rect, RoundedQuad, TextSpec};
 
-/// Max rounded rects: panel islands + tab bar elements (borders, backgrounds)
-const MAX_ROUNDED_RECTS: usize = 64;
+/// Max rounded rects: panel islands + tab bar elements + SSH dialog overlay
+const MAX_ROUNDED_RECTS: usize = 160;
 
 /// Pick an sRGB render format, fixing Bgra8Unorm/Rgba8Unorm on Windows.
 fn pick_srgb_format(fmt: TextureFormat) -> TextureFormat {
@@ -491,134 +491,6 @@ impl RoundedRectUniforms {
 }
 
 // ---------------------------------------------------------------------------
-// GpuSimple — lightweight GPU context for the SSH dialog window
-// ---------------------------------------------------------------------------
-
-/// Lightweight GPU context for simple windows (e.g. SSH dialog) that only need
-/// two-layer rendering (base + overlay) with rounded rects and text.
-pub struct GpuSimple {
-    pub device: Device,
-    pub queue: Queue,
-    pub surface: Surface<'static>,
-    pub surface_config: SurfaceConfiguration,
-    render_format: TextureFormat,
-
-    pub font_system: FontSystem,
-    swash_cache: SwashCache,
-    atlas: TextAtlas,
-    text_renderer: TextRenderer,
-    overlay_text_renderer: TextRenderer,
-    viewport: Viewport,
-    rounded_rect: RoundedRectPipeline,
-    pub colors: ColorScheme,
-}
-
-impl GpuSimple {
-    pub fn new(
-        window: Arc<winit::window::Window>,
-        colors: ColorScheme,
-        max_rounded_rects: usize,
-    ) -> Option<Self> {
-        let gpu = init_gpu(window, TextureUsages::RENDER_ATTACHMENT)?;
-        let text = init_text_resources(&gpu.device, &gpu.queue, gpu.render_format);
-        let rounded_rect =
-            RoundedRectPipeline::new(&gpu.device, gpu.render_format, max_rounded_rects);
-
-        Some(Self {
-            device: gpu.device,
-            queue: gpu.queue,
-            surface: gpu.surface,
-            surface_config: gpu.surface_config,
-            render_format: gpu.render_format,
-            font_system: text.font_system,
-            swash_cache: text.swash_cache,
-            atlas: text.atlas,
-            text_renderer: text.text_renderer,
-            overlay_text_renderer: text.overlay_text_renderer,
-            viewport: text.viewport,
-            rounded_rect,
-            colors,
-        })
-    }
-
-    pub fn resize(&mut self, width: u32, height: u32) {
-        if width == 0 || height == 0 {
-            return;
-        }
-        self.surface_config.width = width;
-        self.surface_config.height = height;
-        self.surface.configure(&self.device, &self.surface_config);
-    }
-
-    /// Render a frame with two layers: base (rounded rects + text) then overlay (rounded rects + text).
-    pub fn render_simple(
-        &mut self,
-        clear_color: wgpu::Color,
-        base_quads: &[RoundedQuad],
-        overlay_quads: &[RoundedQuad],
-        base_text: Vec<TextArea>,
-        overlay_text: Vec<TextArea>,
-    ) -> Result<(), SurfaceError> {
-        let (frame, view) = begin_frame(&self.surface, self.render_format)?;
-
-        let base_rr_count = self.rounded_rect.upload_quads(&self.queue, base_quads, 0);
-        let total_rr_count =
-            self.rounded_rect
-                .upload_quads(&self.queue, overlay_quads, base_rr_count);
-
-        update_viewport(&mut self.viewport, &self.queue, &self.surface_config);
-
-        self.text_renderer
-            .prepare(
-                &self.device,
-                &self.queue,
-                &mut self.font_system,
-                &mut self.atlas,
-                &self.viewport,
-                base_text,
-                &mut self.swash_cache,
-            )
-            .ok();
-
-        self.overlay_text_renderer
-            .prepare(
-                &self.device,
-                &self.queue,
-                &mut self.font_system,
-                &mut self.atlas,
-                &self.viewport,
-                overlay_text,
-                &mut self.swash_cache,
-            )
-            .ok();
-
-        let mut encoder = self
-            .device
-            .create_command_encoder(&CommandEncoderDescriptor {
-                label: Some("render encoder"),
-            });
-
-        {
-            let mut pass = begin_clear_pass(&mut encoder, &view, "render pass", clear_color);
-
-            self.rounded_rect.draw_range(&mut pass, 0, base_rr_count);
-            self.text_renderer
-                .render(&self.atlas, &self.viewport, &mut pass)
-                .ok();
-
-            self.rounded_rect
-                .draw_range(&mut pass, base_rr_count, total_rr_count - base_rr_count);
-            self.overlay_text_renderer
-                .render(&self.atlas, &self.viewport, &mut pass)
-                .ok();
-        }
-
-        finish_frame(&self.queue, &mut self.atlas, encoder, frame);
-        Ok(())
-    }
-}
-
-// ---------------------------------------------------------------------------
 // GpuContext — full GPU context for the main terminal window
 // ---------------------------------------------------------------------------
 
@@ -878,6 +750,7 @@ impl GpuContext {
         overlay: &DrawContext,
         scene_text: &[(&[TextSpec], &[Buffer])],
         overlay_text: &[(&[TextSpec], &[Buffer])],
+        extra_overlay_text: Vec<TextArea>,
         icon_manager: &IconManager,
         screenshot_path: Option<&str>,
         content_changed: bool,
@@ -1009,6 +882,7 @@ impl GpuContext {
             for &(specs, bufs) in overlay_text {
                 push_text_specs(&mut overlay_areas, specs, bufs, scale_factor);
             }
+            overlay_areas.extend(extra_overlay_text);
 
             self.overlay_text_renderer
                 .prepare_with_custom(

@@ -146,7 +146,6 @@ pub struct DialogTheme {
     pub cancel_pad_v: f32,
     pub ok_pad_h: f32,
     pub font_size: f32,
-    pub max_rounded_rects: usize,
 }
 
 impl Default for DialogTheme {
@@ -174,7 +173,6 @@ impl Default for DialogTheme {
             cancel_pad_v: 8.0,
             ok_pad_h: 28.0,
             font_size: 13.0,
-            max_rounded_rects: 80,
         }
     }
 }

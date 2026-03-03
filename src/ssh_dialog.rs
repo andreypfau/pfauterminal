@@ -1,11 +1,7 @@
-use std::sync::Arc;
-
 use glyphon::{FontSystem, Metrics, TextArea};
-use wgpu::*;
-use winit::event::{ElementState, KeyEvent, MouseButton, WindowEvent};
-use winit::event_loop::ActiveEventLoop;
+use winit::event::{ElementState, KeyEvent};
 use winit::keyboard::{Key, NamedKey};
-use winit::window::{Window, WindowAttributes, WindowId};
+use winit::window::CursorIcon;
 
 use crate::colors::ColorScheme;
 use crate::draw::DrawContext;
@@ -157,8 +153,11 @@ impl FormLayout {
     }
 }
 
-/// Dialog state: widgets, focus, layout rects, text buffers.
-struct SshDialog {
+/// In-window modal dialog for SSH session configuration.
+///
+/// Renders as a centered overlay with a dimmed backdrop. Clicking outside
+/// the dialog or pressing Escape closes it.
+pub struct SshDialog {
     // Labels
     title: Label,
     host_label: Label,
@@ -192,14 +191,22 @@ struct SshDialog {
     scale: f32,
     dialog_theme: DialogTheme,
     label_color: glyphon::Color,
+
+    // Centering / surface info
+    origin_x: f32,
+    origin_y: f32,
+    surface_w: f32,
+    surface_h: f32,
 }
 
 impl SshDialog {
-    fn new(
+    pub fn new(
         scale: f32,
         theme: &Theme,
         font_system: &mut FontSystem,
         prefill: Option<&SshPrefill>,
+        surface_w: f32,
+        surface_h: f32,
     ) -> Self {
         let t = &theme.dialog;
         let colors = &theme.colors;
@@ -295,6 +302,10 @@ impl SshDialog {
             scale,
             dialog_theme: t.clone(),
             label_color,
+            origin_x: 0.0,
+            origin_y: 0.0,
+            surface_w,
+            surface_h,
         };
 
         if let Some(prefill) = prefill {
@@ -315,14 +326,44 @@ impl SshDialog {
             }
         }
 
-        dialog.compute_layout(scale, font_system);
+        dialog.compute_layout_centered(scale, surface_w, surface_h, font_system);
         dialog
+    }
+
+    /// Recompute layout centered on the given surface dimensions.
+    pub fn compute_layout_centered(
+        &mut self,
+        scale: f32,
+        surface_w: f32,
+        surface_h: f32,
+        font_system: &mut FontSystem,
+    ) {
+        let t = &self.dialog_theme;
+        let dialog_w = t.width * scale;
+        let dialog_h = self.compute_dialog_height() * scale;
+        self.origin_x = ((surface_w - dialog_w) / 2.0).max(0.0);
+        self.origin_y = ((surface_h - dialog_h) / 2.0).max(0.0);
+        self.surface_w = surface_w;
+        self.surface_h = surface_h;
+        self.compute_layout(scale, font_system);
+    }
+
+    /// Returns the dialog bounding rect in surface coordinates.
+    pub fn dialog_rect(&self) -> Rect {
+        let t = &self.dialog_theme;
+        Rect {
+            x: self.origin_x,
+            y: self.origin_y,
+            width: t.width * self.scale,
+            height: self.compute_dialog_height() * self.scale,
+        }
     }
 
     fn compute_layout(&mut self, scale: f32, font_system: &mut FontSystem) {
         self.scale = scale;
         let s = scale;
         let t = &self.dialog_theme;
+        let (ox, oy) = (self.origin_x, self.origin_y);
 
         let char_width = crate::font::measure_cell(font_system).width;
         for field in [
@@ -337,8 +378,9 @@ impl SshDialog {
         }
 
         let line_h = t.font_size * LINE_HEIGHT_MULT;
-        let form_x = t.form_pad_h * s;
-        let form_w = t.width * s - 2.0 * form_x;
+        let form_pad = t.form_pad_h * s;
+        let form_x = ox + form_pad;
+        let form_w = t.width * s - 2.0 * form_pad;
         let field_h = t.field_height * s;
         let field_gap = t.field_gap * s;
         let label_w = t.label_width * s;
@@ -346,7 +388,7 @@ impl SshDialog {
 
         let dialog_w = t.width * s;
         let dialog_h = self.compute_dialog_height() * s;
-        let dialog_rect = Rect { x: 0.0, y: 0.0, width: dialog_w, height: dialog_h };
+        let dialog_rect = Rect { x: ox, y: oy, width: dialog_w, height: dialog_h };
         let label_color = self.label_color;
 
         let fl = FormLayout {
@@ -360,11 +402,11 @@ impl SshDialog {
         };
 
         // Title
-        let title_y = (t.title_bar_height * s - fl.line_h_scaled) / 2.0;
+        let title_y = oy + (t.title_bar_height * s - fl.line_h_scaled) / 2.0;
         self.title.set_position(form_x, title_y, dialog_rect);
         self.title.set_color(label_color);
 
-        let mut row_y = t.title_bar_height * s + t.form_pad_v * s;
+        let mut row_y = oy + t.title_bar_height * s + t.form_pad_v * s;
         let row_step = field_h + t.form_row_gap * s;
 
         // Host + Port row
@@ -427,10 +469,10 @@ impl SshDialog {
 
         // Footer buttons
         let button_h = t.cancel_pad_v * 2.0 + line_h;
-        let footer_y = (self.compute_dialog_height() - t.footer_pad_v - button_h) * s;
+        let footer_y = oy + (self.compute_dialog_height() - t.footer_pad_v - button_h) * s;
         let cancel_w = (t.cancel_pad_h * 2.0 + char_width * 6.0) * s;
         let ok_w = (t.ok_pad_h * 2.0 + char_width * 2.0) * s;
-        let btn_right = dialog_w - t.footer_pad_h * s;
+        let btn_right = ox + dialog_w - t.footer_pad_h * s;
         self.ok_button.set_rect(Rect {
             x: btn_right - ok_w,
             y: footer_y,
@@ -618,16 +660,14 @@ impl SshDialog {
         font_system: &mut FontSystem,
         dropdown_theme: &crate::theme::DropdownTheme,
     ) {
-        let dialog_w = self.dialog_theme.width * self.scale;
-        let dialog_h = self.compute_dialog_height() * self.scale;
         let auth_logical_w = self.auth_dropdown_rect.width / self.scale;
         self.auth_dropdown.open(
             auth_menu_items(),
             crate::dropdown::MenuPosition::BelowAnchor(self.auth_dropdown_rect),
             Some(auth_logical_w),
             self.scale,
-            dialog_w,
-            dialog_h,
+            self.surface_w,
+            self.surface_h,
             font_system,
             dropdown_theme,
         );
@@ -726,18 +766,182 @@ impl SshDialog {
         }
     }
 
-    fn cursor_for_hit(hit: &DialogHit) -> winit::window::CursorIcon {
+    fn cursor_for_hit(hit: &DialogHit) -> CursorIcon {
         match hit {
             DialogHit::CancelButton
             | DialogHit::OkButton
             | DialogHit::AuthDropdown
-            | DialogHit::BrowseButton => winit::window::CursorIcon::Pointer,
-            DialogHit::Field(_) => winit::window::CursorIcon::Text,
-            _ => winit::window::CursorIcon::Default,
+            | DialogHit::BrowseButton => CursorIcon::Pointer,
+            DialogHit::Field(_) => CursorIcon::Text,
+            _ => CursorIcon::Default,
         }
     }
 
-    fn draw<'a>(
+    // -----------------------------------------------------------------------
+    // Public event-handling API (called from App)
+    // -----------------------------------------------------------------------
+
+    /// Update hover state on mouse move. Returns the cursor icon to set.
+    pub fn handle_mouse_move(&mut self, cx: f32, cy: f32) -> CursorIcon {
+        if self.auth_dropdown.is_open() {
+            let dd_hover = self.auth_dropdown.hit_test(cx, cy);
+            self.auth_dropdown.set_hover(dd_hover);
+        }
+
+        // Outside the dialog (and dropdown closed) → default cursor
+        if !self.auth_dropdown.is_open() && !self.dialog_rect().contains(cx, cy) {
+            self.set_hover(DialogHit::Inside);
+            return CursorIcon::Default;
+        }
+
+        let hit = self.hit_test(cx, cy);
+        let cursor = Self::cursor_for_hit(&hit);
+        self.set_hover(hit);
+        cursor
+    }
+
+    /// Handle a left mouse click.
+    /// Returns `Ok(Some(result))` on submit, `Ok(None)` for handled click,
+    /// `Err(())` to close the dialog (cancel or click-outside).
+    pub fn handle_mouse_click(
+        &mut self,
+        cx: f32,
+        cy: f32,
+        font_system: &mut FontSystem,
+        dropdown_theme: &crate::theme::DropdownTheme,
+    ) -> Result<Option<SshResult>, ()> {
+        // When auth dropdown is open, handle dropdown interaction only
+        if self.auth_dropdown.is_open() {
+            let hit = self.hit_test(cx, cy);
+            self.handle_click(hit, cx, font_system, dropdown_theme);
+            return Ok(None);
+        }
+
+        // Click outside dialog → close
+        if !self.dialog_rect().contains(cx, cy) {
+            return Err(());
+        }
+
+        let hit = self.hit_test(cx, cy);
+
+        if matches!(hit, DialogHit::CancelButton) {
+            return Err(());
+        }
+
+        if matches!(hit, DialogHit::BrowseButton) {
+            self.open_file_picker(font_system);
+            return Ok(None);
+        }
+
+        if let Some(result) =
+            self.handle_click(hit, cx, font_system, dropdown_theme)
+            && !result.host.is_empty()
+        {
+            return Ok(Some(result));
+        }
+
+        Ok(None)
+    }
+
+    /// Handle a keyboard event.
+    /// Returns `Ok(Some(result))` on submit, `Ok(None)` for handled key,
+    /// `Err(())` to close the dialog (Escape).
+    pub fn handle_key_event(
+        &mut self,
+        event: &KeyEvent,
+        font_system: &mut FontSystem,
+        super_pressed: bool,
+        ctrl_pressed: bool,
+        shift_pressed: bool,
+    ) -> Result<Option<SshResult>, ()> {
+        if event.state == ElementState::Pressed {
+            if let Key::Named(NamedKey::Escape) = event.logical_key.as_ref() {
+                if self.auth_dropdown.is_open() {
+                    self.auth_dropdown.close();
+                    return Ok(None);
+                }
+                return Err(());
+            }
+
+            // Clipboard modifier: Cmd on macOS, Ctrl on others
+            let clipboard_mod = if cfg!(target_os = "macos") {
+                super_pressed
+            } else {
+                ctrl_pressed
+            };
+
+            if clipboard_mod {
+                if let Key::Character(c) = event.logical_key.as_ref() {
+                    match c.as_ref() {
+                        "v" => {
+                            if let Ok(mut clip) = arboard::Clipboard::new()
+                                && let Ok(text) = clip.get_text()
+                            {
+                                self.insert_text(&text, font_system);
+                            }
+                            return Ok(None);
+                        }
+                        "c" => {
+                            if let Some(text) =
+                                self.focused_field_widget_mut().selected_text()
+                            {
+                                if let Ok(mut clip) = arboard::Clipboard::new() {
+                                    let _ = clip.set_text(text);
+                                }
+                            }
+                            return Ok(None);
+                        }
+                        "x" => {
+                            if let Some(text) =
+                                self.focused_field_widget_mut().selected_text()
+                            {
+                                if let Ok(mut clip) = arboard::Clipboard::new() {
+                                    let _ = clip.set_text(text);
+                                }
+                                self.focused_field_widget_mut()
+                                    .delete_back(font_system);
+                            }
+                            return Ok(None);
+                        }
+                        "a" => {
+                            self.focused_field_widget_mut().select_all();
+                            return Ok(None);
+                        }
+                        _ => {}
+                    }
+                }
+            }
+        }
+
+        if let Some(result) =
+            self.handle_key(event, font_system, shift_pressed)
+            && !result.host.is_empty()
+        {
+            return Ok(Some(result));
+        }
+        Ok(None)
+    }
+
+    // -----------------------------------------------------------------------
+    // Drawing
+    // -----------------------------------------------------------------------
+
+    /// Draw the semi-transparent dark scrim behind the dialog.
+    pub fn draw_scrim(ctx: &mut DrawContext, surface_w: f32, surface_h: f32) {
+        ctx.rounded_rect(
+            Rect {
+                x: 0.0,
+                y: 0.0,
+                width: surface_w,
+                height: surface_h,
+            },
+            [0.0, 0.0, 0.0, 0.5],
+            0.0,
+        );
+    }
+
+    /// Draw the dialog body (background, widgets, text) into the given context.
+    pub fn draw<'a>(
         &'a self,
         ctx: &mut DrawContext,
         text_areas: &mut Vec<TextArea<'a>>,
@@ -746,16 +950,43 @@ impl SshDialog {
     ) {
         let s = scale;
         let t = &self.dialog_theme;
+        let (ox, oy) = (self.origin_x, self.origin_y);
         let border = t.border_width * s;
         let field_pad = t.field_pad_h * s;
         let dialog_w = t.width * s;
+        let dialog_h = self.compute_dialog_height() * s;
+        let r = t.field_radius * s;
+        let dialog_rect = Rect { x: ox, y: oy, width: dialog_w, height: dialog_h };
+
+        // Shadow
+        let shadow_expand = 20.0 * s;
+        ctx.shadow(
+            Rect {
+                x: ox - shadow_expand,
+                y: oy - shadow_expand,
+                width: dialog_w + 2.0 * shadow_expand,
+                height: dialog_h + 2.0 * shadow_expand,
+            },
+            [0.0, 0.0, 0.0, 0.3],
+            r + shadow_expand,
+            shadow_expand,
+        );
+
+        // Dialog background with border
+        ctx.stroked_rect(
+            &dialog_rect,
+            colors.dropdown_border.to_linear_f32(),
+            colors.background.to_linear_f32(),
+            r,
+            1.0 * s,
+        );
 
         // Title
         self.title.draw(text_areas, s);
         ctx.rounded_rect(
             Rect {
-                x: 0.0,
-                y: t.title_bar_height * s - border,
+                x: ox,
+                y: oy + t.title_bar_height * s - border,
                 width: dialog_w,
                 height: border,
             },
@@ -821,6 +1052,46 @@ impl SshDialog {
         // Footer buttons
         self.cancel_button.draw(ctx, text_areas, s);
         self.ok_button.draw(ctx, text_areas, s);
+    }
+
+    // -----------------------------------------------------------------------
+    // Accessors
+    // -----------------------------------------------------------------------
+
+    /// Access the auth dropdown (for drawing and buffer access).
+    pub fn auth_dropdown(&self) -> &DropdownMenu {
+        &self.auth_dropdown
+    }
+
+    // -----------------------------------------------------------------------
+    // File picker
+    // -----------------------------------------------------------------------
+
+    pub fn open_file_picker(&mut self, font_system: &mut FontSystem) {
+        let mut dialog = rfd::FileDialog::new().set_title("Select Private Key File");
+
+        if let Some(home) = dirs::home_dir() {
+            let ssh_dir = home.join(".ssh");
+            if ssh_dir.exists() {
+                dialog = dialog.set_directory(&ssh_dir);
+            } else {
+                dialog = dialog.set_directory(&home);
+            }
+        }
+
+        if let Some(path) = dialog.pick_file() {
+            let path_str = path.to_string_lossy().to_string();
+            let display = if let Some(home) = dirs::home_dir() {
+                if let Ok(rest) = path.strip_prefix(&home) {
+                    format!("~/{}", rest.display())
+                } else {
+                    path_str
+                }
+            } else {
+                path_str
+            };
+            self.set_key_path(display, font_system);
+        }
     }
 }
 
@@ -894,310 +1165,4 @@ fn draw_folder_icon(
         folder_col,
         1.5 * s,
     );
-}
-
-/// Separate OS window for the SSH session dialog with its own GPU context.
-pub struct SshDialogWindow {
-    window: Arc<Window>,
-    gpu: crate::gpu::GpuSimple,
-    dialog: SshDialog,
-    theme: Theme,
-    cursor_position: (f32, f32),
-    super_pressed: bool,
-    ctrl_pressed: bool,
-    shift_pressed: bool,
-}
-
-impl SshDialogWindow {
-    pub fn open(
-        event_loop: &ActiveEventLoop,
-        theme: &Theme,
-        prefill: Option<&SshPrefill>,
-    ) -> Option<Self> {
-        let theme = theme.clone();
-        let dialog_width = theme.dialog.width;
-        let initial_h = 280.0;
-
-        let attrs = WindowAttributes::default()
-            .with_title("SSH Session")
-            .with_inner_size(winit::dpi::LogicalSize::new(dialog_width, initial_h))
-            .with_resizable(false)
-            .with_visible(false);
-
-        let window = match event_loop.create_window(attrs) {
-            Ok(w) => Arc::new(w),
-            Err(_) => return None,
-        };
-        let actual_scale = window.scale_factor() as f32;
-
-        let mut gpu = crate::gpu::GpuSimple::new(
-            window.clone(),
-            theme.colors.clone(),
-            theme.dialog.max_rounded_rects,
-        )?;
-
-        let dialog = SshDialog::new(actual_scale, &theme, &mut gpu.font_system, prefill);
-
-        let dialog_h = dialog.compute_dialog_height();
-        let _ =
-            window.request_inner_size(winit::dpi::LogicalSize::new(dialog_width, dialog_h));
-
-        let mut s = Self {
-            window,
-            gpu,
-            dialog,
-            theme,
-            cursor_position: (0.0, 0.0),
-            super_pressed: false,
-            ctrl_pressed: false,
-            shift_pressed: false,
-        };
-
-        // Render the first frame before showing the window to avoid a blank flash
-        s.render();
-        s.window.set_visible(true);
-
-        Some(s)
-    }
-
-    pub fn window_id(&self) -> WindowId {
-        self.window.id()
-    }
-
-    pub fn request_redraw(&self) {
-        self.window.request_redraw();
-    }
-
-    fn resize_to_fit(&mut self) {
-        let dialog_h = self.dialog.compute_dialog_height();
-        let dialog_w = self.dialog.dialog_theme.width;
-        let _ = self
-            .window
-            .request_inner_size(winit::dpi::LogicalSize::new(dialog_w, dialog_h));
-    }
-
-    /// Handle a window event. Returns Some(SshResult) on submit, or None.
-    /// Returns Err(()) if the window should be closed (cancel/escape/close button).
-    pub fn handle_event(&mut self, event: WindowEvent) -> Result<Option<SshResult>, ()> {
-        match event {
-            WindowEvent::CloseRequested => Err(()),
-
-            WindowEvent::RedrawRequested => {
-                self.render();
-                Ok(None)
-            }
-
-            WindowEvent::Resized(new_size) => {
-                self.gpu.resize(new_size.width, new_size.height);
-                self.request_redraw();
-                Ok(None)
-            }
-
-            WindowEvent::ScaleFactorChanged { scale_factor, .. } => {
-                self.dialog
-                    .compute_layout(scale_factor as f32, &mut self.gpu.font_system);
-                self.resize_to_fit();
-                self.request_redraw();
-                Ok(None)
-            }
-
-            WindowEvent::CursorMoved { position, .. } => {
-                self.cursor_position = (position.x as f32, position.y as f32);
-                let (cx, cy) = self.cursor_position;
-
-                if self.dialog.auth_dropdown.is_open() {
-                    let dd_hover = self.dialog.auth_dropdown.hit_test(cx, cy);
-                    if self.dialog.auth_dropdown.set_hover(dd_hover) {
-                        self.request_redraw();
-                    }
-                }
-
-                let hit = self.dialog.hit_test(cx, cy);
-                self.window.set_cursor(SshDialog::cursor_for_hit(&hit));
-                self.dialog.set_hover(hit);
-                self.request_redraw();
-                Ok(None)
-            }
-
-            WindowEvent::MouseInput {
-                state: ElementState::Pressed,
-                button: MouseButton::Left,
-                ..
-            } => {
-                let (cx, cy) = self.cursor_position;
-                let hit = self.dialog.hit_test(cx, cy);
-
-                if matches!(hit, DialogHit::CancelButton) {
-                    return Err(());
-                }
-
-                if matches!(hit, DialogHit::BrowseButton) {
-                    self.open_file_picker();
-                    self.request_redraw();
-                    return Ok(None);
-                }
-
-                if let Some(result) =
-                    self.dialog
-                        .handle_click(hit, cx, &mut self.gpu.font_system, &self.theme.dropdown)
-                    && !result.host.is_empty()
-                {
-                    return Ok(Some(result));
-                }
-
-                self.request_redraw();
-                Ok(None)
-            }
-
-            WindowEvent::ModifiersChanged(new_modifiers) => {
-                self.super_pressed = new_modifiers.state().super_key();
-                self.ctrl_pressed = new_modifiers.state().control_key();
-                self.shift_pressed = new_modifiers.state().shift_key();
-                Ok(None)
-            }
-
-            WindowEvent::KeyboardInput { event, .. } => {
-                if event.state == ElementState::Pressed {
-                    if let Key::Named(NamedKey::Escape) = event.logical_key.as_ref() {
-                        if self.dialog.auth_dropdown.is_open() {
-                            self.dialog.auth_dropdown.close();
-                            self.request_redraw();
-                            return Ok(None);
-                        }
-                        return Err(());
-                    }
-
-                    // Clipboard modifier: Cmd on macOS, Ctrl on others
-                    #[cfg(target_os = "macos")]
-                    let clipboard_mod = self.super_pressed;
-                    #[cfg(not(target_os = "macos"))]
-                    let clipboard_mod = self.ctrl_pressed;
-
-                    if clipboard_mod {
-                        if let Key::Character(c) = event.logical_key.as_ref() {
-                            match c.as_ref() {
-                                "v" => {
-                                    if let Ok(mut clip) = arboard::Clipboard::new()
-                                        && let Ok(text) = clip.get_text()
-                                    {
-                                        self.dialog
-                                            .insert_text(&text, &mut self.gpu.font_system);
-                                        self.request_redraw();
-                                    }
-                                    return Ok(None);
-                                }
-                                "c" => {
-                                    if let Some(text) = self.dialog.focused_field_widget_mut().selected_text() {
-                                        if let Ok(mut clip) = arboard::Clipboard::new() {
-                                            let _ = clip.set_text(text);
-                                        }
-                                    }
-                                    return Ok(None);
-                                }
-                                "x" => {
-                                    if let Some(text) = self.dialog.focused_field_widget_mut().selected_text() {
-                                        if let Ok(mut clip) = arboard::Clipboard::new() {
-                                            let _ = clip.set_text(text);
-                                        }
-                                        self.dialog.focused_field_widget_mut().delete_back(&mut self.gpu.font_system);
-                                        self.request_redraw();
-                                    }
-                                    return Ok(None);
-                                }
-                                "a" => {
-                                    self.dialog.focused_field_widget_mut().select_all();
-                                    self.request_redraw();
-                                    return Ok(None);
-                                }
-                                _ => {}
-                            }
-                        }
-                    }
-                }
-                if let Some(result) =
-                    self.dialog
-                        .handle_key(&event, &mut self.gpu.font_system, self.shift_pressed)
-                    && !result.host.is_empty()
-                {
-                    return Ok(Some(result));
-                }
-                self.request_redraw();
-                Ok(None)
-            }
-
-            _ => Ok(None),
-        }
-    }
-
-    fn open_file_picker(&mut self) {
-        let mut dialog = rfd::FileDialog::new().set_title("Select Private Key File");
-
-        if let Some(home) = dirs::home_dir() {
-            let ssh_dir = home.join(".ssh");
-            if ssh_dir.exists() {
-                dialog = dialog.set_directory(&ssh_dir);
-            } else {
-                dialog = dialog.set_directory(&home);
-            }
-        }
-
-        if let Some(path) = dialog.pick_file() {
-            let path_str = path.to_string_lossy().to_string();
-            let display = if let Some(home) = dirs::home_dir() {
-                if let Ok(rest) = path.strip_prefix(&home) {
-                    format!("~/{}", rest.display())
-                } else {
-                    path_str
-                }
-            } else {
-                path_str
-            };
-            self.dialog
-                .set_key_path(display, &mut self.gpu.font_system);
-        }
-    }
-
-    fn render(&mut self) {
-        let scale = self.window.scale_factor() as f32;
-        let colors = &self.gpu.colors.clone();
-        let theme = &self.theme.clone();
-
-        let mut base_ctx = DrawContext::new();
-        let mut base_text: Vec<TextArea> = Vec::new();
-        self.dialog
-            .draw(&mut base_ctx, &mut base_text, scale, colors);
-
-        // Overlay: auth dropdown
-        let mut overlay_ctx = DrawContext::new();
-        let mut overlay_text_specs = Vec::new();
-        self.dialog.auth_dropdown.draw(
-            &mut overlay_ctx,
-            &mut overlay_text_specs,
-            theme,
-            scale,
-        );
-        let mut overlay_text: Vec<TextArea> = Vec::new();
-        crate::gpu::push_text_specs(
-            &mut overlay_text,
-            &overlay_text_specs,
-            self.dialog.auth_dropdown.item_buffers(),
-            scale,
-        );
-
-        match self.gpu.render_simple(
-            self.gpu.colors.background.to_wgpu_color(),
-            &base_ctx.rounded_quads,
-            &overlay_ctx.rounded_quads,
-            base_text,
-            overlay_text,
-        ) {
-            Ok(()) => {}
-            Err(SurfaceError::Lost | SurfaceError::Outdated) => {
-                self.gpu
-                    .surface
-                    .configure(&self.gpu.device, &self.gpu.surface_config);
-            }
-            Err(_) => {}
-        }
-    }
 }
