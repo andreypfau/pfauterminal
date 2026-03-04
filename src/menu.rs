@@ -1,6 +1,6 @@
-/// App version, read from Cargo.toml at compile time.
-pub const APP_VERSION: &str = concat!(env!("CARGO_PKG_VERSION"), " (", env!("GIT_SHORT_HASH"), ")");
-pub const APP_NAME: &str = "pfauterminal";
+pub const APP_VERSION: &str = env!("APP_VERSION");
+pub const APP_BUILD: &str = env!("GIT_SHORT_HASH");
+pub const APP_NAME: &str = "PfauTerminal";
 pub const APP_AUTHOR: &str = "Andrey Pfau";
 pub const APP_YEAR: &str = env!("GIT_COMMIT_YEAR");
 
@@ -31,7 +31,7 @@ mod macos {
     use objc::{msg_send, sel, sel_impl};
     use std::ffi::CString;
 
-    use super::{APP_AUTHOR, APP_NAME, APP_VERSION, APP_YEAR};
+    use super::{APP_AUTHOR, APP_BUILD, APP_NAME, APP_VERSION, APP_YEAR};
 
     /// NSEventModifierFlagCommand | NSEventModifierFlagOption
     const CMD_OPT_MASK: usize = (1 << 20) | (1 << 19);
@@ -69,12 +69,14 @@ mod macos {
         unsafe {
             let keys = [
                 nsstring("ApplicationName"),
+                nsstring("ApplicationVersion"),
                 nsstring("Version"),
                 nsstring("Copyright"),
             ];
             let values = [
                 nsstring(APP_NAME),
                 nsstring(APP_VERSION),
+                nsstring(APP_BUILD),
                 nsstring(&format!("Copyright © {APP_YEAR} {APP_AUTHOR}")),
             ];
 
@@ -85,7 +87,7 @@ mod macos {
                 dict_cls,
                 dictionaryWithObjects: values.as_ptr()
                 forKeys: keys.as_ptr()
-                count: 3usize
+                count: 4usize
             ]
         }
     }
@@ -210,7 +212,7 @@ mod macos {
 
 #[cfg(target_os = "windows")]
 mod windows {
-    use super::{APP_AUTHOR, APP_NAME, APP_VERSION, APP_YEAR};
+    use super::{APP_AUTHOR, APP_BUILD, APP_NAME, APP_VERSION, APP_YEAR};
 
     pub fn show_about_dialog() {
         use windows::core::HSTRING;
@@ -218,7 +220,7 @@ mod windows {
 
         let title = HSTRING::from(format!("About {APP_NAME}"));
         let message = HSTRING::from(format!(
-            "{APP_NAME}\nVersion {APP_VERSION}\n\nCopyright © 2025 {APP_AUTHOR}"
+            "{APP_NAME}\nVersion {APP_VERSION} ({APP_BUILD})\n\nCopyright © {APP_YEAR} {APP_AUTHOR}"
         ));
 
         unsafe {
