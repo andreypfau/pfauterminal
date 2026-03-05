@@ -867,7 +867,7 @@ impl ApplicationHandler<TerminalEvent> for App {
                         let interval = if self.tabs.get(self.active_tab)
                             .is_some_and(|p| p.cursor_animating() || p.is_smooth_scrolling())
                         {
-                            Duration::from_millis(16) // ~60fps for active animations
+                            BLINK_INTERVAL // ~30fps for active animations
                         } else {
                             // During blink pause (500ms after input), sleep until
                             // pause expires instead of rendering 30fps of identical
@@ -893,12 +893,13 @@ impl ApplicationHandler<TerminalEvent> for App {
                 if let Some(panel) = self.tabs.get(self.active_tab) {
                     if panel.cursor_visible() {
                         if panel.cursor_animating() || panel.is_smooth_scrolling() {
-                            // Active animation — full redraw at high frame rate
+                            // Active animation — full redraw at ~60fps
                             #[cfg(feature = "debug-fps")]
                             redraw_debug::ANIM_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                             self.redraw();
                             self.last_redraw = Instant::now();
-                            self.request_redraw();
+                            let wait_until = self.last_redraw + BLINK_INTERVAL;
+                            event_loop.set_control_flow(ControlFlow::WaitUntil(wait_until));
                         } else {
                             // Check blink pause: during 500ms after input, cursor
                             // is solid — no need to render at all.
@@ -1346,12 +1347,11 @@ impl ApplicationHandler<TerminalEvent> for App {
             if let Some((cursor_vis, animating, scrolling, last_input)) = panel_state {
                 if cursor_vis {
                     if animating || scrolling {
-                        // Active animation — full redraw needed
+                        // Active animation — full redraw at ~60fps
                         self.redraw();
                         self.last_redraw = Instant::now();
-                        if let Some(w) = &self.window {
-                            w.request_redraw();
-                        }
+                        let wait_until = self.last_redraw + BLINK_INTERVAL;
+                        event_loop.set_control_flow(ControlFlow::WaitUntil(wait_until));
                     } else {
                         // Check blink pause
                         let input_age = last_input.elapsed();
