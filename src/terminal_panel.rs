@@ -34,6 +34,8 @@ use crate::theme::PanelTheme;
 #[derive(Debug)]
 pub enum TerminalEvent {
     Wakeup,
+    /// Periodic tick from the render timer thread (30 fps).
+    Tick,
     Title(PanelId, String),
     Exit(PanelId),
 }

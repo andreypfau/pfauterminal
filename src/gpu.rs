@@ -88,7 +88,7 @@ fn init_gpu(window: Arc<winit::window::Window>, texture_usages: TextureUsages) -
         width: size.width.max(1),
         height: size.height.max(1),
         present_mode: PresentMode::AutoVsync,
-        desired_maximum_frame_latency: 1,
+        desired_maximum_frame_latency: 2,
         alpha_mode: caps.alpha_modes[0],
         view_formats,
     };
@@ -974,15 +974,17 @@ impl GpuContext {
                 self.cursor_pipeline.draw(&mut pass);
             }
 
-            // Overlay layer (dropdown menus — on top of cursor)
-            let overlay_count = total_rounded_rects - scene_rr_count;
-            if overlay_count > 0 {
-                self.rounded_rect
-                    .draw_range(&mut pass, scene_rr_count, overlay_count);
+            if content_changed {
+                // Overlay layer (dropdown menus — on top of cursor)
+                let overlay_count = total_rounded_rects - scene_rr_count;
+                if overlay_count > 0 {
+                    self.rounded_rect
+                        .draw_range(&mut pass, scene_rr_count, overlay_count);
+                }
+                self.overlay_text_renderer
+                    .render(&self.atlas, &self.viewport, &mut pass)
+                    .ok();
             }
-            self.overlay_text_renderer
-                .render(&self.atlas, &self.viewport, &mut pass)
-                .ok();
         }
 
         #[cfg(feature = "debug-fps")]

@@ -35,7 +35,9 @@ fn disable_app_nap() {
         let info: *mut Object = msg_send![cls, processInfo];
         let Some(reason) = ns_string("Terminal I/O") else { return };
         let _: *mut Object =
-            msg_send![info, beginActivityWithOptions:0x00FFFFFFu64 reason:reason];
+            // NSActivityUserInitiated (0x00FFFFFF) minus NSActivityIdleSystemSleepDisabled (1<<20):
+            // Prevents App Nap throttling without preventing system sleep.
+            msg_send![info, beginActivityWithOptions:0x00EFFFFEu64 reason:reason];
     }
 
     unsafe fn ns_string(s: &str) -> Option<*mut Object> {
