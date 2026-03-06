@@ -29,14 +29,42 @@ use crate::tab_bar::{TabBar, TabBarElement};
 use crate::terminal_panel::{EventProxy, PanelId, TermSize, TerminalEvent, TerminalPanel};
 use crate::theme::Theme;
 
-/// Frame interval for animations (cursor move, smooth scroll) — 30fps.
-const FRAME_INTERVAL: Duration = Duration::from_millis(33);
+/// Frame interval for animations (cursor move, smooth scroll) — 60fps.
+const FRAME_INTERVAL: Duration = Duration::from_millis(16);
 /// Frame interval when window is not focused — 2fps.
 const UNFOCUSED_FRAME_INTERVAL: Duration = Duration::from_millis(500);
 /// Cursor stays solid for this long after typing before blink resumes.
 const BLINK_PAUSE: Duration = Duration::from_millis(500);
-/// Interval between blink phase toggles (on→off or off→on).
-const BLINK_TOGGLE: Duration = Duration::from_millis(500);
+
+/// Smooth blink timing (must match GPU shader constants).
+const BLINK_FADE_DUR: f32 = 0.3;  // fade phase duration in seconds
+const BLINK_HOLD_DUR: f32 = 0.3;  // hold phase duration in seconds
+const BLINK_CYCLE: f32 = (BLINK_FADE_DUR + BLINK_HOLD_DUR) * 2.0; // 1.2s
+
+/// Returns (is_fading, seconds_until_next_phase_change) for the cursor blink.
+/// `input_age` is seconds since last input.
+/// During fade phases `is_fading=true` — render at 30fps.
+/// During hold phases `is_fading=false` — sleep until next phase.
+fn blink_phase(input_age: f32) -> (bool, f32) {
+    if input_age < BLINK_PAUSE.as_secs_f32() {
+        return (false, BLINK_PAUSE.as_secs_f32() - input_age);
+    }
+    let elapsed = input_age - BLINK_PAUSE.as_secs_f32();
+    let phase = elapsed % BLINK_CYCLE;
+    if phase < BLINK_FADE_DUR {
+        // Fade-out
+        (true, BLINK_FADE_DUR - phase)
+    } else if phase < BLINK_FADE_DUR + BLINK_HOLD_DUR {
+        // Hold invisible
+        (false, BLINK_FADE_DUR + BLINK_HOLD_DUR - phase)
+    } else if phase < BLINK_FADE_DUR * 2.0 + BLINK_HOLD_DUR {
+        // Fade-in
+        (true, BLINK_FADE_DUR * 2.0 + BLINK_HOLD_DUR - phase)
+    } else {
+        // Hold visible
+        (false, BLINK_CYCLE - phase)
+    }
+}
 
 pub struct App {
     window: Option<Arc<Window>>,
@@ -1331,22 +1359,33 @@ impl ApplicationHandler<TerminalEvent> for App {
                 return;
             }
 
-            if panel.cursor_visible() {
-                let input_age = panel.last_input_time().elapsed();
-                if input_age < BLINK_PAUSE {
-                    // Cursor is solid during blink pause — sleep until pause ends.
-                    let wake = panel.last_input_time() + BLINK_PAUSE;
-                    event_loop.set_control_flow(ControlFlow::WaitUntil(wake));
-                    return;
-                }
-                // Step blink: render every 500ms for phase transitions.
-                let next = self.last_redraw + BLINK_TOGGLE;
-                if now >= next {
-                    if let Some(w) = &self.window {
-                        w.request_redraw();
+            if panel.cursor_visible() && self.focused {
+                let input_age = panel.last_input_time().elapsed().as_secs_f32();
+                let (is_fading, secs_to_next) = blink_phase(input_age);
+
+                if is_fading {
+                    // Fade phase — render at 30fps for smooth animation.
+                    let next = self.last_redraw + frame_interval;
+                    if now >= next {
+                        if let Some(w) = &self.window {
+                            w.request_redraw();
+                        }
+                    } else {
+                        event_loop.set_control_flow(ControlFlow::WaitUntil(next));
                     }
                 } else {
-                    event_loop.set_control_flow(ControlFlow::WaitUntil(next));
+                    // Hold phase (or blink pause) — sleep until next phase change.
+                    let wake = now + Duration::from_secs_f32(secs_to_next);
+                    // Render one frame at the start of each hold phase so the
+                    // cursor reflects the correct visibility state.
+                    let since_redraw = now.duration_since(self.last_redraw).as_secs_f32();
+                    if since_redraw > FRAME_INTERVAL.as_secs_f32() {
+                        if let Some(w) = &self.window {
+                            w.request_redraw();
+                        }
+                    } else {
+                        event_loop.set_control_flow(ControlFlow::WaitUntil(wake));
+                    }
                 }
                 return;
             }

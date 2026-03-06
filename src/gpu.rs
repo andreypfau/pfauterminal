@@ -1286,15 +1286,32 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
     let d = rounded_rect_sdf(pixel - center, half_size, radius);
     let shape_alpha = 1.0 - smoothstep(-0.5, 0.5, d);
 
-    // Step blink: on/off every 500ms after 500ms pause
+    // Smooth blink inspired by IntelliJ:
+    // After blink_pause, cycle through: fade-out → hold → fade-in → hold
+    // Uses easeInOutCubic for fade-out, easeOutQuint for fade-in.
     let blink_pause = 0.5;
-    let blink_half = 0.5;
+    let fade_dur = 0.3;   // fade phase duration
+    let hold_dur = 0.3;   // hold phase duration
+    let cycle = (fade_dur + hold_dur) * 2.0; // full cycle = 1.2s
     var blink_alpha = 1.0;
     if t_input > blink_pause {
         let elapsed = t_input - blink_pause;
-        let phase = elapsed - floor(elapsed / (blink_half * 2.0)) * (blink_half * 2.0);
-        if phase >= blink_half {
+        let phase = elapsed - floor(elapsed / cycle) * cycle;
+        if phase < fade_dur {
+            // Fade out: easeInOutCubic
+            let t = phase / fade_dur;
+            let ease = select(4.0 * t * t * t, 1.0 - pow(-2.0 * t + 2.0, 3.0) / 2.0, t >= 0.5);
+            blink_alpha = 1.0 - ease;
+        } else if phase < fade_dur + hold_dur {
+            // Hold invisible
             blink_alpha = 0.0;
+        } else if phase < fade_dur * 2.0 + hold_dur {
+            // Fade in: easeOutQuint
+            let t = (phase - fade_dur - hold_dur) / fade_dur;
+            blink_alpha = 1.0 - pow(1.0 - t, 5.0);
+        } else {
+            // Hold visible
+            blink_alpha = 1.0;
         }
     }
 
