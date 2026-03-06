@@ -1,4 +1,3 @@
-use std::sync::atomic::{AtomicBool, Ordering as AtomicOrdering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -14,7 +13,7 @@ mod redraw_debug {
 use alacritty_terminal::selection::SelectionType;
 use winit::application::ApplicationHandler;
 use winit::event::{ElementState, MouseButton, WindowEvent};
-use winit::event_loop::{ActiveEventLoop, EventLoopProxy};
+use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoopProxy};
 use winit::keyboard::{KeyCode, PhysicalKey};
 use winit::window::{CursorIcon, Window, WindowAttributes, WindowId};
 
@@ -30,9 +29,14 @@ use crate::tab_bar::{TabBar, TabBarElement};
 use crate::terminal_panel::{EventProxy, PanelId, TermSize, TerminalEvent, TerminalPanel};
 use crate::theme::Theme;
 
-/// Fixed blink interval — 30 fps.
-/// DO NOT change this value. 30 fps is required for smooth cursor animation.
-const BLINK_INTERVAL: Duration = Duration::from_millis(33);
+/// Frame interval for animations (cursor move, smooth scroll) — 30fps.
+const FRAME_INTERVAL: Duration = Duration::from_millis(33);
+/// Frame interval when window is not focused — 2fps.
+const UNFOCUSED_FRAME_INTERVAL: Duration = Duration::from_millis(500);
+/// Cursor stays solid for this long after typing before blink resumes.
+const BLINK_PAUSE: Duration = Duration::from_millis(500);
+/// Interval between blink phase toggles (on→off or off→on).
+const BLINK_TOGGLE: Duration = Duration::from_millis(500);
 
 pub struct App {
     window: Option<Arc<Window>>,
@@ -63,8 +67,8 @@ pub struct App {
     dirty: bool,
     /// Window is fully occluded (hidden behind other windows) — skip all rendering.
     occluded: bool,
-    /// Shared flag: tells the timer thread whether to send Tick events.
-    tick_active: Arc<AtomicBool>,
+    /// Window has keyboard focus.
+    focused: bool,
 
     // Cached scene data from the last full (dirty) redraw.
     // Reused during blink-only frames to avoid rebuilding the scene.
@@ -109,7 +113,7 @@ impl App {
             last_redraw: Instant::now(),
             dirty: false,
             occluded: false,
-            tick_active: Arc::new(AtomicBool::new(false)),
+            focused: true,
             cached_scene: DrawContext::new(),
             cached_overlay: DrawContext::new(),
             cached_scene_panel_text: Vec::new(),
@@ -735,26 +739,6 @@ impl ApplicationHandler<TerminalEvent> for App {
         // Render the first frame before showing the window to avoid a blank flash
         self.redraw();
         window.set_visible(true);
-
-        // Start the render timer thread — sends Tick events at 30 fps.
-        // Uses a dedicated thread + sleep instead of winit WaitUntil to avoid
-        // event loop dispatch overhead on macOS (~5% CPU savings).
-        self.tick_active.store(true, AtomicOrdering::Release);
-        let tick_active = self.tick_active.clone();
-        let tick_proxy = self.event_proxy_raw.clone();
-        std::thread::Builder::new()
-            .name("render-timer".into())
-            .spawn(move || {
-                loop {
-                    std::thread::sleep(BLINK_INTERVAL);
-                    if tick_active.load(AtomicOrdering::Acquire) {
-                        if tick_proxy.send_event(TerminalEvent::Tick).is_err() {
-                            break; // event loop closed
-                        }
-                    }
-                }
-            })
-            .ok();
     }
 
     fn user_event(&mut self, event_loop: &ActiveEventLoop, event: TerminalEvent) {
@@ -772,47 +756,6 @@ impl ApplicationHandler<TerminalEvent> for App {
                     let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_millis() as u64;
                     let last = LAST.load(Ordering::Relaxed);
                     if now - last >= 3000 { LAST.store(now, Ordering::Relaxed); eprintln!("[wakeup] total: {c}"); }
-                }
-            }
-            TerminalEvent::Tick => {
-                if self.occluded || self.window.is_none() {
-                    return;
-                }
-
-                let elapsed = Instant::now().duration_since(self.last_redraw);
-                let has_overlay = self.dropdown.is_open() || self.ssh_dialog.is_some();
-
-                if self.dirty || has_overlay {
-                    self.dirty = false;
-                    self.redraw();
-                    self.last_redraw = Instant::now();
-                    return;
-                }
-
-                if let Some(panel) = self.tabs.get(self.active_tab) {
-                    if panel.cursor_visible() {
-                        if panel.cursor_animating() || panel.is_smooth_scrolling() {
-                            #[cfg(feature = "debug-fps")]
-                            redraw_debug::ANIM_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                            self.redraw();
-                            self.last_redraw = Instant::now();
-                        } else {
-                            // During blink pause (500ms after input), cursor is
-                            // solid — skip rendering identical frames.
-                            let input_age = panel.last_input_time().elapsed();
-                            if input_age < Duration::from_millis(500) {
-                                #[cfg(feature = "debug-fps")]
-                                redraw_debug::PAUSE_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                                return;
-                            }
-                            if elapsed >= BLINK_INTERVAL {
-                                #[cfg(feature = "debug-fps")]
-                                redraw_debug::BLINK_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                                self.redraw_blink_only();
-                                self.last_redraw = Instant::now();
-                            }
-                        }
-                    }
                 }
             }
             TerminalEvent::Title(panel_id, title) => {
@@ -893,9 +836,13 @@ impl ApplicationHandler<TerminalEvent> for App {
                 self.sync_tab_state();
             }
 
+            WindowEvent::Focused(is_focused) => {
+                self.focused = is_focused;
+                self.request_redraw();
+            }
+
             WindowEvent::Occluded(is_occluded) => {
                 self.occluded = is_occluded;
-                self.tick_active.store(!is_occluded, AtomicOrdering::Release);
                 if !is_occluded {
                     self.request_redraw();
                 }
@@ -925,12 +872,31 @@ impl ApplicationHandler<TerminalEvent> for App {
                 if self.occluded {
                     return;
                 }
-                // RedrawRequested is only triggered by Wakeup (new content).
-                // Tick-driven rendering happens directly in user_event.
-                if self.dirty {
+
+                let now = Instant::now();
+                let has_overlay = self.dropdown.is_open() || self.ssh_dialog.is_some();
+
+                if self.dirty || has_overlay {
+                    #[cfg(feature = "debug-fps")]
+                    redraw_debug::DIRTY_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                     self.dirty = false;
                     self.redraw();
-                    self.last_redraw = Instant::now();
+                    self.last_redraw = now;
+                    return;
+                }
+
+                if let Some(panel) = self.tabs.get(self.active_tab) {
+                    if panel.cursor_animating() || panel.is_smooth_scrolling() {
+                        #[cfg(feature = "debug-fps")]
+                        redraw_debug::ANIM_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        self.redraw();
+                        self.last_redraw = now;
+                    } else if panel.cursor_visible() {
+                        #[cfg(feature = "debug-fps")]
+                        redraw_debug::BLINK_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        self.redraw_blink_only();
+                        self.last_redraw = now;
+                    }
                 }
             }
 
@@ -1319,9 +1285,75 @@ impl ApplicationHandler<TerminalEvent> for App {
         }
     }
 
-    fn new_events(&mut self, _event_loop: &ActiveEventLoop, _cause: winit::event::StartCause) {
-        // Rendering is now driven by Tick events from the timer thread.
-        // No WaitUntil / ResumeTimeReached handling needed.
+    fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
+        if self.occluded || self.window.is_none() || self.tabs.is_empty() {
+            event_loop.set_control_flow(ControlFlow::Wait);
+            return;
+        }
+
+        let now = Instant::now();
+
+        // Content changed — render immediately.
+        if self.dirty {
+            if let Some(w) = &self.window {
+                w.request_redraw();
+            }
+            return;
+        }
+
+        // When unfocused, use low frame rate (2fps) for any animations.
+        let frame_interval = if self.focused { FRAME_INTERVAL } else { UNFOCUSED_FRAME_INTERVAL };
+
+        // SSH dialog has its own text cursor blink.
+        if self.ssh_dialog.is_some() {
+            let next = self.last_redraw + frame_interval;
+            if now >= next {
+                if let Some(w) = &self.window {
+                    w.request_redraw();
+                }
+            } else {
+                event_loop.set_control_flow(ControlFlow::WaitUntil(next));
+            }
+            return;
+        }
+
+        if let Some(panel) = self.tabs.get(self.active_tab) {
+            // Animations (cursor glide, smooth scroll).
+            if panel.cursor_animating() || panel.is_smooth_scrolling() {
+                let next = self.last_redraw + frame_interval;
+                if now >= next {
+                    if let Some(w) = &self.window {
+                        w.request_redraw();
+                    }
+                } else {
+                    event_loop.set_control_flow(ControlFlow::WaitUntil(next));
+                }
+                return;
+            }
+
+            if panel.cursor_visible() {
+                let input_age = panel.last_input_time().elapsed();
+                if input_age < BLINK_PAUSE {
+                    // Cursor is solid during blink pause — sleep until pause ends.
+                    let wake = panel.last_input_time() + BLINK_PAUSE;
+                    event_loop.set_control_flow(ControlFlow::WaitUntil(wake));
+                    return;
+                }
+                // Step blink: render every 500ms for phase transitions.
+                let next = self.last_redraw + BLINK_TOGGLE;
+                if now >= next {
+                    if let Some(w) = &self.window {
+                        w.request_redraw();
+                    }
+                } else {
+                    event_loop.set_control_flow(ControlFlow::WaitUntil(next));
+                }
+                return;
+            }
+        }
+
+        // Nothing to render — sleep until an event arrives.
+        event_loop.set_control_flow(ControlFlow::Wait);
     }
 }
 

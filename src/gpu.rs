@@ -1286,13 +1286,16 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
     let d = rounded_rect_sdf(pixel - center, half_size, radius);
     let shape_alpha = 1.0 - smoothstep(-0.5, 0.5, d);
 
-    // Smooth cosine blink
+    // Step blink: on/off every 500ms after 500ms pause
     let blink_pause = 0.5;
-    let blink_period = 1.0;
+    let blink_half = 0.5;
     var blink_alpha = 1.0;
     if t_input > blink_pause {
-        let phase = (t_input - blink_pause) / blink_period * 6.283185;
-        blink_alpha = cos(phase) * 0.5 + 0.5;
+        let elapsed = t_input - blink_pause;
+        let phase = elapsed - floor(elapsed / (blink_half * 2.0)) * (blink_half * 2.0);
+        if phase >= blink_half {
+            blink_alpha = 0.0;
+        }
     }
 
     let final_alpha = u.color.a * shape_alpha * blink_alpha;
