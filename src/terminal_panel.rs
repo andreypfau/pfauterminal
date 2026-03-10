@@ -351,6 +351,12 @@ impl TerminalPanel {
                 let mut env = std::collections::HashMap::new();
                 env.insert("TERM".into(), "xterm-256color".into());
                 env.insert("COLORTERM".into(), "truecolor".into());
+                // Ensure LANG is set to a UTF-8 locale so that shells (zsh ZLE, bash readline)
+                // correctly handle multi-byte characters. macOS GUI apps launched via Finder/Launchpad
+                // may not inherit LANG from the user's shell profile.
+                if std::env::var("LANG").map_or(true, |v| v.is_empty()) {
+                    env.insert("LANG".into(), "en_US.UTF-8".into());
+                }
                 env
             },
             #[cfg(target_os = "windows")]
