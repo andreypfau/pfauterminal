@@ -646,18 +646,6 @@ impl TerminalPanel {
             }
         }
 
-        // Handle Alt+key → ESC prefix + key
-        if alt {
-            if let Some(t) = &event.text
-                && !t.is_empty()
-            {
-                let mut data = vec![0x1B];
-                data.extend_from_slice(t.as_bytes());
-                self.backend.send_input(Cow::Owned(data));
-                return true;
-            }
-        }
-
         let bytes = match event.logical_key.as_ref() {
             Key::Named(NamedKey::Enter) => Some(b"\r".to_vec()),
             Key::Named(NamedKey::Backspace) => Some(b"\x7f".to_vec()),
@@ -710,8 +698,22 @@ impl TerminalPanel {
 
         if let Some(b) = bytes {
             self.backend.send_input(Cow::Owned(b));
-            true
-        } else if let Some(t) = &event.text
+            return true;
+        }
+
+        // Handle Alt+key → ESC prefix + key (after named keys to avoid intercepting Alt+Arrows)
+        if alt {
+            if let Some(t) = &event.text
+                && !t.is_empty()
+            {
+                let mut data = vec![0x1B];
+                data.extend_from_slice(t.as_bytes());
+                self.backend.send_input(Cow::Owned(data));
+                return true;
+            }
+        }
+
+        if let Some(t) = &event.text
             && !t.is_empty()
         {
             self.backend
