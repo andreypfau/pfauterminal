@@ -22,6 +22,9 @@ enum FocusedField {
     Password,
     KeyPath,
     Passphrase,
+    JumpHost,
+    JumpPort,
+    JumpUsername,
 }
 
 #[derive(Debug)]
@@ -73,6 +76,10 @@ pub struct SshResult {
     pub password: String,
     pub key_path: String,
     pub passphrase: String,
+    /// Jump host fields (ProxyJump / ssh -J).
+    pub jump_host: String,
+    pub jump_port: String,
+    pub jump_username: String,
 }
 
 /// Pre-fill data for the SSH dialog from a saved session.
@@ -82,6 +89,9 @@ pub struct SshPrefill {
     pub username: String,
     pub auth_method: AuthMethod,
     pub key_path: Option<String>,
+    pub jump_host: Option<String>,
+    pub jump_port: Option<u16>,
+    pub jump_username: Option<String>,
 }
 
 impl SshResult {
@@ -99,11 +109,21 @@ impl SshResult {
             },
             AuthMethod::Agent => crate::ssh::SshAuth::Agent,
         };
+        let jump = if self.jump_host.is_empty() {
+            None
+        } else {
+            Some(crate::ssh::JumpHostConfig {
+                host: self.jump_host.clone(),
+                port: self.jump_port.parse::<u16>().unwrap_or(22),
+                username: self.jump_username.clone(),
+            })
+        };
         crate::ssh::SshConfig {
             host: self.host.clone(),
             port,
             username: self.username.clone(),
             auth,
+            jump,
         }
     }
 }
@@ -168,6 +188,9 @@ pub struct SshDialog {
     keypath_label: Label,
     passphrase_label: Label,
     auth_value_label: Label,
+    jump_host_label: Label,
+    jump_port_label: Label,
+    jump_username_label: Label,
 
     // Text fields
     host_field: TextField,
@@ -176,6 +199,9 @@ pub struct SshDialog {
     password_field: TextField,
     keypath_field: TextField,
     passphrase_field: TextField,
+    jump_host_field: TextField,
+    jump_port_field: TextField,
+    jump_username_field: TextField,
 
     // Buttons
     cancel_button: Button,
@@ -232,6 +258,9 @@ impl SshDialog {
             metrics,
             font_system,
         );
+        let jump_host_label = Label::new("Jump host:", attrs, metrics, font_system);
+        let jump_port_label = Label::new("Port:", attrs, metrics, font_system);
+        let jump_username_label = Label::new("Username:", attrs, metrics, font_system);
 
         let fr = t.field_radius;
         let fp = t.field_pad_h;
@@ -243,6 +272,10 @@ impl SshDialog {
         let keypath_field =
             TextField::new(DEFAULT_KEY_PATH, false, metrics, char_width, fr, fp, font_system);
         let passphrase_field = TextField::new("", true, metrics, char_width, fr, fp, font_system);
+        let jump_host_field = TextField::new("", false, metrics, char_width, fr, fp, font_system);
+        let mut jump_port_field = TextField::new("", false, metrics, char_width, fr, fp, font_system);
+        jump_port_field.set_value("22", font_system);
+        let jump_username_field = TextField::new("", false, metrics, char_width, fr, fp, font_system);
 
         let cancel_button = Button::new(
             "Cancel",
@@ -285,12 +318,18 @@ impl SshDialog {
             keypath_label,
             passphrase_label,
             auth_value_label,
+            jump_host_label,
+            jump_port_label,
+            jump_username_label,
             host_field,
             port_field,
             username_field,
             password_field,
             keypath_field,
             passphrase_field,
+            jump_host_field,
+            jump_port_field,
+            jump_username_field,
             cancel_button,
             ok_button,
             auth_method: initial_auth,
@@ -318,6 +357,15 @@ impl SshDialog {
                 .set_value(&prefill.username, font_system);
             if let Some(key_path) = &prefill.key_path {
                 dialog.keypath_field.set_value(key_path, font_system);
+            }
+            if let Some(jh) = &prefill.jump_host {
+                dialog.jump_host_field.set_value(jh, font_system);
+            }
+            if let Some(jp) = prefill.jump_port {
+                dialog.jump_port_field.set_value(&jp.to_string(), font_system);
+            }
+            if let Some(ju) = &prefill.jump_username {
+                dialog.jump_username_field.set_value(ju, font_system);
             }
             match initial_auth {
                 AuthMethod::Password => dialog.set_focus(FocusedField::Password),
@@ -373,6 +421,9 @@ impl SshDialog {
             &mut self.password_field,
             &mut self.keypath_field,
             &mut self.passphrase_field,
+            &mut self.jump_host_field,
+            &mut self.jump_port_field,
+            &mut self.jump_username_field,
         ] {
             field.set_char_width(char_width);
         }
@@ -467,6 +518,26 @@ impl SshDialog {
         let passphrase_y = row_y + row_step;
         fl.row(&mut self.passphrase_label, &mut self.passphrase_field, passphrase_y, cred_input_w);
 
+        // Jump host rows (always after credential rows — row_y + 2*row_step for the two credential rows)
+        let jump_base_y = row_y + 2.0 * row_step;
+
+        // Jump Host + Jump Port row (same layout as Host + Port)
+        let jump_host_input_w = form_w - label_w - field_gap - port_section_w;
+        fl.row(&mut self.jump_host_label, &mut self.jump_host_field, jump_base_y, jump_host_input_w);
+        let jump_port_label_x = form_x + label_w + field_gap + jump_host_input_w + field_gap;
+        fl.label(&mut self.jump_port_label, jump_port_label_x, jump_base_y);
+        self.jump_port_field.set_rect(Rect {
+            x: form_x + form_w - t.port_field_width * s,
+            y: jump_base_y,
+            width: t.port_field_width * s,
+            height: field_h,
+        });
+
+        // Jump Username row
+        let jump_username_y = jump_base_y + row_step;
+        let jump_username_input_w = form_w - label_w - field_gap - port_section_w;
+        fl.row(&mut self.jump_username_label, &mut self.jump_username_field, jump_username_y, jump_username_input_w);
+
         // Footer buttons
         let button_h = t.cancel_pad_v * 2.0 + line_h;
         let footer_y = oy + (self.compute_dialog_height() - t.footer_pad_v - button_h) * s;
@@ -490,7 +561,12 @@ impl SshDialog {
     fn compute_dialog_height(&self) -> f32 {
         let t = &self.dialog_theme;
         let line_h = t.font_size * LINE_HEIGHT_MULT;
+        // 5 original rows + 2 jump host rows = 7 rows
         let form_content_h = t.field_height
+            + t.form_row_gap
+            + t.field_height
+            + t.form_row_gap
+            + t.field_height
             + t.form_row_gap
             + t.field_height
             + t.form_row_gap
@@ -513,6 +589,9 @@ impl SshDialog {
             FocusedField::Password => &mut self.password_field,
             FocusedField::KeyPath => &mut self.keypath_field,
             FocusedField::Passphrase => &mut self.passphrase_field,
+            FocusedField::JumpHost => &mut self.jump_host_field,
+            FocusedField::JumpPort => &mut self.jump_port_field,
+            FocusedField::JumpUsername => &mut self.jump_username_field,
         }
     }
 
@@ -574,6 +653,15 @@ impl SshDialog {
                 }
             }
             AuthMethod::Agent => {}
+        }
+        if self.jump_host_field.contains(x, y) {
+            return DialogHit::Field(FocusedField::JumpHost);
+        }
+        if self.jump_port_field.contains(x, y) {
+            return DialogHit::Field(FocusedField::JumpPort);
+        }
+        if self.jump_username_field.contains(x, y) {
+            return DialogHit::Field(FocusedField::JumpUsername);
         }
         if self.cancel_button.contains(x, y) {
             return DialogHit::CancelButton;
@@ -696,10 +784,13 @@ impl SshDialog {
                 let next = match (self.focused_field, self.auth_method) {
                     (FocusedField::Username, AuthMethod::Password) => FocusedField::Password,
                     (FocusedField::Username, AuthMethod::Key) => FocusedField::KeyPath,
-                    (FocusedField::Username, AuthMethod::Agent) => FocusedField::Host,
-                    (FocusedField::Password, _) => FocusedField::Host,
+                    (FocusedField::Username, AuthMethod::Agent) => FocusedField::JumpHost,
+                    (FocusedField::Password, _) => FocusedField::JumpHost,
                     (FocusedField::KeyPath, _) => FocusedField::Passphrase,
-                    (FocusedField::Passphrase, _) => FocusedField::Host,
+                    (FocusedField::Passphrase, _) => FocusedField::JumpHost,
+                    (FocusedField::JumpHost, _) => FocusedField::JumpPort,
+                    (FocusedField::JumpPort, _) => FocusedField::JumpUsername,
+                    (FocusedField::JumpUsername, _) => FocusedField::Host,
                     (FocusedField::Host, _) => FocusedField::Port,
                     (FocusedField::Port, _) => FocusedField::Username,
                 };
@@ -763,6 +854,9 @@ impl SshDialog {
                 self.keypath_field.value().to_string()
             },
             passphrase: self.passphrase_field.value().to_string(),
+            jump_host: self.jump_host_field.value().to_string(),
+            jump_port: self.jump_port_field.value().to_string(),
+            jump_username: self.jump_username_field.value().to_string(),
         }
     }
 
@@ -1048,6 +1142,14 @@ impl SshDialog {
             }
             AuthMethod::Agent => {}
         }
+
+        // Jump host rows
+        self.jump_host_label.draw(text_areas, s);
+        self.jump_host_field.draw(ctx, text_areas, s, colors);
+        self.jump_port_label.draw(text_areas, s);
+        self.jump_port_field.draw(ctx, text_areas, s, colors);
+        self.jump_username_label.draw(text_areas, s);
+        self.jump_username_field.draw(ctx, text_areas, s, colors);
 
         // Footer buttons
         self.cancel_button.draw(ctx, text_areas, s);

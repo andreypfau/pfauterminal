@@ -16,6 +16,16 @@ pub struct SshConfig {
     pub port: u16,
     pub username: String,
     pub auth: SshAuth,
+    /// Optional jump host (ProxyJump / ssh -J) configuration.
+    pub jump: Option<JumpHostConfig>,
+}
+
+/// Jump host (bastion / ProxyJump) configuration.
+#[derive(Debug, Clone)]
+pub struct JumpHostConfig {
+    pub host: String,
+    pub port: u16,
+    pub username: String,
 }
 
 /// SSH authentication method.
@@ -122,50 +132,45 @@ async fn ssh_session(
     write_to_term(&term, &format!("\x1b[?25lConnecting to {addr}...\r\n"));
     event_proxy.send_event(Event::Wakeup);
 
-    let mut session = russh::client::connect(russh_config, &addr, SshHandler)
-        .await?;
+    // If a jump host is configured, connect through it
+    let _jump_session;
+    let mut session = if let Some(ref jump) = config.jump {
+        let jump_addr = format!("{}:{}", jump.host, jump.port);
+        write_to_term(&term, &format!("Connecting via jump host {jump_addr}...\r\n"));
+        event_proxy.send_event(Event::Wakeup);
+
+        let jump_config = Arc::new(russh::client::Config::default());
+        let mut jump_sess = russh::client::connect(jump_config, &jump_addr, SshHandler).await?;
+
+        // Authenticate to jump host using the same auth method as the target
+        write_to_term(&term, &format!("Authenticating to jump host as {}...\r\n", jump.username));
+        event_proxy.send_event(Event::Wakeup);
+        authenticate(&mut jump_sess, &jump.username, &config.auth).await
+            .map_err(|e| format!("Jump host authentication failed: {e}"))?;
+
+        // Open a direct-tcpip tunnel to the target host
+        write_to_term(&term, &format!("Opening tunnel to {addr}...\r\n"));
+        event_proxy.send_event(Event::Wakeup);
+        let tunnel = jump_sess
+            .channel_open_direct_tcpip(&config.host, config.port as u32, "127.0.0.1", 0)
+            .await?;
+        let stream = tunnel.into_stream();
+
+        // Connect to target host through the tunnel
+        let target_config = Arc::new(russh::client::Config::default());
+        let sess = russh::client::connect_stream(target_config, stream, SshHandler).await?;
+        _jump_session = Some(jump_sess);
+        sess
+    } else {
+        _jump_session = None;
+        russh::client::connect(russh_config, &addr, SshHandler).await?
+    };
 
     // Authenticate
     write_to_term(&term, &format!("Authenticating as {}...\r\n", config.username));
     event_proxy.send_event(Event::Wakeup);
 
-    let auth_result = match &config.auth {
-        SshAuth::Password(password) => {
-            match session.authenticate_password(&config.username, password).await {
-                Ok(true) => Ok(()),
-                Ok(false) => Err("server rejected password".to_string()),
-                Err(e) => Err(format!("password auth error: {e}")),
-            }
-        }
-        SshAuth::Key { path, passphrase } => {
-            let key_path = shellexpand_path(path);
-            match russh_keys::load_secret_key(&key_path, passphrase.as_deref()) {
-                Ok(key_pair) => {
-                    match session.authenticate_publickey(&config.username, Arc::new(key_pair)).await {
-                        Ok(true) => Ok(()),
-                        Ok(false) => Err(format!("server rejected key {}", key_path.display())),
-                        Err(e) => Err(format!("public key auth error: {e}")),
-                    }
-                }
-                Err(e) => Err(format!("failed to load key {}: {e}", key_path.display())),
-            }
-        }
-        SshAuth::Agent => {
-            let mut reasons = Vec::new();
-            let ok = try_agent_auth(&mut session, &config.username, &mut reasons).await
-                || try_default_keys(&mut session, &config.username, &mut reasons).await;
-            if ok {
-                Ok(())
-            } else {
-                if reasons.is_empty() {
-                    reasons.push("no keys available and agent not reachable".to_string());
-                }
-                Err(reasons.join("\r\n  "))
-            }
-        }
-    };
-
-    if let Err(reason) = auth_result {
+    if let Err(reason) = authenticate(&mut session, &config.username, &config.auth).await {
         write_to_term(&term, &format!(
             "\x1b[?25l\r\n\x1b[31mAuthentication failed for {}@{}\r\n  {reason}\x1b[0m\r\n",
             config.username, config.host
@@ -229,6 +234,48 @@ async fn ssh_session(
     let _ = channel.close().await;
     event_proxy.send_event(Event::Exit);
     Ok(())
+}
+
+async fn authenticate(
+    session: &mut russh::client::Handle<SshHandler>,
+    username: &str,
+    auth: &SshAuth,
+) -> Result<(), String> {
+    match auth {
+        SshAuth::Password(password) => {
+            match session.authenticate_password(username, password).await {
+                Ok(true) => Ok(()),
+                Ok(false) => Err("server rejected password".to_string()),
+                Err(e) => Err(format!("password auth error: {e}")),
+            }
+        }
+        SshAuth::Key { path, passphrase } => {
+            let key_path = shellexpand_path(path);
+            match russh_keys::load_secret_key(&key_path, passphrase.as_deref()) {
+                Ok(key_pair) => {
+                    match session.authenticate_publickey(username, Arc::new(key_pair)).await {
+                        Ok(true) => Ok(()),
+                        Ok(false) => Err(format!("server rejected key {}", key_path.display())),
+                        Err(e) => Err(format!("public key auth error: {e}")),
+                    }
+                }
+                Err(e) => Err(format!("failed to load key {}: {e}", key_path.display())),
+            }
+        }
+        SshAuth::Agent => {
+            let mut reasons = Vec::new();
+            let ok = try_agent_auth(session, username, &mut reasons).await
+                || try_default_keys(session, username, &mut reasons).await;
+            if ok {
+                Ok(())
+            } else {
+                if reasons.is_empty() {
+                    reasons.push("no keys available and agent not reachable".to_string());
+                }
+                Err(reasons.join("\r\n  "))
+            }
+        }
+    }
 }
 
 async fn try_agent_auth(
