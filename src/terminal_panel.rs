@@ -627,24 +627,39 @@ impl TerminalPanel {
         let cursor_prefix: &[u8] = if app_cursor { b"\x1bO" } else { b"\x1b[" };
 
         // Handle Ctrl+key → control characters (0x00–0x1F)
+        // Use physical key for letters to work correctly with non-Latin layouts.
         if ctrl {
-            let ctrl_byte = match event.logical_key.as_ref() {
-                Key::Character(c) if c.len() == 1 => {
-                    let Some(ch) = c.chars().next() else { return false };
-                    match ch {
-                        'a'..='z' => Some(ch as u8 - b'a' + 1),
-                        'A'..='Z' => Some(ch as u8 - b'A' + 1),
-                        '@' | ' ' => Some(0x00),
-                        '[' => Some(0x1B),
-                        '\\' => Some(0x1C),
-                        ']' => Some(0x1D),
-                        '^' | '~' => Some(0x1E),
-                        '_' | '/' => Some(0x1F),
-                        _ => None,
-                    }
-                }
+            let ctrl_byte = match event.physical_key {
+                PhysicalKey::Code(code) => match code {
+                    KeyCode::KeyA => Some(1),  KeyCode::KeyB => Some(2),
+                    KeyCode::KeyC => Some(3),  KeyCode::KeyD => Some(4),
+                    KeyCode::KeyE => Some(5),  KeyCode::KeyF => Some(6),
+                    KeyCode::KeyG => Some(7),  KeyCode::KeyH => Some(8),
+                    KeyCode::KeyI => Some(9),  KeyCode::KeyJ => Some(10),
+                    KeyCode::KeyK => Some(11), KeyCode::KeyL => Some(12),
+                    KeyCode::KeyM => Some(13), KeyCode::KeyN => Some(14),
+                    KeyCode::KeyO => Some(15), KeyCode::KeyP => Some(16),
+                    KeyCode::KeyQ => Some(17), KeyCode::KeyR => Some(18),
+                    KeyCode::KeyS => Some(19), KeyCode::KeyT => Some(20),
+                    KeyCode::KeyU => Some(21), KeyCode::KeyV => Some(22),
+                    KeyCode::KeyW => Some(23), KeyCode::KeyX => Some(24),
+                    KeyCode::KeyY => Some(25), KeyCode::KeyZ => Some(26),
+                    _ => None,
+                },
                 _ => None,
-            };
+            }
+            .or_else(|| match event.logical_key.as_ref() {
+                Key::Character(c) => match c.chars().next() {
+                    Some('@' | ' ') => Some(0x00),
+                    Some('[') => Some(0x1B),
+                    Some('\\') => Some(0x1C),
+                    Some(']') => Some(0x1D),
+                    Some('^' | '~') => Some(0x1E),
+                    Some('_' | '/') => Some(0x1F),
+                    _ => None,
+                },
+                _ => None,
+            });
             if let Some(b) = ctrl_byte {
                 let data = if alt { vec![0x1B, b] } else { vec![b] };
                 self.backend.send_input(Cow::Owned(data));
