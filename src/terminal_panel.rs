@@ -587,7 +587,7 @@ impl TerminalPanel {
         })
     }
 
-    pub fn handle_key(&mut self, event: &KeyEvent, ctrl: bool, alt: bool) -> bool {
+    pub fn handle_key(&mut self, event: &KeyEvent, ctrl: bool, alt: bool, shift: bool) -> bool {
         if event.state != ElementState::Pressed {
             return false;
         }
@@ -668,7 +668,15 @@ impl TerminalPanel {
         }
 
         let bytes = match event.logical_key.as_ref() {
-            Key::Named(NamedKey::Enter) => Some(b"\r".to_vec()),
+            Key::Named(NamedKey::Enter) => {
+                // CSI u modifier encoding: 1 + Shift(1) + Alt(2)
+                let modifier = 1 + if shift { 1 } else { 0 } + if alt { 2 } else { 0 };
+                if modifier > 1 {
+                    Some(format!("\x1b[13;{modifier}u").into_bytes())
+                } else {
+                    Some(b"\r".to_vec())
+                }
+            }
             Key::Named(NamedKey::Backspace) => Some(b"\x7f".to_vec()),
             Key::Named(NamedKey::Tab) => Some(b"\t".to_vec()),
             Key::Named(NamedKey::Escape) => Some(b"\x1b".to_vec()),

@@ -1287,7 +1287,7 @@ impl ApplicationHandler<TerminalEvent> for App {
                 }
 
                 if let Some(panel) = self.tabs.get_mut(self.active_tab) {
-                    panel.handle_key(&event, self.ctrl_pressed, self.alt_pressed);
+                    panel.handle_key(&event, self.ctrl_pressed, self.alt_pressed, self.shift_pressed);
                     self.dirty = true;
                     self.request_redraw();
                 }
