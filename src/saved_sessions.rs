@@ -12,12 +12,6 @@ pub struct SavedSession {
     #[serde(default)]
     pub password: Option<String>,
     pub last_used: u64,
-    #[serde(default)]
-    pub jump_host: Option<String>,
-    #[serde(default)]
-    pub jump_port: Option<u16>,
-    #[serde(default)]
-    pub jump_username: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -29,22 +23,10 @@ pub enum SavedAuthType {
 
 impl SavedSession {
     pub fn display_label(&self) -> String {
-        let target = if self.port == 22 {
+        if self.port == 22 {
             format!("{}@{}", self.username, self.host)
         } else {
             format!("{}@{}:{}", self.username, self.host, self.port)
-        };
-        if let Some(jh) = &self.jump_host {
-            let jump_user = self.jump_username.as_deref().unwrap_or(&self.username);
-            let jump_port = self.jump_port.unwrap_or(22);
-            let jump = if jump_port == 22 {
-                format!("{jump_user}@{jh}")
-            } else {
-                format!("{jump_user}@{jh}:{jump_port}")
-            };
-            format!("{target} via {jump}")
-        } else {
-            target
         }
     }
 
@@ -96,9 +78,6 @@ impl SavedSessions {
             existing.auth_type = session.auth_type;
             existing.key_path = session.key_path;
             existing.password = session.password;
-            existing.jump_host = session.jump_host;
-            existing.jump_port = session.jump_port;
-            existing.jump_username = session.jump_username;
         } else {
             self.sessions.push(session);
         }

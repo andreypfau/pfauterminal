@@ -669,21 +669,6 @@ impl App {
                 _ => None,
             },
             last_used: now_unix(),
-            jump_host: if result.jump_host.is_empty() {
-                None
-            } else {
-                Some(result.jump_host.clone())
-            },
-            jump_port: if result.jump_host.is_empty() {
-                None
-            } else {
-                Some(result.jump_port.parse().unwrap_or(22))
-            },
-            jump_username: if result.jump_host.is_empty() || result.jump_username.is_empty() {
-                None
-            } else {
-                Some(result.jump_username.clone())
-            },
         };
         self.saved_sessions.upsert(saved);
     }
@@ -698,14 +683,6 @@ impl App {
             }
             MenuAction::ConnectSavedSession(key) => {
                 if let Some(session) = self.saved_sessions.find_by_key(key) {
-                    let jump = session.jump_host.as_ref().map(|jh| {
-                        crate::ssh::JumpHostConfig {
-                            host: jh.clone(),
-                            port: session.jump_port.unwrap_or(22),
-                            username: session.jump_username.clone()
-                                .unwrap_or_else(|| session.username.clone()),
-                        }
-                    });
                     let config = crate::ssh::SshConfig {
                         host: session.host.clone(),
                         port: session.port,
@@ -725,7 +702,6 @@ impl App {
                             },
                             SavedAuthType::Agent => crate::ssh::SshAuth::Agent,
                         },
-                        jump,
                     };
                     self.saved_sessions.touch_by_key(key);
                     self.connect_ssh(config);
@@ -1311,7 +1287,7 @@ impl ApplicationHandler<TerminalEvent> for App {
                 }
 
                 if let Some(panel) = self.tabs.get_mut(self.active_tab) {
-                    panel.handle_key(&event, self.ctrl_pressed, self.alt_pressed);
+                    panel.handle_key(&event, self.ctrl_pressed, self.alt_pressed, self.shift_pressed);
                     self.dirty = true;
                     self.request_redraw();
                 }
