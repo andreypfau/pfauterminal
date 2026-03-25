@@ -697,13 +697,19 @@ impl TerminalPanel {
                     Key::Named(NamedKey::End) => b'F',
                     _ => unreachable!(),
                 };
-                // xterm modifier encoding: 1 + (Alt=2) + (Ctrl=4)
-                let modifier = 1 + if alt { 2 } else { 0 } + if ctrl { 4 } else { 0 };
-                if modifier > 1 {
-                    // Modified keys always use CSI format, even in app cursor mode
-                    Some(format!("\x1b[1;{modifier}{}", suffix as char).into_bytes())
+                // Option+Left/Right → ESC b / ESC f (readline word navigation)
+                if alt && !ctrl && (suffix == b'D' || suffix == b'C') {
+                    let ch = if suffix == b'D' { b'b' } else { b'f' };
+                    Some(vec![0x1b, ch])
                 } else {
-                    Some([cursor_prefix, &[suffix]].concat())
+                    // xterm modifier encoding: 1 + (Alt=2) + (Ctrl=4)
+                    let modifier = 1 + if alt { 2 } else { 0 } + if ctrl { 4 } else { 0 };
+                    if modifier > 1 {
+                        // Modified keys always use CSI format, even in app cursor mode
+                        Some(format!("\x1b[1;{modifier}{}", suffix as char).into_bytes())
+                    } else {
+                        Some([cursor_prefix, &[suffix]].concat())
+                    }
                 }
             }
             Key::Named(NamedKey::PageUp) => Some(b"\x1b[5~".to_vec()),
