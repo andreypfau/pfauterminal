@@ -7,6 +7,8 @@ use alacritty_terminal::vte::ansi;
 use alacritty_terminal::Term;
 use tokio::sync::mpsc;
 
+use russh::Pty;
+
 use crate::terminal_panel::{EventProxy, TermSize};
 
 /// SSH connection configuration.
@@ -176,8 +178,43 @@ async fn ssh_session(
 
     // Open channel, request PTY and shell
     let mut channel = session.channel_open_session().await?;
+    let terminal_modes = [
+        // Special characters
+        (Pty::VINTR, 3),      // Ctrl+C
+        (Pty::VQUIT, 28),     // Ctrl+\
+        (Pty::VERASE, 127),   // Backspace
+        (Pty::VKILL, 21),     // Ctrl+U
+        (Pty::VEOF, 4),       // Ctrl+D
+        (Pty::VSUSP, 26),     // Ctrl+Z
+        (Pty::VREPRINT, 18),  // Ctrl+R
+        (Pty::VWERASE, 23),   // Ctrl+W
+        (Pty::VLNEXT, 22),    // Ctrl+V
+        (Pty::VSTART, 17),    // Ctrl+Q (XON)
+        (Pty::VSTOP, 19),     // Ctrl+S (XOFF)
+        // Input modes
+        (Pty::ICRNL, 1),      // Map CR to NL on input
+        (Pty::IXON, 1),       // Enable XON/XOFF flow control
+        (Pty::IXANY, 0),
+        (Pty::IMAXBEL, 1),
+        (Pty::IUTF8, 1),      // UTF-8 input
+        // Output modes
+        (Pty::OPOST, 1),      // Post-process output
+        (Pty::ONLCR, 1),      // Map NL to CR-NL on output
+        // Local modes
+        (Pty::ISIG, 1),       // Enable signals
+        (Pty::ICANON, 1),     // Canonical mode (shell switches to raw)
+        (Pty::ECHO, 1),       // Echo input
+        (Pty::ECHOE, 1),      // Echo erase as BS-SP-BS
+        (Pty::ECHOK, 1),      // Echo kill
+        (Pty::ECHOCTL, 1),    // Echo control chars as ^X
+        (Pty::ECHOKE, 1),     // Kill echoed by erasing each char
+        (Pty::IEXTEN, 1),     // Enable extended input processing
+        // Speeds
+        (Pty::TTY_OP_ISPEED, 38400),
+        (Pty::TTY_OP_OSPEED, 38400),
+    ];
     channel
-        .request_pty(false, "xterm-256color", cols as u32, rows as u32, 0, 0, &[])
+        .request_pty(false, "xterm-256color", cols as u32, rows as u32, 0, 0, &terminal_modes)
         .await?;
     channel.request_shell(false).await?;
 
