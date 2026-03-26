@@ -1205,6 +1205,28 @@ impl ApplicationHandler<TerminalEvent> for App {
                     return;
                 }
 
+                // Ctrl+Tab / Ctrl+Shift+Tab — switch tabs
+                if event.state == ElementState::Pressed
+                    && self.ctrl_pressed
+                    && matches!(event.physical_key, PhysicalKey::Code(KeyCode::Tab))
+                    && self.tabs.len() > 1
+                {
+                    if self.shift_pressed {
+                        // Previous tab
+                        self.active_tab = if self.active_tab == 0 {
+                            self.tabs.len() - 1
+                        } else {
+                            self.active_tab - 1
+                        };
+                    } else {
+                        // Next tab
+                        self.active_tab = (self.active_tab + 1) % self.tabs.len();
+                    }
+                    self.sync_tab_state();
+                    self.request_redraw();
+                    return;
+                }
+
                 // macOS: Cmd+key shortcuts (copy, paste, screenshot).
                 // Block ALL Cmd+key from reaching the terminal.
                 #[cfg(target_os = "macos")]
