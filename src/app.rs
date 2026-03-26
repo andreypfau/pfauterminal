@@ -541,6 +541,22 @@ impl App {
         self.sync_tab_state();
     }
 
+    /// Show a native confirmation dialog before closing.
+    /// Returns true if the user confirmed.
+    fn confirm_close(&self, message: &str) -> bool {
+        use rfd::MessageDialog;
+        use rfd::MessageDialogResult;
+        use rfd::MessageLevel;
+        use rfd::MessageButtons;
+        let result = MessageDialog::new()
+            .set_level(MessageLevel::Warning)
+            .set_title("pfauterminal")
+            .set_description(message)
+            .set_buttons(MessageButtons::OkCancel)
+            .show();
+        result == MessageDialogResult::Ok
+    }
+
     fn open_new_tab_dropdown(&mut self) {
         // Populate cache from background thread if not yet available
         if self.cached_shells.is_none() {
@@ -830,7 +846,11 @@ impl ApplicationHandler<TerminalEvent> for App {
 
         match event {
             WindowEvent::CloseRequested => {
-                event_loop.exit();
+                if self.tabs.is_empty()
+                    || self.confirm_close("Close all tabs and exit?")
+                {
+                    event_loop.exit();
+                }
             }
 
             WindowEvent::Resized(new_size) => {
@@ -1225,7 +1245,9 @@ impl ApplicationHandler<TerminalEvent> for App {
                         }
                         PhysicalKey::Code(KeyCode::KeyW) => {
                             if self.tabs.len() <= 1 {
-                                event_loop.exit();
+                                if self.confirm_close("Close the last tab and exit?") {
+                                    event_loop.exit();
+                                }
                             } else {
                                 self.close_tab(self.active_tab);
                             }
@@ -1276,7 +1298,9 @@ impl ApplicationHandler<TerminalEvent> for App {
                         }
                         PhysicalKey::Code(KeyCode::KeyW) => {
                             if self.tabs.len() <= 1 {
-                                event_loop.exit();
+                                if self.confirm_close("Close the last tab and exit?") {
+                                    event_loop.exit();
+                                }
                             } else {
                                 self.close_tab(self.active_tab);
                             }
