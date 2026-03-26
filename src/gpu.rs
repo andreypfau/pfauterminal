@@ -974,13 +974,15 @@ impl GpuContext {
                 self.cursor_pipeline.draw(&mut pass);
             }
 
+            // Overlay layer (scrollbar, dropdown menus — on top of cursor).
+            // Always draw overlay, even on blink-only frames, so the scrollbar
+            // doesn't vanish when only the cursor is being redrawn.
+            let overlay_count = total_rounded_rects - scene_rr_count;
+            if overlay_count > 0 {
+                self.rounded_rect
+                    .draw_range(&mut pass, scene_rr_count, overlay_count);
+            }
             if content_changed {
-                // Overlay layer (dropdown menus — on top of cursor)
-                let overlay_count = total_rounded_rects - scene_rr_count;
-                if overlay_count > 0 {
-                    self.rounded_rect
-                        .draw_range(&mut pass, scene_rr_count, overlay_count);
-                }
                 self.overlay_text_renderer
                     .render(&self.atlas, &self.viewport, &mut pass)
                     .ok();

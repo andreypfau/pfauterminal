@@ -88,6 +88,86 @@ impl Dimensions for TermSize {
     }
 }
 
+// --- Scrollbar ---
+
+const SCROLLBAR_WIDTH: f32 = 6.0;
+const SCROLLBAR_HIT_WIDTH: f32 = 20.0;
+const SCROLLBAR_MIN_HEIGHT: f32 = 20.0;
+
+#[derive(Debug, Clone, Copy)]
+struct ScrollbarMetrics {
+    /// Y position of the thumb (physical pixels, rounded).
+    thumb_y: f32,
+    /// Height of the thumb (physical pixels, rounded).
+    thumb_height: f32,
+    /// Top of the scrollable content area.
+    track_y: f32,
+    /// Height of the scrollable content area.
+    track_height: f32,
+    /// X position of the hit zone (wider than visual).
+    hit_x: f32,
+    /// Maximum scroll offset (total_lines - screen_lines).
+    max_offset: usize,
+}
+
+#[derive(Debug)]
+struct ScrollbarState {
+    dragging: bool,
+    /// Y offset within the thumb where the drag started.
+    drag_anchor: f32,
+    /// Cached grid dimensions from the last draw snapshot.
+    total_lines: usize,
+    screen_lines: usize,
+    display_offset: usize,
+}
+
+impl Default for ScrollbarState {
+    fn default() -> Self {
+        Self {
+            dragging: false,
+            drag_anchor: 0.0,
+            total_lines: 0,
+            screen_lines: 0,
+            display_offset: 0,
+        }
+    }
+}
+
+impl ScrollbarState {
+    /// Compute scrollbar geometry from cached state + viewport.
+    /// Returns `None` if content fits on screen (no scrollbar needed).
+    fn metrics(&self, vp: &PanelViewport) -> Option<ScrollbarMetrics> {
+        if self.total_lines <= self.screen_lines {
+            return None;
+        }
+        let scale = vp.scale_factor;
+        let content_y = vp.content_rect.y;
+        let content_height = vp.content_rect.height;
+        let content_x = vp.content_rect.x;
+
+        let max_offset = self.total_lines.saturating_sub(self.screen_lines);
+        let thumb_height = ((self.screen_lines as f32 / self.total_lines as f32) * content_height)
+            .max(SCROLLBAR_MIN_HEIGHT * scale)
+            .round();
+        let track = content_height - thumb_height;
+        let ratio = if max_offset > 0 {
+            (max_offset - self.display_offset) as f32 / max_offset as f32
+        } else {
+            0.0
+        };
+        let thumb_y = (content_y + ratio * track).round();
+
+        Some(ScrollbarMetrics {
+            thumb_y,
+            thumb_height,
+            track_y: content_y,
+            track_height: content_height,
+            hit_x: content_x + vp.content_rect.width - SCROLLBAR_HIT_WIDTH * scale,
+            max_offset,
+        })
+    }
+}
+
 // --- Event proxy (bridges alacritty events to winit) ---
 
 /// I/O backend: either a local PTY or an SSH channel.
@@ -320,10 +400,8 @@ pub struct TerminalPanel {
     cursor_visible: bool,
     /// Reusable buffer for grid cell snapshots — avoids per-frame Vec allocation.
     snapshot_cells: Vec<SnapshotCell>,
-    /// Whether the user is currently dragging the scrollbar thumb.
-    scrollbar_dragging: bool,
-    /// The Y offset from the top of the thumb where the drag started (physical pixels).
-    scrollbar_drag_anchor: f32,
+    /// Scrollbar state.
+    scrollbar: ScrollbarState,
 }
 
 impl TerminalPanel {
@@ -398,8 +476,7 @@ impl TerminalPanel {
             cursor_anim: CursorAnimation::new(),
             cursor_visible: false,
             snapshot_cells: Vec::new(),
-            scrollbar_dragging: false,
-            scrollbar_drag_anchor: 0.0,
+            scrollbar: ScrollbarState::default(),
         })
     }
 
@@ -427,8 +504,7 @@ impl TerminalPanel {
             cursor_anim: CursorAnimation::new(),
             cursor_visible: false,
             snapshot_cells: Vec::new(),
-            scrollbar_dragging: false,
-            scrollbar_drag_anchor: 0.0,
+            scrollbar: ScrollbarState::default(),
         }
     }
 
@@ -467,8 +543,7 @@ impl TerminalPanel {
             cursor_anim: CursorAnimation::new(),
             cursor_visible: false,
             snapshot_cells: Vec::new(),
-            scrollbar_dragging: false,
-            scrollbar_drag_anchor: 0.0,
+            scrollbar: ScrollbarState::default(),
         }
     }
 
@@ -777,6 +852,7 @@ impl TerminalPanel {
                 self.scroll_accumulator += pos.y;
                 let mut term = self.term.lock();
                 let lines = (self.scroll_accumulator / cell_height) as i32;
+                let mut changed = false;
                 if lines != 0 {
                     let offset_before = term.grid().display_offset();
                     term.scroll_display(alacritty_terminal::grid::Scroll::Delta(lines));
@@ -787,22 +863,29 @@ impl TerminalPanel {
                         // Scroll was clamped (hit top/bottom of scrollback)
                         self.scroll_accumulator = 0.0;
                     }
+                    if actual != 0 {
+                        changed = true;
+                    }
                 }
-                // Clamp at scroll boundaries
+                // Clamp at scroll boundaries — kill any residual sub-pixel
+                // offset so the scrollbar and content don't jitter at edges.
                 let offset = term.grid().display_offset();
-                if offset == 0 && self.scroll_accumulator < 0.0 {
-                    self.scroll_accumulator = 0.0;
-                }
                 let max_offset = term.grid().total_lines().saturating_sub(term.grid().screen_lines());
-                if offset >= max_offset && self.scroll_accumulator > 0.0 {
+                if (offset == 0 && self.scroll_accumulator < 0.0)
+                    || (offset >= max_offset && self.scroll_accumulator > 0.0)
+                {
                     self.scroll_accumulator = 0.0;
                 }
                 drop(term);
+                let old_pixel_offset = self.scroll_pixel_offset;
                 self.scroll_pixel_offset = self.scroll_accumulator as f32;
                 if self.scroll_pixel_offset.abs() <= 0.5 {
                     self.scroll_pixel_offset = 0.0;
                 }
-                true
+                if self.scroll_pixel_offset != old_pixel_offset {
+                    changed = true;
+                }
+                changed
             }
         }
     }
@@ -851,124 +934,75 @@ impl TerminalPanel {
         })
     }
 
-    /// Returns the scrollbar hit-zone rect (wider than visual for easier grabbing).
-    /// Returns `None` if there is no scrollbar (content fits on screen).
-    fn scrollbar_hit_rect(&self) -> Option<(Rect, f32, f32, usize)> {
+    /// Compute current scrollbar metrics using live term data (for hit-testing).
+    fn scrollbar_metrics_live(&self) -> Option<ScrollbarMetrics> {
         let vp = self.viewport.as_ref()?;
         let term = self.term.lock();
-        let total_lines = term.grid().total_lines();
-        let screen_lines = term.grid().screen_lines();
-        if total_lines <= screen_lines {
-            return None;
-        }
-        let scale = vp.scale_factor;
-        let content_height = vp.content_rect.height;
-        let content_y = vp.content_rect.y;
-        let content_x = vp.content_rect.x;
-        let hit_width = 20.0 * scale; // wider than visual for easier grabbing
-        let min_scrollbar_height = 20.0 * scale;
-        let scrollbar_height = ((screen_lines as f32 / total_lines as f32) * content_height)
-            .max(min_scrollbar_height);
-        let max_offset = total_lines.saturating_sub(screen_lines);
-        let display_offset = term.grid().display_offset();
-        let scrollbar_y = if max_offset > 0 {
-            content_y
-                + ((max_offset - display_offset) as f32 / max_offset as f32)
-                    * (content_height - scrollbar_height)
-        } else {
-            content_y
+        let sb = ScrollbarState {
+            dragging: false,
+            drag_anchor: 0.0,
+            total_lines: term.grid().total_lines(),
+            screen_lines: term.grid().screen_lines(),
+            display_offset: term.grid().display_offset(),
         };
-        let hit_rect = Rect {
-            x: content_x + vp.content_rect.width - hit_width,
-            y: scrollbar_y,
-            width: hit_width,
-            height: scrollbar_height,
-        };
-        Some((hit_rect, content_y, content_height, max_offset))
+        drop(term);
+        sb.metrics(vp)
     }
 
-    /// Test if a click position hits the scrollbar. If so, begin dragging.
-    /// Returns `true` if the scrollbar was grabbed.
+    /// Test if a click hits the scrollbar. If so, begin dragging.
     pub fn try_start_scrollbar_drag(&mut self, px: f32, py: f32) -> bool {
-        let Some((hit_rect, content_y, content_height, max_offset)) = self.scrollbar_hit_rect()
-        else {
+        let Some(m) = self.scrollbar_metrics_live() else {
             return false;
         };
-        if px >= hit_rect.x
-            && px < hit_rect.x + hit_rect.width
-            && py >= hit_rect.y
-            && py < hit_rect.y + hit_rect.height
+        let scale = self.viewport.as_ref().unwrap().scale_factor;
+        let hit_width = SCROLLBAR_HIT_WIDTH * scale;
+
+        // Check if click is in the scrollbar track column
+        if px < m.hit_x || px >= m.hit_x + hit_width
+            || py < m.track_y || py >= m.track_y + m.track_height
         {
-            // Clicked on the thumb — anchor relative to thumb top
-            self.scrollbar_dragging = true;
-            self.scrollbar_drag_anchor = py - hit_rect.y;
-            return true;
+            return false;
         }
-        // Clicked in the scrollbar track but not on the thumb — jump there
-        let vp = self.viewport.as_ref().unwrap();
-        let hit_width = 20.0 * vp.scale_factor;
-        let track_x = vp.content_rect.x + vp.content_rect.width - hit_width;
-        if max_offset > 0
-            && px >= track_x
-            && px < track_x + hit_width
-            && py >= content_y
-            && py < content_y + content_height
-        {
-            self.scrollbar_dragging = true;
-            self.scrollbar_drag_anchor = hit_rect.height / 2.0;
-            self.move_scrollbar_to(py - hit_rect.height / 2.0, content_y, content_height, hit_rect.height, max_offset);
-            return true;
+
+        if py >= m.thumb_y && py < m.thumb_y + m.thumb_height {
+            // Clicked on the thumb
+            self.scrollbar.dragging = true;
+            self.scrollbar.drag_anchor = py - m.thumb_y;
+        } else {
+            // Clicked in the track — jump thumb center to click position
+            self.scrollbar.dragging = true;
+            self.scrollbar.drag_anchor = m.thumb_height / 2.0;
+            self.apply_scrollbar_position(py - m.thumb_height / 2.0, &m);
         }
-        false
+        true
     }
 
     /// Update scroll position while dragging the scrollbar thumb.
     pub fn update_scrollbar_drag(&mut self, py: f32) {
-        if !self.scrollbar_dragging {
+        if !self.scrollbar.dragging {
             return;
         }
-        let Some(vp) = self.viewport.as_ref() else {
+        let Some(m) = self.scrollbar_metrics_live() else {
             return;
         };
-        let content_y = vp.content_rect.y;
-        let content_height = vp.content_rect.height;
-        let scale = vp.scale_factor;
-        let term = self.term.lock();
-        let total_lines = term.grid().total_lines();
-        let screen_lines = term.grid().screen_lines();
-        let max_offset = total_lines.saturating_sub(screen_lines);
-        if max_offset == 0 {
-            return;
-        }
-        let min_scrollbar_height = 20.0 * scale;
-        let scrollbar_height = ((screen_lines as f32 / total_lines as f32) * content_height)
-            .max(min_scrollbar_height);
-        drop(term);
-
-        let thumb_top = py - self.scrollbar_drag_anchor;
-        self.move_scrollbar_to(thumb_top, content_y, content_height, scrollbar_height, max_offset);
+        let thumb_top = py - self.scrollbar.drag_anchor;
+        self.apply_scrollbar_position(thumb_top, &m);
     }
 
-    fn move_scrollbar_to(
-        &mut self,
-        thumb_top: f32,
-        content_y: f32,
-        content_height: f32,
-        scrollbar_height: f32,
-        max_offset: usize,
-    ) {
-        let track = content_height - scrollbar_height;
-        if track <= 0.0 {
+    /// Convert a thumb Y position to a scroll offset and apply it.
+    fn apply_scrollbar_position(&mut self, thumb_top: f32, m: &ScrollbarMetrics) {
+        let track = m.track_height - m.thumb_height;
+        if track <= 0.0 || m.max_offset == 0 {
             return;
         }
-        let ratio = ((thumb_top - content_y) / track).clamp(0.0, 1.0);
-        // ratio 0 = top of scrollback (max display_offset), ratio 1 = bottom (display_offset 0)
-        let target_offset = ((1.0 - ratio) * max_offset as f32).round() as usize;
-        let target_offset = target_offset.min(max_offset);
+        let ratio = ((thumb_top - m.track_y) / track).clamp(0.0, 1.0);
+        // ratio 0 = top of history, ratio 1 = bottom (live)
+        let target = ((1.0 - ratio) * m.max_offset as f32).round() as usize;
+        let target = target.min(m.max_offset);
 
         let mut term = self.term.lock();
         let current = term.grid().display_offset();
-        let delta = target_offset as i32 - current as i32;
+        let delta = target as i32 - current as i32;
         if delta != 0 {
             term.scroll_display(alacritty_terminal::grid::Scroll::Delta(delta));
         }
@@ -977,24 +1011,25 @@ impl TerminalPanel {
         self.scroll_accumulator = 0.0;
     }
 
-    /// Stop dragging the scrollbar.
     pub fn stop_scrollbar_drag(&mut self) {
-        self.scrollbar_dragging = false;
+        self.scrollbar.dragging = false;
     }
 
-    /// Returns true if the scrollbar is currently being dragged.
     pub fn is_scrollbar_dragging(&self) -> bool {
-        self.scrollbar_dragging
+        self.scrollbar.dragging
     }
 
     /// Returns true if the pixel position is over the scrollbar hit zone.
     pub fn is_in_scrollbar_area(&self, px: f32, py: f32) -> bool {
-        self.scrollbar_hit_rect().is_some_and(|(hit_rect, content_y, content_height, _)| {
-            px >= hit_rect.x
-                && px < hit_rect.x + hit_rect.width
-                && py >= content_y
-                && py < content_y + content_height
-        })
+        let Some(vp) = self.viewport.as_ref() else {
+            return false;
+        };
+        let Some(m) = self.scrollbar_metrics_live() else {
+            return false;
+        };
+        let hit_width = SCROLLBAR_HIT_WIDTH * vp.scale_factor;
+        px >= m.hit_x && px < m.hit_x + hit_width
+            && py >= m.track_y && py < m.track_y + m.track_height
     }
 
     pub fn start_selection(&mut self, ty: SelectionType, point: Point, side: Side) {
@@ -1132,6 +1167,11 @@ impl TerminalPanel {
             } else {
                 None
             };
+
+            // Cache scrollbar state so draw_scrollbar() doesn't need a separate lock.
+            self.scrollbar.total_lines = term.grid().total_lines();
+            self.scrollbar.screen_lines = term.grid().screen_lines();
+            self.scrollbar.display_offset = display_offset;
 
             (cursor_point, cursor_shape, selection_range, display_offset, extra_row_cells)
         }; // lock released here
@@ -1383,38 +1423,18 @@ impl TerminalPanel {
             Some(vp) => vp,
             None => return,
         };
-        let scale = vp.scale_factor;
-        let content_x = vp.content_rect.x;
-        let content_y = vp.content_rect.y;
-
-        let term = self.term.lock();
-        let total_lines = term.grid().total_lines();
-        let screen_lines = term.grid().screen_lines();
-        if total_lines <= screen_lines {
+        let Some(m) = self.scrollbar.metrics(vp) else {
             return;
-        }
-        let display_offset = term.grid().display_offset();
-        drop(term);
-
-        let content_height = vp.content_rect.height;
-        let scrollbar_width = 6.0 * scale;
-        let min_scrollbar_height = 20.0 * scale;
-        let scrollbar_height = ((screen_lines as f32 / total_lines as f32) * content_height)
-            .max(min_scrollbar_height);
-        let max_offset = total_lines.saturating_sub(screen_lines);
-        let scrollbar_y = if max_offset > 0 {
-            content_y + ((max_offset - display_offset) as f32 / max_offset as f32)
-                * (content_height - scrollbar_height)
-        } else {
-            content_y
         };
-        let scrollbar_rect = Rect {
-            x: content_x + vp.content_rect.width - scrollbar_width,
-            y: scrollbar_y,
-            width: scrollbar_width,
-            height: scrollbar_height,
+        let scale = vp.scale_factor;
+        let visual_width = SCROLLBAR_WIDTH * scale;
+        let thumb_rect = Rect {
+            x: vp.content_rect.x + vp.content_rect.width - visual_width,
+            y: m.thumb_y,
+            width: visual_width,
+            height: m.thumb_height,
         };
-        ctx.rounded_rect(scrollbar_rect, [1.0, 1.0, 1.0, 0.25], 3.0 * scale);
+        ctx.rounded_rect(thumb_rect, [1.0, 1.0, 1.0, 0.25], 3.0 * scale);
     }
 
     pub fn buffers(&self) -> &[Buffer] {
