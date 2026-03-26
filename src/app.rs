@@ -1100,7 +1100,8 @@ impl ApplicationHandler<TerminalEvent> for App {
                             }
                         }
                         TabBarElement::PlusButton => {
-                            self.open_new_tab_dropdown();
+                            // Left click on "+" opens a default tab
+                            self.new_tab(None);
                             self.request_redraw();
                         }
                         TabBarElement::None => {}
@@ -1155,7 +1156,12 @@ impl ApplicationHandler<TerminalEvent> for App {
                 if self.dropdown.is_open() {
                     self.dropdown.close();
                 }
-                self.open_context_menu(cx, cy);
+                // Right-click on "+" opens shell/SSH picker dropdown
+                if self.tab_bar.hit_test(cx, cy) == TabBarElement::PlusButton {
+                    self.open_new_tab_dropdown();
+                } else {
+                    self.open_context_menu(cx, cy);
+                }
                 self.request_redraw();
             }
 
