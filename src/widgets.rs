@@ -1,3 +1,5 @@
+use std::cell::Cell;
+
 use glyphon::{Attrs, Buffer, Color as GlyphonColor, FontSystem, Metrics, TextArea};
 
 use crate::colors::{ColorScheme, HexColor};
@@ -68,6 +70,9 @@ pub struct TextField {
     metrics: Metrics,
     radius: f32,
     pad_h: f32,
+    /// Horizontal scroll offset in physical pixels.
+    /// Uses Cell so draw() can adjust it through &self.
+    scroll_offset: Cell<f32>,
 }
 
 impl TextField {
@@ -94,6 +99,7 @@ impl TextField {
             metrics,
             radius,
             pad_h,
+            scroll_offset: Cell::new(0.0),
         }
     }
 
@@ -125,10 +131,22 @@ impl TextField {
     }
 
     pub fn click(&mut self, x: f32, scale: f32) {
-        let rel_x = (x - self.rect.x - self.pad_h * scale).max(0.0);
-        let char_w = self.char_width * scale;
-        let pos = (rel_x / char_w).round() as usize;
-        self.cursor_pos = pos.min(self.value.chars().count());
+        let rel_x = (x - self.rect.x - self.pad_h * scale).max(0.0) + self.scroll_offset.get();
+        let logical_x = rel_x / scale;
+        // Find the closest character position from glyph layout
+        let display = self.display_text();
+        let char_count = display.chars().count();
+        let mut best_pos = char_count;
+        let mut best_dist = f32::MAX;
+        for i in 0..=char_count {
+            let gx = self.cursor_x_from_layout(i);
+            let dist = (gx - logical_x).abs();
+            if dist < best_dist {
+                best_dist = dist;
+                best_pos = i;
+            }
+        }
+        self.cursor_pos = best_pos;
         self.selection_anchor = None;
         self.focused = true;
     }
@@ -291,6 +309,48 @@ impl TextField {
         }
     }
 
+    /// Get the pixel X offset of a character position from the layout glyphs.
+    /// Returns the offset in logical pixels (unscaled).
+    fn cursor_x_from_layout(&self, char_pos: usize) -> f32 {
+        let display = self.display_text();
+        let byte_target = char_to_byte(&display, char_pos);
+        for run in self.buffer.layout_runs() {
+            for glyph in run.glyphs.iter() {
+                if glyph.start >= byte_target {
+                    return glyph.x;
+                }
+            }
+            // Cursor is at or past the end of this run
+            if let Some(last) = run.glyphs.last() {
+                if byte_target >= last.end {
+                    return last.x + last.w;
+                }
+            }
+        }
+        // Fallback: use char_width approximation
+        char_pos as f32 * self.char_width
+    }
+
+    /// Ensure the cursor is visible within the field by adjusting scroll_offset (in pixels).
+    fn ensure_cursor_visible(&self, scale: f32) {
+        let pad = self.pad_h * scale;
+        let field_inner_w = self.rect.width - 2.0 * pad;
+        if field_inner_w <= 0.0 {
+            return;
+        }
+        let cursor_x = self.cursor_x_from_layout(self.cursor_pos) * scale;
+        let mut offset = self.scroll_offset.get();
+        // Cursor scrolled left of the visible window
+        if cursor_x < offset {
+            offset = cursor_x;
+        }
+        // Cursor scrolled right of the visible window
+        if cursor_x > offset + field_inner_w {
+            offset = cursor_x - field_inner_w;
+        }
+        self.scroll_offset.set(offset);
+    }
+
     fn display_text(&self) -> String {
         if self.password {
             "*".repeat(self.value.chars().count())
@@ -308,13 +368,15 @@ impl TextField {
     fn refresh_buffer(&mut self, font_system: &mut FontSystem) {
         let text = self.display_text();
         let attrs = font::default_attrs();
+        // Use a very large width so glyphon never wraps — horizontal
+        // scrolling is handled by scroll_offset + text bounds clipping.
         font::set_buffer_text(
             &mut self.buffer,
             font_system,
             &text,
             self.metrics,
             attrs,
-            600.0,
+            f32::MAX,
         );
     }
 
@@ -325,6 +387,8 @@ impl TextField {
         scale: f32,
         colors: &ColorScheme,
     ) {
+        self.ensure_cursor_visible(scale);
+
         let border_w = if self.focused {
             2.0 * scale
         } else {
@@ -345,8 +409,11 @@ impl TextField {
         );
 
         let pad = self.pad_h * scale;
+        let char_w = self.char_width * scale;
         let line_h = self.metrics.line_height;
         let text_y = self.rect.y + (self.rect.height - line_h * scale) / 2.0;
+        let scroll = self.scroll_offset.get();
+        let text_left = self.rect.x + pad - scroll;
 
         let text_color = if self.is_showing_placeholder() {
             colors.text_placeholder.to_glyphon()
@@ -356,7 +423,7 @@ impl TextField {
 
         text_areas.push(TextArea {
             buffer: &self.buffer,
-            left: self.rect.x + pad,
+            left: text_left,
             top: text_y,
             scale,
             bounds: self.rect.to_text_bounds(),
@@ -368,30 +435,38 @@ impl TextField {
             let cursor_h = line_h * scale;
             let cursor_y = self.rect.y + (self.rect.height - cursor_h) / 2.0;
 
-            // Draw selection highlight
+            // Draw selection highlight (clipped to field bounds)
             if let Some(anchor) = self.selection_anchor {
                 let start = anchor.min(self.cursor_pos);
                 let end = anchor.max(self.cursor_pos);
                 if start != end {
-                    let sel_x =
-                        self.rect.x + self.pad_h * scale + start as f32 * self.char_width * scale;
-                    let sel_w = (end - start) as f32 * self.char_width * scale;
-                    ctx.rounded_rect(
-                        Rect {
-                            x: sel_x,
-                            y: cursor_y,
-                            width: sel_w,
-                            height: cursor_h,
-                        },
-                        colors.selection.to_linear_f32(),
-                        0.0,
-                    );
+                    let sel_x = self.rect.x + pad
+                        + self.cursor_x_from_layout(start) * scale - scroll;
+                    let sel_end_x = self.rect.x + pad
+                        + self.cursor_x_from_layout(end) * scale - scroll;
+                    // Clip selection to field inner area
+                    let field_left = self.rect.x + pad;
+                    let field_right = self.rect.x + self.rect.width - pad;
+                    let clip_x = sel_x.max(field_left);
+                    let clip_right = sel_end_x.min(field_right);
+                    if clip_right > clip_x {
+                        ctx.rounded_rect(
+                            Rect {
+                                x: clip_x,
+                                y: cursor_y,
+                                width: clip_right - clip_x,
+                                height: cursor_h,
+                            },
+                            colors.selection.to_linear_f32(),
+                            0.0,
+                        );
+                    }
                 }
             }
 
             // Draw cursor
-            let cursor_x =
-                self.rect.x + self.pad_h * scale + self.cursor_pos as f32 * self.char_width * scale;
+            let cursor_x = self.rect.x + pad
+                + self.cursor_x_from_layout(self.cursor_pos) * scale - scroll;
             ctx.rounded_rect(
                 Rect {
                     x: cursor_x,
