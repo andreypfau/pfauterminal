@@ -14,12 +14,14 @@ use alacritty_terminal::selection::SelectionType;
 use winit::application::ApplicationHandler;
 use winit::event::{ElementState, MouseButton, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoopProxy};
-use winit::keyboard::{KeyCode, PhysicalKey};
+use winit::keyboard::{Key, KeyCode, PhysicalKey};
 use winit::window::{CursorIcon, Window, WindowAttributes, WindowId};
 
 use crate::draw::DrawContext;
 use crate::dropdown::{DropdownElement, DropdownMenu, MenuAction, MenuEntry, MenuPosition};
+use crate::font;
 use crate::gpu::GpuContext;
+use crate::hotkeys::{HotkeyAction, HotkeyConfig, HotkeyLookup};
 use crate::icons;
 use crate::icons::IconManager;
 use crate::layout::{Rect, TextSpec};
@@ -89,6 +91,9 @@ pub struct App {
     last_click_time: Instant,
     click_count: u8,
     screenshot_pending: Option<String>,
+    hotkey_config: HotkeyConfig,
+    hotkey_lookup: HotkeyLookup,
+    hotkeys_enabled: bool,
     last_redraw: Instant,
     /// Set when new terminal content or user input arrives — forces an
     /// immediate render regardless of the cursor-blink throttle.
@@ -111,6 +116,8 @@ impl App {
     pub fn new(event_proxy_raw: EventLoopProxy<TerminalEvent>) -> Self {
         let theme = Theme::new();
         let saved_sessions = SavedSessions::load();
+        let hotkey_config = HotkeyConfig::load();
+        let hotkey_lookup = hotkey_config.build_lookup();
         let (shell_tx, shell_rx) = std::sync::mpsc::channel();
         std::thread::spawn(move || {
             let _ = shell_tx.send(detect_shells());
@@ -138,6 +145,9 @@ impl App {
             last_click_time: Instant::now(),
             click_count: 0,
             screenshot_pending: std::env::var("SCREENSHOT").ok().filter(|s| !s.is_empty()),
+            hotkey_config,
+            hotkey_lookup,
+            hotkeys_enabled: true,
             last_redraw: Instant::now(),
             dirty: false,
             occluded: false,
@@ -202,6 +212,19 @@ impl App {
         }
     }
 
+    fn update_all_viewports(&mut self) {
+        let Some(gpu) = self.gpu.as_ref() else { return };
+        let cell = gpu.cell;
+        let scale = gpu.scale_factor;
+        let area = self.panel_area(gpu);
+        let tab_h = TabBar::height(&self.theme.tab_bar, scale);
+
+        for panel in &mut self.tabs {
+            let viewport = TerminalPanel::compute_viewport(&area, &cell, scale, tab_h, &self.theme.panel);
+            panel.set_viewport(viewport, &cell);
+        }
+    }
+
     fn update_tab_bar(&mut self) {
         let Some(gpu) = self.gpu.as_mut() else { return };
         let scale = gpu.scale_factor;
@@ -259,6 +282,7 @@ impl App {
             &mut gpu.font_system,
             &colors,
             &cell,
+            gpu.font_size,
             &theme.panel,
         );
         let panel_bufs = panel.buffers();
@@ -557,6 +581,234 @@ impl App {
         result == MessageDialogResult::Ok
     }
 
+    /// Dispatch a hotkey action. Returns true if handled (event consumed).
+    fn handle_hotkey_action(
+        &mut self,
+        action: HotkeyAction,
+        event_loop: &ActiveEventLoop,
+    ) -> bool {
+        use HotkeyAction::*;
+        match action {
+            // --- Tab management ---
+            NewTab => {
+                self.new_tab(None);
+                self.request_redraw();
+            }
+            CloseTab => {
+                if self.tabs.len() <= 1 {
+                    if self.confirm_close("Close the last tab and exit?") {
+                        event_loop.exit();
+                    }
+                } else {
+                    self.close_tab(self.active_tab);
+                }
+            }
+            NextTab => {
+                if self.tabs.len() > 1 {
+                    self.active_tab = (self.active_tab + 1) % self.tabs.len();
+                    self.sync_tab_state();
+                    self.request_redraw();
+                }
+            }
+            PreviousTab => {
+                if self.tabs.len() > 1 {
+                    self.active_tab = if self.active_tab == 0 {
+                        self.tabs.len() - 1
+                    } else {
+                        self.active_tab - 1
+                    };
+                    self.sync_tab_state();
+                    self.request_redraw();
+                }
+            }
+            Tab1 => self.switch_to_tab(0),
+            Tab2 => self.switch_to_tab(1),
+            Tab3 => self.switch_to_tab(2),
+            Tab4 => self.switch_to_tab(3),
+            Tab5 => self.switch_to_tab(4),
+            Tab6 => self.switch_to_tab(5),
+            Tab7 => self.switch_to_tab(6),
+            Tab8 => self.switch_to_tab(7),
+            Tab9 => self.switch_to_tab(8),
+            Tab10 => self.switch_to_tab(9),
+            ReopenTab => {
+                // TODO: implement reopen last closed tab
+            }
+
+            // --- Clipboard ---
+            Copy => {
+                if let Some(panel) = self.tabs.get_mut(self.active_tab) {
+                    if let Some(text) = panel.selection_to_string() {
+                        if let Ok(mut clip) = arboard::Clipboard::new() {
+                            let _ = clip.set_text(text);
+                        }
+                        panel.clear_selection();
+                        self.request_redraw();
+                    }
+                }
+            }
+            Paste => {
+                if let Ok(mut clip) = arboard::Clipboard::new()
+                    && let Ok(text) = clip.get_text()
+                    && let Some(panel) = self.tabs.get_mut(self.active_tab)
+                {
+                    panel.notify_input();
+                    panel.write_to_pty(text.into_bytes());
+                }
+            }
+            CtrlC => {
+                // Intelligent Ctrl-C: copy if selection, else send SIGINT
+                if let Some(panel) = self.tabs.get_mut(self.active_tab) {
+                    if panel.has_selection() {
+                        if let Some(text) = panel.selection_to_string() {
+                            if let Ok(mut clip) = arboard::Clipboard::new() {
+                                let _ = clip.set_text(text);
+                            }
+                        }
+                        panel.clear_selection();
+                        self.request_redraw();
+                    } else {
+                        // No selection — don't consume, let terminal handle Ctrl-C
+                        return false;
+                    }
+                }
+            }
+            SelectAll => {
+                if let Some(panel) = self.tabs.get_mut(self.active_tab) {
+                    panel.select_all();
+                    self.request_redraw();
+                }
+            }
+            Clear => {
+                if let Some(panel) = self.tabs.get_mut(self.active_tab) {
+                    panel.clear();
+                    self.request_redraw();
+                }
+            }
+
+            // --- Line editing ---
+            Home => {
+                if let Some(panel) = self.tabs.get_mut(self.active_tab) {
+                    panel.notify_input();
+                    let seq = if panel.is_app_cursor() { b"\x1bOH".to_vec() } else { b"\x1b[H".to_vec() };
+                    panel.write_to_pty(seq);
+                }
+            }
+            End => {
+                if let Some(panel) = self.tabs.get_mut(self.active_tab) {
+                    panel.notify_input();
+                    let seq = if panel.is_app_cursor() { b"\x1bOF".to_vec() } else { b"\x1b[F".to_vec() };
+                    panel.write_to_pty(seq);
+                }
+            }
+            DeleteLine => {
+                if let Some(panel) = self.tabs.get_mut(self.active_tab) {
+                    panel.notify_input();
+                    panel.write_to_pty(b"\x15".to_vec()); // Ctrl+U
+                }
+            }
+
+            // --- Zoom ---
+            ZoomIn => {
+                let Some(gpu) = self.gpu.as_ref() else { return true };
+                // ×1.05: 14→15→16→...→20→21→23→25→...
+                let new = (gpu.font_size * 1.05).ceil();
+                self.set_font_size(new);
+            }
+            ZoomOut => {
+                let Some(gpu) = self.gpu.as_ref() else { return true };
+                let new = (gpu.font_size / 1.05).floor();
+                self.set_font_size(new);
+            }
+            ResetZoom => {
+                self.set_font_size(font::DEFAULT_FONT_SIZE);
+            }
+
+            // --- Search ---
+            Search => {
+                // TODO: implement search overlay
+            }
+
+            // --- Fullscreen ---
+            ToggleFullscreen => {
+                if let Some(window) = &self.window {
+                    if window.fullscreen().is_some() {
+                        window.set_fullscreen(None);
+                    } else {
+                        window.set_fullscreen(Some(
+                            winit::window::Fullscreen::Borderless(None),
+                        ));
+                    }
+                }
+            }
+
+            // --- Scrolling ---
+            ScrollToTop => {
+                if let Some(panel) = self.tabs.get_mut(self.active_tab) {
+                    panel.scroll_to_top();
+                    self.request_redraw();
+                }
+            }
+            ScrollToBottom => {
+                if let Some(panel) = self.tabs.get_mut(self.active_tab) {
+                    panel.scroll_to_bottom();
+                    self.request_redraw();
+                }
+            }
+            ScrollPageUp => {
+                if let Some(panel) = self.tabs.get_mut(self.active_tab) {
+                    panel.scroll_page_up();
+                    self.request_redraw();
+                }
+            }
+            ScrollPageDown => {
+                if let Some(panel) = self.tabs.get_mut(self.active_tab) {
+                    panel.scroll_page_down();
+                    self.request_redraw();
+                }
+            }
+            ScrollUp => {
+                if let Some(panel) = self.tabs.get_mut(self.active_tab) {
+                    panel.scroll_lines(-3);
+                    self.request_redraw();
+                }
+            }
+            ScrollDown => {
+                if let Some(panel) = self.tabs.get_mut(self.active_tab) {
+                    panel.scroll_lines(3);
+                    self.request_redraw();
+                }
+            }
+
+            // --- Not yet implemented ---
+            NewWindow | Settings => {
+                // TODO
+            }
+        }
+        true
+    }
+
+    fn switch_to_tab(&mut self, idx: usize) {
+        if idx < self.tabs.len() && idx != self.active_tab {
+            self.active_tab = idx;
+            self.sync_tab_state();
+            self.request_redraw();
+        }
+    }
+
+    fn set_font_size(&mut self, size: f32) {
+        let size = size.clamp(font::MIN_FONT_SIZE, font::MAX_FONT_SIZE);
+        let Some(gpu) = self.gpu.as_mut() else { return };
+        if (gpu.font_size - size).abs() < 0.01 {
+            return;
+        }
+        gpu.set_font_size(size);
+        drop(gpu);
+        self.update_all_viewports();
+        self.dirty = true;
+        self.request_redraw();
+    }
+
     fn open_new_tab_dropdown(&mut self) {
         // Populate cache from background thread if not yet available
         if self.cached_shells.is_none() {
@@ -662,6 +914,7 @@ impl App {
             sw,
             sh,
         ));
+        self.hotkeys_enabled = false;
     }
 
     fn save_ssh_session(&mut self, result: &SshResult) {
@@ -1043,11 +1296,13 @@ impl ApplicationHandler<TerminalEvent> for App {
                         Ok(None) => {}
                         Ok(Some(result)) => {
                             self.ssh_dialog = None;
+                            self.hotkeys_enabled = true;
                             self.save_ssh_session(&result);
                             self.new_tab_ssh(result);
                         }
                         Err(()) => {
                             self.ssh_dialog = None;
+                            self.hotkeys_enabled = true;
                         }
                     }
                     self.request_redraw();
@@ -1190,11 +1445,13 @@ impl ApplicationHandler<TerminalEvent> for App {
                         Ok(None) => {}
                         Ok(Some(result)) => {
                             self.ssh_dialog = None;
+                            self.hotkeys_enabled = true;
                             self.save_ssh_session(&result);
                             self.new_tab_ssh(result);
                         }
                         Err(()) => {
                             self.ssh_dialog = None;
+                            self.hotkeys_enabled = true;
                         }
                     }
                     self.request_redraw();
@@ -1211,130 +1468,33 @@ impl ApplicationHandler<TerminalEvent> for App {
                     return;
                 }
 
-                // Ctrl+Tab / Ctrl+Shift+Tab — switch tabs
-                if event.state == ElementState::Pressed
-                    && self.ctrl_pressed
-                    && matches!(event.physical_key, PhysicalKey::Code(KeyCode::Tab))
-                    && self.tabs.len() > 1
-                {
-                    if self.shift_pressed {
-                        // Previous tab
-                        self.active_tab = if self.active_tab == 0 {
-                            self.tabs.len() - 1
-                        } else {
-                            self.active_tab - 1
+                // Match hotkeys from config (disabled during modals)
+                if event.state == ElementState::Pressed && self.hotkeys_enabled {
+                    if let PhysicalKey::Code(code) = event.physical_key {
+                        let logical_char = match event.logical_key.as_ref() {
+                            Key::Character(s) => s.chars().next(),
+                            _ => None,
                         };
-                    } else {
-                        // Next tab
-                        self.active_tab = (self.active_tab + 1) % self.tabs.len();
+                        if let Some(action) = self.hotkey_lookup.match_key(
+                            code,
+                            logical_char,
+                            self.ctrl_pressed,
+                            self.alt_pressed,
+                            self.shift_pressed,
+                            self.super_pressed,
+                        ) {
+                            let handled = self.handle_hotkey_action(action, event_loop);
+                            if handled {
+                                return;
+                            }
+                            // Not handled (e.g. ctrl-c without selection) — fall through
+                        }
                     }
-                    self.sync_tab_state();
-                    self.request_redraw();
-                    return;
-                }
 
-                // macOS: Cmd+key shortcuts (copy, paste, screenshot).
-                // Block ALL Cmd+key from reaching the terminal.
-                #[cfg(target_os = "macos")]
-                if event.state == ElementState::Pressed && self.super_pressed {
-                    match event.physical_key {
-                        PhysicalKey::Code(KeyCode::KeyC) => {
-                            if let Some(panel) = self.tabs.get_mut(self.active_tab) {
-                                if let Some(text) = panel.selection_to_string() {
-                                    if let Ok(mut clip) = arboard::Clipboard::new() {
-                                        let _ = clip.set_text(text);
-                                    }
-                                    panel.clear_selection();
-                                    self.request_redraw();
-                                }
-                            }
-                            return;
-                        }
-                        PhysicalKey::Code(KeyCode::KeyV) => {
-                            if let Ok(mut clip) = arboard::Clipboard::new()
-                                && let Ok(text) = clip.get_text()
-                                && let Some(panel) = self.tabs.get_mut(self.active_tab)
-                            {
-                                panel.notify_input();
-                                panel.write_to_pty(text.into_bytes());
-                            }
-                            return;
-                        }
-                        PhysicalKey::Code(KeyCode::KeyS) => {
-                            self.screenshot_pending =
-                                Some("/tmp/pfauterminal_screenshot.png".to_string());
-                            self.request_redraw();
-                            return;
-                        }
-                        PhysicalKey::Code(KeyCode::KeyT) => {
-                            self.new_tab(None);
-                            self.request_redraw();
-                            return;
-                        }
-                        PhysicalKey::Code(KeyCode::KeyW) => {
-                            if self.tabs.len() <= 1 {
-                                if self.confirm_close("Close the last tab and exit?") {
-                                    event_loop.exit();
-                                }
-                            } else {
-                                self.close_tab(self.active_tab);
-                            }
-                            return;
-                        }
-                        _ => {}
-                    }
-                    // Don't pass Cmd+key combos to the terminal
-                    return;
-                }
-
-                // Windows/Linux: Ctrl+key clipboard shortcuts.
-                // Only intercept copy and paste — all other Ctrl+key combos
-                // must reach the terminal as control characters.
-                #[cfg(not(target_os = "macos"))]
-                if event.state == ElementState::Pressed && self.ctrl_pressed {
-                    match event.physical_key {
-                        PhysicalKey::Code(KeyCode::KeyC) => {
-                            // Ctrl+C with active selection → copy to clipboard.
-                            // Without selection → fall through to send SIGINT (0x03).
-                            if let Some(panel) = self.tabs.get_mut(self.active_tab) {
-                                if panel.has_selection() {
-                                    if let Some(text) = panel.selection_to_string() {
-                                        if let Ok(mut clip) = arboard::Clipboard::new() {
-                                            let _ = clip.set_text(text);
-                                        }
-                                    }
-                                    panel.clear_selection();
-                                    self.request_redraw();
-                                    return;
-                                }
-                            }
-                        }
-                        PhysicalKey::Code(KeyCode::KeyV) => {
-                            if let Ok(mut clip) = arboard::Clipboard::new()
-                                && let Ok(text) = clip.get_text()
-                                && let Some(panel) = self.tabs.get_mut(self.active_tab)
-                            {
-                                panel.notify_input();
-                                panel.write_to_pty(text.into_bytes());
-                            }
-                            return;
-                        }
-                        PhysicalKey::Code(KeyCode::KeyT) => {
-                            self.new_tab(None);
-                            self.request_redraw();
-                            return;
-                        }
-                        PhysicalKey::Code(KeyCode::KeyW) => {
-                            if self.tabs.len() <= 1 {
-                                if self.confirm_close("Close the last tab and exit?") {
-                                    event_loop.exit();
-                                }
-                            } else {
-                                self.close_tab(self.active_tab);
-                            }
-                            return;
-                        }
-                        _ => {}
+                    // macOS: block all remaining Cmd+key from reaching the terminal
+                    #[cfg(target_os = "macos")]
+                    if self.super_pressed {
+                        return;
                     }
                 }
 

@@ -6,6 +6,7 @@ mod draw;
 mod dropdown;
 mod font;
 mod gpu;
+mod hotkeys;
 mod icons;
 mod layout;
 mod menu;

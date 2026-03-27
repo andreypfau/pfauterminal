@@ -1065,6 +1065,60 @@ impl TerminalPanel {
         self.active_selection.is_some()
     }
 
+    pub fn is_app_cursor(&self) -> bool {
+        let term = self.term.lock();
+        term.mode().contains(TermMode::APP_CURSOR)
+    }
+
+    pub fn select_all(&mut self) {
+        use alacritty_terminal::index::{Column, Line};
+        use alacritty_terminal::selection::Selection;
+        let mut term = self.term.lock();
+        let total = term.grid().total_lines();
+        let cols = term.grid().columns();
+        let start = Point::new(Line(-(total as i32 - 1)), Column(0));
+        let end = Point::new(Line(0), Column(cols.saturating_sub(1)));
+        let sel = Selection::new(SelectionType::Lines, start, Side::Left);
+        term.selection = Some(sel);
+        if let Some(ref mut sel) = term.selection {
+            sel.update(end, Side::Right);
+        }
+        drop(term);
+        // Mirror into our active_selection for rendering
+        self.active_selection = None; // let terminal own it
+    }
+
+    pub fn clear(&mut self) {
+        self.write_to_pty(b"\x1b[2J\x1b[3J\x1b[H".to_vec());
+    }
+
+    pub fn scroll_to_top(&mut self) {
+        let mut term = self.term.lock();
+        term.scroll_display(alacritty_terminal::grid::Scroll::Top);
+    }
+
+    pub fn scroll_to_bottom(&mut self) {
+        let mut term = self.term.lock();
+        term.scroll_display(alacritty_terminal::grid::Scroll::Bottom);
+    }
+
+    pub fn scroll_page_up(&mut self) {
+        let mut term = self.term.lock();
+        let lines = term.grid().screen_lines() as i32;
+        term.scroll_display(alacritty_terminal::grid::Scroll::Delta(lines));
+    }
+
+    pub fn scroll_page_down(&mut self) {
+        let mut term = self.term.lock();
+        let lines = term.grid().screen_lines() as i32;
+        term.scroll_display(alacritty_terminal::grid::Scroll::Delta(-lines));
+    }
+
+    pub fn scroll_lines(&mut self, delta: i32) {
+        let mut term = self.term.lock();
+        term.scroll_display(alacritty_terminal::grid::Scroll::Delta(delta));
+    }
+
     pub fn draw(
         &mut self,
         ctx: &mut DrawContext,
@@ -1072,6 +1126,7 @@ impl TerminalPanel {
         font_system: &mut FontSystem,
         colors: &ColorScheme,
         cell_metrics: &CellMetrics,
+        font_size: f32,
         panel_theme: &PanelTheme,
     ) {
         let vp = match &self.viewport {
@@ -1106,7 +1161,7 @@ impl TerminalPanel {
             ctx.rounded_rect(island_rect, colors.background.to_linear_f32(), island_radius);
         }
 
-        let metrics = font::metrics();
+        let metrics = font::metrics_for_size(font_size);
 
         // --- Snapshot grid data under the lock, then release it ---
         let (cursor_point, cursor_shape, selection_range, display_offset, extra_row_cells) = {

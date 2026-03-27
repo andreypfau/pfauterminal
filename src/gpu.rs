@@ -511,6 +511,7 @@ pub struct GpuContext {
     pub colors: ColorScheme,
 
     pub cell: CellMetrics,
+    pub font_size: f32,
     pub scale_factor: f32,
 
     // Background quad rendering
@@ -650,6 +651,7 @@ impl GpuContext {
             rounded_rect,
             colors,
             cell,
+            font_size: font::DEFAULT_FONT_SIZE,
             scale_factor,
             quad_pipeline,
             quad_vertex_buffer,
@@ -663,6 +665,12 @@ impl GpuContext {
             cached_total_rr_count: 0,
             cached_quad_vertex_count: 0,
         })
+    }
+
+    /// Update the terminal font size and remeasure cell metrics.
+    pub fn set_font_size(&mut self, size: f32) {
+        self.font_size = size;
+        self.cell = font::measure_cell_for_size(&mut self.font_system, size);
     }
 
     fn capture_screenshot(&self, path: &str, texture: &Texture) {

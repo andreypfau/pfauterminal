@@ -2,8 +2,11 @@ use glyphon::{Attrs, Buffer, Family, FontSystem, Metrics, Shaping};
 
 pub const FONT_DATA: &[u8] = include_bytes!("../fonts/JetBrainsMono-Regular.ttf");
 pub const FONT_FAMILY: &str = "JetBrains Mono";
-pub const FONT_SIZE: f32 = 14.0;
+pub const DEFAULT_FONT_SIZE: f32 = 14.0;
 pub const LINE_HEIGHT: f32 = 1.2;
+/// Minimum / maximum font size for zoom.
+pub const MIN_FONT_SIZE: f32 = 1.0;
+pub const MAX_FONT_SIZE: f32 = 100.0;
 
 #[derive(Clone, Copy)]
 pub struct CellMetrics {
@@ -32,7 +35,11 @@ pub fn create_font_system() -> FontSystem {
 }
 
 pub fn metrics() -> Metrics {
-    Metrics::new(FONT_SIZE, FONT_SIZE * LINE_HEIGHT)
+    metrics_for_size(DEFAULT_FONT_SIZE)
+}
+
+pub fn metrics_for_size(font_size: f32) -> Metrics {
+    Metrics::new(font_size, font_size * LINE_HEIGHT)
 }
 
 /// Default text attributes using the monospace family.
@@ -64,7 +71,12 @@ pub fn set_buffer_text(
 
 /// Measure cell dimensions by rendering a reference character.
 pub fn measure_cell(font_system: &mut FontSystem) -> CellMetrics {
-    let mut buffer = Buffer::new(font_system, metrics());
+    measure_cell_for_size(font_system, DEFAULT_FONT_SIZE)
+}
+
+pub fn measure_cell_for_size(font_system: &mut FontSystem, font_size: f32) -> CellMetrics {
+    let m = metrics_for_size(font_size);
+    let mut buffer = Buffer::new(font_system, m);
     buffer.set_size(font_system, Some(200.0), Some(100.0));
     buffer.set_text(font_system, "M", default_attrs(), Shaping::Advanced);
     buffer.shape_until_scroll(font_system, false);
@@ -74,10 +86,10 @@ pub fn measure_cell(font_system: &mut FontSystem) -> CellMetrics {
         .next()
         .and_then(|run| run.glyphs.first())
         .map(|g| g.w)
-        .unwrap_or(FONT_SIZE * 0.6);
+        .unwrap_or(font_size * 0.6);
 
     CellMetrics {
         width,
-        height: FONT_SIZE * LINE_HEIGHT,
+        height: font_size * LINE_HEIGHT,
     }
 }
