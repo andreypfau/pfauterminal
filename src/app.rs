@@ -701,6 +701,30 @@ impl App {
                     panel.write_to_pty(seq);
                 }
             }
+            PreviousWord => {
+                if let Some(panel) = self.tabs.get_mut(self.active_tab) {
+                    panel.notify_input();
+                    panel.write_to_pty(b"\x1bb".to_vec()); // ESC b
+                }
+            }
+            NextWord => {
+                if let Some(panel) = self.tabs.get_mut(self.active_tab) {
+                    panel.notify_input();
+                    panel.write_to_pty(b"\x1bf".to_vec()); // ESC f
+                }
+            }
+            DeletePreviousWord => {
+                if let Some(panel) = self.tabs.get_mut(self.active_tab) {
+                    panel.notify_input();
+                    panel.write_to_pty(b"\x17".to_vec()); // Ctrl+W
+                }
+            }
+            DeleteNextWord => {
+                if let Some(panel) = self.tabs.get_mut(self.active_tab) {
+                    panel.notify_input();
+                    panel.write_to_pty(b"\x1bd".to_vec()); // ESC d
+                }
+            }
             DeleteLine => {
                 if let Some(panel) = self.tabs.get_mut(self.active_tab) {
                     panel.notify_input();

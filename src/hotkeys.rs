@@ -42,6 +42,10 @@ pub enum HotkeyAction {
     // Line editing
     Home,
     End,
+    PreviousWord,
+    NextWord,
+    DeletePreviousWord,
+    DeleteNextWord,
     DeleteLine,
 
     // Application
@@ -232,6 +236,10 @@ impl HotkeyConfig {
             // Line editing
             (Home, vec!["⌘-Left".into()]),
             (End, vec!["⌘-Right".into()]),
+            (PreviousWord, vec!["⌥-Left".into()]),
+            (NextWord, vec!["⌥-Right".into()]),
+            (DeletePreviousWord, vec!["⌥-Backspace".into()]),
+            (DeleteNextWord, vec!["⌥-Delete".into()]),
             (DeleteLine, vec!["⌘-Backspace".into()]),
             // Application
             (ToggleFullscreen, vec!["Ctrl+⌘+F".into(), "F11".into()]),
@@ -279,6 +287,10 @@ impl HotkeyConfig {
             (Search, vec!["Ctrl-Shift-F".into()]),
             (CtrlC, vec!["Ctrl-C".into()]),
             // Line editing
+            (PreviousWord, vec!["Ctrl-Left".into()]),
+            (NextWord, vec!["Ctrl-Right".into()]),
+            (DeletePreviousWord, vec!["Ctrl-Backspace".into()]),
+            (DeleteNextWord, vec!["Ctrl-Delete".into()]),
             (DeleteLine, vec!["Ctrl-Shift-Backspace".into()]),
             // Application
             (ToggleFullscreen, vec!["F11".into(), "Alt-Enter".into()]),
