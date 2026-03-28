@@ -12,6 +12,7 @@ mod layout;
 mod menu;
 mod saved_sessions;
 mod ssh;
+mod ssh_config;
 mod ssh_dialog;
 mod tab_bar;
 mod terminal_panel;

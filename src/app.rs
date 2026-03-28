@@ -26,6 +26,7 @@ use crate::icons;
 use crate::icons::IconManager;
 use crate::layout::{Rect, TextSpec};
 use crate::saved_sessions::{now_unix, SavedAuthType, SavedSession, SavedSessions};
+use crate::ssh_config::SshHostEntry;
 use crate::ssh_dialog::{AuthMethod, SshDialog, SshPrefill, SshResult};
 use crate::tab_bar::{TabBar, TabBarElement};
 use crate::terminal_panel::{EventProxy, PanelId, TermSize, TerminalEvent, TerminalPanel};
@@ -80,6 +81,7 @@ pub struct App {
     dropdown: DropdownMenu,
     ssh_dialog: Option<SshDialog>,
     saved_sessions: SavedSessions,
+    ssh_config_hosts: Vec<SshHostEntry>,
     cached_shells: Option<Vec<(String, String)>>,
     shell_receiver: Option<std::sync::mpsc::Receiver<Vec<(String, String)>>>,
     cursor_position: (f32, f32),
@@ -116,6 +118,7 @@ impl App {
     pub fn new(event_proxy_raw: EventLoopProxy<TerminalEvent>) -> Self {
         let theme = Theme::new();
         let saved_sessions = SavedSessions::load();
+        let ssh_config_hosts = crate::ssh_config::load_ssh_config();
         let hotkey_config = HotkeyConfig::load();
         let hotkey_lookup = hotkey_config.build_lookup();
         let (shell_tx, shell_rx) = std::sync::mpsc::channel();
@@ -134,6 +137,7 @@ impl App {
             dropdown: DropdownMenu::new(),
             ssh_dialog: None,
             saved_sessions,
+            ssh_config_hosts,
             cached_shells: None,
             shell_receiver: Some(shell_rx),
             cursor_position: (0.0, 0.0),
@@ -860,17 +864,47 @@ impl App {
         // Separator between shells and SSH section
         entries.push(MenuEntry::Separator);
 
-        // Saved SSH sessions (sorted by last used)
+        // Saved SSH sessions (sorted by last used), with alias from SSH config if available
         for session in saved {
+            let label = self
+                .ssh_config_hosts
+                .iter()
+                .find(|h| h.effective_host() == session.host)
+                .map(|h| h.alias.clone())
+                .unwrap_or_else(|| session.display_label());
             entries.push(MenuEntry::closeable_item_with_icon(
-                &session.display_label(),
+                &label,
                 MenuAction::ConnectSavedSession(session.key()),
                 icons::ICON_TERMINAL,
             ));
         }
 
-        // Separator before "New SSH Session..." (only if saved sessions exist)
-        if !saved.is_empty() {
+        // SSH config hosts not yet in saved sessions
+        let ssh_hosts: Vec<_> = self
+            .ssh_config_hosts
+            .iter()
+            .filter(|h| {
+                !saved
+                    .iter()
+                    .any(|s| s.host == h.effective_host() || s.host == h.alias)
+            })
+            .collect();
+
+        if !ssh_hosts.is_empty() {
+            if !saved.is_empty() {
+                entries.push(MenuEntry::Separator);
+            }
+            for host in &ssh_hosts {
+                entries.push(MenuEntry::item_with_icon(
+                    &host.display_label(),
+                    MenuAction::ConnectSshConfigHost(host.alias.clone()),
+                    icons::ICON_TERMINAL,
+                ));
+            }
+        }
+
+        // Separator before "New SSH Session..."
+        if !saved.is_empty() || !ssh_hosts.is_empty() {
             entries.push(MenuEntry::Separator);
         }
 
@@ -997,6 +1031,26 @@ impl App {
                         },
                     };
                     self.saved_sessions.touch_by_key(key);
+                    self.connect_ssh(config);
+                }
+            }
+            MenuAction::ConnectSshConfigHost(alias) => {
+                if let Some(host) = self.ssh_config_hosts.iter().find(|h| h.alias == *alias) {
+                    let config = crate::ssh::SshConfig {
+                        host: host.effective_host().to_string(),
+                        port: host.effective_port(),
+                        username: host
+                            .user
+                            .clone()
+                            .unwrap_or_else(current_username),
+                        auth: match &host.identity_file {
+                            Some(path) => crate::ssh::SshAuth::Key {
+                                path: path.clone(),
+                                passphrase: None,
+                            },
+                            None => crate::ssh::SshAuth::Agent,
+                        },
+                    };
                     self.connect_ssh(config);
                 }
             }
@@ -1657,6 +1711,12 @@ fn detect_default_shell() -> Option<(String, String)> {
         }
     }
     None
+}
+
+fn current_username() -> String {
+    std::env::var("USER")
+        .or_else(|_| std::env::var("USERNAME"))
+        .unwrap_or_else(|_| "root".to_string())
 }
 
 /// Detect available shells on the system. Returns (display_label, full_path) pairs.

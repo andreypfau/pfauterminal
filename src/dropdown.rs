@@ -11,6 +11,7 @@ pub enum MenuAction {
     NewShell(String),
     OpenSshDialog,
     ConnectSavedSession(String),
+    ConnectSshConfigHost(String),
     Copy,
     Paste,
 }
